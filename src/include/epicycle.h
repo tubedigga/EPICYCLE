@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.10-div-latch"
+#define EPICYCLE_VERSION "0.2.11-trim-midi-harden"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -254,6 +254,8 @@ int engine_pad_voice_active(const EpicycleEngine *eng, int pad); /* 1 if any voi
 float engine_division_slice_frac(int slices);
 int engine_division_quantize_slices(int slices);
 int engine_division_from_cc(uint8_t cc); /* discrete musical N from K2 */
+int engine_division_from_cc_sticky(uint8_t cc, int current_n); /* hysteresis vs flicker */
+uint8_t engine_division_cc_center(int slices); /* pot target for pickup at N */
 int engine_division_step(int slices, int delta); /* encoder: step 1/2/4/8/16/32 */
 void engine_division_snap_brace(EpicycleEngine *eng, int pad); /* start→slice, len=1/N */
 void engine_division_set_slice_index(EpicycleEngine *eng, int pad, int slice_index);

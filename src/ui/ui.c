@@ -424,7 +424,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                 draw_text(px, 8, 212, "K1/K2 width  K3 slide", COL_MUTED, 1);
                 draw_text(px, 8, 226, "ENC push -> DIV  hold SHIFT xfade", COL_MUTED, 1);
             } else {
-                snprintf(line, sizeof line, "DIV%d", pad ? pad->division_beats : 4);
+                snprintf(line, sizeof line, "DIV%d",
+                         pad ? engine_division_quantize_slices(pad->division_beats) : 4);
                 draw_text(px, 200, 52, line, COL_MOD, 3);
                 draw_text(px, 8, 212, "K2=N slices  K1/K3 pick slice", COL_MUTED, 1);
                 draw_text(px, 8, 226, "ENC wheel=N  push=FREE  B1/B2 page", COL_MUTED, 1);

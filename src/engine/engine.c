@@ -27,6 +27,15 @@ static float clampf(float v, float lo, float hi)
     return v;
 }
 
+/* Near-zero FREE width: 1 sample frame when bank known, else tiny epsilon.
+ * No forced musical min-gap (Ash: Start/End froze at the old ~2% clamp). */
+static float trim_min_len(const EpicyclePad *p)
+{
+    if (p && p->sample && p->sample->frames > 2)
+        return 1.0f / (float)p->sample->frames;
+    return 1e-6f;
+}
+
 static float pitch_ratio(int octave, int semi, float fine)
 {
     float semis = (float)(octave * 12 + semi) + fine / 100.0f;
@@ -155,11 +164,21 @@ float engine_division_slice_frac(int slices)
 
 int engine_division_quantize_slices(int slices)
 {
+    /* Only musical powers of two — never leave N at 3/5/6/… (Ash: spontaneous jumps). */
     if (slices < 1)
         return 1;
-    if (slices > EPICYCLE_MAX_DIVISION)
-        return EPICYCLE_MAX_DIVISION;
-    return slices;
+    int best = k_div_steps[0];
+    int best_d = 999;
+    for (int i = 0; i < K_DIV_STEP_N; i++) {
+        int d = k_div_steps[i] - slices;
+        if (d < 0)
+            d = -d;
+        if (d < best_d) {
+            best_d = d;
+            best = k_div_steps[i];
+        }
+    }
+    return best;
 }
 
 int engine_division_from_cc(uint8_t cc)
@@ -172,6 +191,51 @@ int engine_division_from_cc(uint8_t cc)
     if (idx >= K_DIV_STEP_N)
         idx = K_DIV_STEP_N - 1;
     return k_div_steps[idx];
+}
+
+int engine_division_from_cc_sticky(uint8_t cc, int current_n)
+{
+    /* Schmitt-trigger around step boundaries so MIDI pot noise cannot flicker
+     * N (e.g. CC 63↔64 = DIV4↔DIV8). Keep current until clearly in a new zone. */
+    int cur = engine_division_quantize_slices(current_n);
+    int raw = engine_division_from_cc(cc);
+    if (raw == cur)
+        return cur;
+
+    int cur_i = 0, raw_i = 0;
+    for (int i = 0; i < K_DIV_STEP_N; i++) {
+        if (k_div_steps[i] == cur)
+            cur_i = i;
+        if (k_div_steps[i] == raw)
+            raw_i = i;
+    }
+    /* Zone centers at i*127/5; boundaries midway. Require CC past midpoint
+     * by a deadband before accepting the step change. */
+    int lo = cur_i < raw_i ? cur_i : raw_i;
+    int hi = cur_i < raw_i ? raw_i : cur_i;
+    int boundary = (lo * 127 + hi * 127) / (2 * (K_DIV_STEP_N - 1));
+    const int dead = 4;
+    if (raw_i > cur_i) {
+        if ((int)cc < boundary + dead)
+            return cur;
+    } else {
+        if ((int)cc > boundary - dead)
+            return cur;
+    }
+    return raw;
+}
+
+uint8_t engine_division_cc_center(int slices)
+{
+    int n = engine_division_quantize_slices(slices);
+    int si = 0;
+    for (int i = 0; i < K_DIV_STEP_N; i++) {
+        if (k_div_steps[i] == n) {
+            si = i;
+            break;
+        }
+    }
+    return (uint8_t)((si * 127) / (K_DIV_STEP_N - 1));
 }
 
 int engine_division_step(int slices, int delta)
@@ -258,7 +322,7 @@ static void resolve_window(const EpicycleEngine *eng, EpicyclePad *pad, float *s
 {
     (void)eng;
     float len = pad->freeform ? pad->window_length : division_length_frac(pad);
-    len = clampf(len, 0.001f, 1.0f);
+    len = clampf(len, trim_min_len(pad), 1.0f);
     float start = clampf(pad->window_start, 0.0f, 1.0f - len);
     *start_out = start;
     *len_out = len;
@@ -374,7 +438,7 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
         }
     }
 
-    float len = clampf(base_len + d_len, 0.001f, 1.0f);
+    float len = clampf(base_len + d_len, trim_min_len(pad), 1.0f);
     float start = clampf(base_start + d_start, 0.0f, 1.0f - len);
     pad->mod_window_start = start;
     pad->mod_window_length = len;
@@ -522,8 +586,11 @@ void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
         engine_division_snap_brace(eng, pad);
         return;
     }
-    p->window_length = clampf(length, 0.001f, 1.0f);
-    p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
+    {
+        float min_l = trim_min_len(p);
+        p->window_length = clampf(length, min_l, 1.0f);
+        p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
+    }
     engine_sync_mod_window(eng, pad);
 }
 
@@ -570,7 +637,8 @@ void engine_trim_set_start(EpicycleEngine *eng, int pad, float start01)
     float end = p->window_start + p->window_length;
     if (end > 1.0f)
         end = 1.0f;
-    float start = clampf(start01, 0.0f, end - 0.02f);
+    float min_l = trim_min_len(p);
+    float start = clampf(start01, 0.0f, end - min_l);
     engine_set_window(eng, pad, start, end - start);
 }
 
@@ -581,7 +649,8 @@ void engine_trim_set_end(EpicycleEngine *eng, int pad, float end01)
         return;
     EpicyclePad *p = &eng->pads[pad];
     float start = p->window_start;
-    float end = clampf(end01, start + 0.02f, 1.0f);
+    float min_l = trim_min_len(p);
+    float end = clampf(end01, start + min_l, 1.0f);
     engine_set_window(eng, pad, start, end - start);
 }
 
@@ -591,9 +660,10 @@ void engine_trim_set_position(EpicycleEngine *eng, int pad, float pos01)
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     EpicyclePad *p = &eng->pads[pad];
+    float min_l = trim_min_len(p);
     float len = p->window_length;
-    if (len < 0.02f)
-        len = 0.02f;
+    if (len < min_l)
+        len = min_l;
     float start = clampf(pos01, 0.0f, 1.0f - len);
     engine_set_window(eng, pad, start, len);
 }
@@ -742,8 +812,11 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
             if (mask & 2u)
                 engine_trim_set_end(eng, pad, t2);
         } else {
-            if (mask & 2u)
-                engine_set_division(eng, pad, engine_division_from_cc(k2));
+            if (mask & 2u) {
+                int n = engine_division_from_cc_sticky(k2, p->division_beats);
+                if (n != engine_division_quantize_slices(p->division_beats))
+                    engine_set_division(eng, pad, n);
+            }
             if (mask & 1u) {
                 int n = engine_division_quantize_slices(p->division_beats);
                 int idx = (int)((t1 * (float)n));
@@ -968,7 +1041,11 @@ static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigne
         f = 0.95f;
     if (f < 0.001f)
         f = 0.001f;
-    float q = 0.05f + clampf(pad->filter_reso, 0.0f, 1.0f) * 0.85f;
+    /* Chamberlin "q" is damping: lower = more resonance. Map knob so
+     * CC 0 = min reso (high damp), CC 127 = max reso (low damp).
+     * (Ash 0.2.10: previous map felt reversed — 0=full, 127=min.) */
+    float damp = 0.90f - clampf(pad->filter_reso, 0.0f, 1.0f) * 0.85f;
+    float q = damp;
     if (f * q > 0.95f)
         q = 0.95f / f;
 

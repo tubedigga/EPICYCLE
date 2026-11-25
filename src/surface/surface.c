@@ -13,19 +13,18 @@
  *   - SAMPLE=6, SHIFT=49, LOOP=74, MUTE=43; soft B1/B2/B3 = 12/13/14
  *   - 0x42 position request → dump CC19,16,17,18,20 + CC100=0
  *
- * Untrusted-stream rules (0.2.8+; 0.2.10 hardens page/phantom further):
+ * Untrusted-stream rules (0.2.8+; 0.2.11 hard-isolates soft keys / SAMPLE):
  *   - Prefer drop junk over acting on it.
  *   - SysEx cancels running status; never restore.
  *   - AT/pressure/pitch-bend/program: consume & ignore (no snap to notes).
- *   - Soft keys need an explicit status byte (no running-status soft keys);
- *     B1/B2 fire on press; B3 quit on release after a minimum hold; hold
- *     timeout unsticks missed note-offs.
- *   - HARD: knobs / fader / wheel / encoder NEVER change pages. Soft-key
- *     page fires are suppressed while controls were recently active
- *     (CC16–20, CC100, encoder push). Pages only from real B1/B2 presses.
- *   - Pad LEDs only from real note-on/off (never AT).
+ *   - Soft keys need an explicit status byte (no running-status soft keys).
+ *   - HARD isolate: B1/B2/B3 fire only on CLEAN RELEASE after a short hold;
+ *     any pad / CC / other-button activity during the hold cancels the arm.
+ *     Soft keys also suppressed while controls or pads were recently active.
+ *   - Pad note-ons need explicit status + vel≥8; status cleared after pads.
+ *   - SAMPLE LED tracks sample_held; forced off after open drain (no boot flash).
  *   - Volume CC path never lights buttons or pages.
- *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys.
+ *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys / SAMPLE.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -75,28 +74,37 @@ static uint8_t m_d[2];
 static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT];
 
 /*
- * Soft keys: track down + hold time.
- * B1/B2 fire immediately on press (Ash 0.2.8: release path felt laggy).
- * B3 quit still fires on release after a longer hold (false-quit guard).
- * Held latch times out so a missed note-off cannot permanently stick paging.
+ * Soft keys: hard-isolated from pads/knobs.
+ * Arm on explicit press; fire on clean release after a short hold.
+ * Any non-soft MIDI during the hold cancels the arm (Ash: phantom pages).
+ * B3 quit needs a longer hold. Stuck latch times out on missed note-off.
  */
 static uint8_t g_soft_down[3];
 static double g_soft_down_t[3];
 static double g_soft_last_fire_t[3];
+#define SOFT_PAGE_HOLD_S 0.035
 #define SOFT_QUIT_HOLD_S 0.120
 #define SOFT_STUCK_S 1.50
-#define SOFT_PAGE_GAP_S 0.120
-/* Knobs/encoder must never page — suppress B1/B2 briefly after control CCs. */
+#define SOFT_PAGE_GAP_S 0.100
+/* Knobs/encoder/pads must never page — suppress soft keys after bus activity. */
 static double g_ctrl_activity_t;
-#define CTRL_PAGE_GUARD_S 0.280
-/* Shift is momentary; auto-clear if note-off was lost (Ash: sticky xfade UI). */
+static double g_pad_activity_t;
+#define CTRL_PAGE_GUARD_S 0.350
+#define PAD_PAGE_GUARD_S 0.400
+/* Shift / SAMPLE momentary; auto-clear if note-off was lost. */
 static double g_shift_down_t;
+static double g_sample_down_t;
+static int g_sample_led = -1;
+static int g_open_quiet; /* 1 while draining boot dump — no SAMPLE LED flash */
 #define SHIFT_STUCK_S 3.00
+#define SAMPLE_STUCK_S 8.00
 
 static uint8_t g_main_pending;
 static int g_main_pending_n;
 static uint8_t g_fader_pending;
 static int g_fader_pending_n;
+
+static void light_button(int fd, uint8_t note_cc, uint8_t level);
 
 static double now_s(void)
 {
@@ -108,13 +116,48 @@ static double now_s(void)
 static void mark_ctrl_activity(void)
 {
     g_ctrl_activity_t = now_s();
+    /* Cancel any soft-key hold in progress — knobs must never finish a page. */
+    for (int i = 0; i < 3; i++) {
+        g_soft_down[i] = 0;
+        g_soft_down_t[i] = 0;
+    }
 }
 
-static int ctrl_blocks_pages(void)
+static void mark_pad_activity(void)
 {
-    if (g_ctrl_activity_t <= 0.0)
-        return 0;
-    return (now_s() - g_ctrl_activity_t) < CTRL_PAGE_GUARD_S;
+    g_pad_activity_t = now_s();
+    for (int i = 0; i < 3; i++) {
+        g_soft_down[i] = 0;
+        g_soft_down_t[i] = 0;
+    }
+}
+
+static int bus_blocks_pages(void)
+{
+    double t = now_s();
+    if (g_ctrl_activity_t > 0.0 && (t - g_ctrl_activity_t) < CTRL_PAGE_GUARD_S)
+        return 1;
+    if (g_pad_activity_t > 0.0 && (t - g_pad_activity_t) < PAD_PAGE_GUARD_S)
+        return 1;
+    return 0;
+}
+
+static void sample_led_set(int on)
+{
+    int want = on ? 2 : 0;
+    if (want == g_sample_led)
+        return;
+    g_sample_led = want;
+    if (!g_open_quiet)
+        light_button(g_fd, NOTE_SAMPLE, (uint8_t)want);
+}
+
+static void clear_ch_running(void)
+{
+    m_status = 0;
+    m_need = 0;
+    m_n = 0;
+    m_fresh_status = 0;
 }
 
 static int pad_index(uint8_t note)
@@ -234,9 +277,16 @@ static void soft_clear_stuck(void)
         g_state.shift_held = 0;
         g_shift_down_t = 0.0;
     }
+    /* Missed SAMPLE note-off → LED sticky; clear after timeout. */
+    if (g_state.sample_held && g_sample_down_t > 0.0 &&
+        (t - g_sample_down_t) > SAMPLE_STUCK_S) {
+        g_state.sample_held = 0;
+        g_sample_down_t = 0.0;
+        sample_led_set(0);
+    }
 }
 
-/* Soft key: B1/B2 fire on press; B3 quit on release after min hold. */
+/* Soft key: arm on press; fire on clean release after hold. Hard-isolated. */
 static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
 {
     if (which < 0 || which > 2)
@@ -252,41 +302,44 @@ static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
             return;
         if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
             return;
-        /* HARD: while knobs/encoder are moving, ignore page soft keys.
-         * Ash 0.2.9: adjusting division / pots jumped pages toward LFO. */
-        if ((which == 0 || which == 1) && ctrl_blocks_pages())
+        /* HARD: while knobs/pads are active, ignore soft-key arms entirely. */
+        if (bus_blocks_pages())
             return;
         g_soft_down[which] = 1;
         g_soft_down_t[which] = t;
-        /* Pages: immediate on press (not release) so flips feel instant. */
-        if (which == 0 || which == 1) {
-            g_soft_last_fire_t[which] = t;
-            if (which == 0)
-                g_state.soft_left = 1;
-            else
-                g_state.soft_mid = 1;
-            /* Page change drops sticky Shift overlay. */
-            g_state.shift_held = 0;
-            g_shift_down_t = 0.0;
-        }
         return;
     }
 
-    /* note-off */
+    /* note-off — fire only if still armed (not cancelled mid-hold). */
     if (!g_soft_down[which])
         return;
     double held = t - g_soft_down_t[which];
     g_soft_down[which] = 0;
     g_soft_down_t[which] = 0;
 
-    /* B1/B2 already fired on press. */
-    if (which == 0 || which == 1)
+    if (held > SOFT_STUCK_S)
+        return;
+    if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
+        return;
+    /* Re-check bus: a late pad/CC must not let a release finish the page. */
+    if (bus_blocks_pages())
         return;
 
-    /* B3 quit: release after minimum hold. */
-    if (held < SOFT_QUIT_HOLD_S || held > SOFT_STUCK_S)
+    if (which == 0 || which == 1) {
+        if (held < SOFT_PAGE_HOLD_S)
+            return;
+        g_soft_last_fire_t[which] = t;
+        if (which == 0)
+            g_state.soft_left = 1;
+        else
+            g_state.soft_mid = 1;
+        g_state.shift_held = 0;
+        g_shift_down_t = 0.0;
         return;
-    if ((t - g_soft_last_fire_t[2]) < SOFT_PAGE_GAP_S)
+    }
+
+    /* B3 quit: longer hold. */
+    if (held < SOFT_QUIT_HOLD_S)
         return;
     g_soft_last_fire_t[2] = t;
     g_state.soft_right = 1;
@@ -414,10 +467,7 @@ static void dispatch_msg(int explicit_status)
             break; /* unknown CC — ignore (never treat as notes/LEDs) */
         }
         /* Knobs/wheel never leave note running-status that could fake pages. */
-        m_status = 0;
-        m_need = 0;
-        m_n = 0;
-        m_fresh_status = 0;
+        clear_ch_running();
         return;
     }
 
@@ -428,15 +478,21 @@ static void dispatch_msg(int explicit_status)
             on = 0;
 
         if (m_d[0] == NOTE_SAMPLE) {
-            if (!explicit_status && on)
+            if (!explicit_status && on) {
+                clear_ch_running();
                 return; /* no running-status SAMPLE */
+            }
             g_state.sample_held = on ? 1 : 0;
-            light_button(g_fd, NOTE_SAMPLE, on ? 2 : 0);
-            /* SAMPLE edge clears sticky Shift (momentary modifier). */
             if (on) {
+                g_sample_down_t = now_s();
+                /* SAMPLE edge clears sticky Shift (momentary modifier). */
                 g_state.shift_held = 0;
                 g_shift_down_t = 0.0;
+            } else {
+                g_sample_down_t = 0.0;
             }
+            sample_led_set(on);
+            clear_ch_running();
             return;
         }
         if (m_d[0] == NOTE_SHIFT) {
@@ -444,23 +500,23 @@ static void dispatch_msg(int explicit_status)
              * Note-on needs explicit status; note-off always clears (even
              * running-status) so a lost status cannot stick the Trim overlay. */
             if (on) {
-                if (!explicit_status)
+                if (!explicit_status) {
+                    clear_ch_running();
                     return;
+                }
                 g_state.shift_held = 1;
                 g_shift_down_t = now_s();
             } else {
                 g_state.shift_held = 0;
                 g_shift_down_t = 0.0;
             }
+            clear_ch_running();
             return;
         }
         if (m_d[0] == NOTE_LOOP) {
             if (on && explicit_status)
                 g_state.loop_btn = 1;
-            m_status = 0;
-            m_need = 0;
-            m_n = 0;
-            m_fresh_status = 0;
+            clear_ch_running();
             return;
         }
         if (m_d[0] == 111) {
@@ -468,52 +524,54 @@ static void dispatch_msg(int explicit_status)
                 g_state.wheel_press = 1;
                 mark_ctrl_activity(); /* encoder push never pages */
             }
-            m_status = 0;
-            m_need = 0;
-            m_n = 0;
-            m_fresh_status = 0;
+            clear_ch_running();
             return;
         }
         if (m_d[0] == NOTE_SOFT0 || m_d[0] == NOTE_SOFT1 || m_d[0] == NOTE_SOFT2) {
             soft_key_msg((int)m_d[0] - NOTE_SOFT0, on, explicit_status);
             /* Kill running status so soft-key data cannot chain into pads. */
-            m_status = 0;
-            m_need = 0;
-            m_n = 0;
-            m_fresh_status = 0;
+            clear_ch_running();
             return;
         }
         (void)NOTE_MUTE;
+        /* Unknown ch1 note — still clear running status (no phantom chain). */
+        clear_ch_running();
         return;
     }
 
     if (ch == 9 && (cmd == 0x90 || cmd == 0x80)) {
         int idx = pad_index(m_d[0]);
-        if (idx < 0)
+        if (idx < 0) {
+            clear_ch_running();
             return;
+        }
         if (cmd == 0x90 && m_d[1] > 0) {
             /* Explicit status required: a lost AT status under leftover 0x99
              * turns (nn,pp) into phantom pad note-ons (Ash: random pads). */
-            if (!explicit_status)
+            if (!explicit_status) {
+                clear_ch_running();
                 return;
-            if (m_d[1] < 2)
-                return; /* ignore near-zero velocity phantoms */
+            }
+            if (m_d[1] < 8) {
+                clear_ch_running();
+                return; /* ignore low-velocity phantoms / AT bleed */
+            }
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1;
+            mark_pad_activity();
             refresh_pad_led(idx); /* LED only on real note-on */
         } else {
-            if (!explicit_status && g_state.pad_vel[idx] == 0)
+            if (!explicit_status && g_state.pad_vel[idx] == 0) {
+                clear_ch_running();
                 return;
+            }
             if (g_state.pad_vel[idx] > 0)
                 g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
             refresh_pad_led(idx); /* LED only on real note-off */
         }
         /* Kill running status so orphan AT data cannot become pad notes. */
-        m_status = 0;
-        m_need = 0;
-        m_n = 0;
-        m_fresh_status = 0;
+        clear_ch_running();
         return;
     }
 }
@@ -586,9 +644,14 @@ static void midi_drain(int fd, double seconds)
         struct pollfd p = {.fd = fd, .events = POLLIN, .revents = 0};
         poll(&p, 1, 10);
     }
-    /* Soft keys must not arm from the 0x42 dump / LED echo. */
+    /* Soft keys / SAMPLE must not arm from the 0x42 dump / LED echo. */
     g_state.soft_left = g_state.soft_mid = g_state.soft_right = 0;
     memset(g_soft_down, 0, sizeof g_soft_down);
+    g_state.sample_held = 0;
+    g_sample_down_t = 0.0;
+    g_state.shift_held = 0;
+    g_shift_down_t = 0.0;
+    clear_ch_running();
 }
 
 int surface_open(void)
@@ -612,6 +675,11 @@ int surface_open(void)
     g_main_pending_n = 0;
     g_fader_pending_n = 0;
     g_shift_down_t = 0.0;
+    g_sample_down_t = 0.0;
+    g_sample_led = -1;
+    g_ctrl_activity_t = 0.0;
+    g_pad_activity_t = 0.0;
+    g_open_quiet = 0;
     g_fd = -1;
     m_status = m_need = m_n = m_sysex = m_fresh_status = 0;
     snprintf(g_info, sizeof g_info, "no Surface card");
@@ -640,11 +708,18 @@ int surface_open(void)
         g_state.open = 1;
         snprintf(g_info, sizeof g_info, "Surface #%d D%d", card, dev);
 
+        g_open_quiet = 1;
         surface_lights_off(fd);
         static const uint8_t req[] = {0xf0, 0x47, 0x7f, 0x5c, 0x42, 0x00, 0x00, 0xf7};
         (void)midi_write_all(fd, req, sizeof req);
         /* Absorb 0x42 dump + any LED write echoes before the app arms UI. */
         midi_drain(fd, 0.08);
+        g_open_quiet = 0;
+        /* Force SAMPLE LED dark + state clear — no boot lit→unlit flash. */
+        g_state.sample_held = 0;
+        g_sample_down_t = 0.0;
+        g_sample_led = -1;
+        sample_led_set(0);
         return 0;
     }
 
@@ -738,7 +813,11 @@ static void midi_selftest_reset(void)
     g_main_pending_n = 0;
     g_fader_pending_n = 0;
     g_shift_down_t = 0.0;
+    g_sample_down_t = 0.0;
+    g_sample_led = -1;
     g_ctrl_activity_t = 0.0;
+    g_pad_activity_t = 0.0;
+    g_open_quiet = 0;
 }
 
 static void midi_feed_buf(const uint8_t *b, size_t n)
@@ -786,28 +865,32 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 3) B1/B2 fire on press; running-status soft key ignored; no double on release. */
+    /* 3) B1/B2 fire on clean release after hold; press alone does not page. */
     midi_selftest_reset();
     {
         const uint8_t press[] = {0x90, 12, 127};
         midi_feed_buf(press, sizeof press);
-        if (!g_state.soft_left)
-            fails++;
-        g_state.soft_left = 0;
+        if (g_state.soft_left)
+            fails++; /* arm only — no fire on press */
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
         const uint8_t up[] = {0x80, 12, 0};
         midi_feed_buf(up, sizeof up);
-        if (g_state.soft_left)
-            fails++; /* release must not re-fire */
+        if (!g_state.soft_left)
+            fails++; /* clean release fires */
+        g_state.soft_left = 0;
     }
     midi_selftest_reset();
     {
         const uint8_t down[] = {0x90, 12, 127};
         midi_feed_buf(down, sizeof down);
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
         if (!g_state.soft_left)
             fails++;
         g_state.soft_left = 0;
-        const uint8_t up[] = {0x80, 12, 0};
-        midi_feed_buf(up, sizeof up);
 
         /* Running-status continuation must NOT arm soft key */
         const uint8_t run[] = {13, 127}; /* would be soft-mid under 0x90 */
@@ -815,6 +898,20 @@ int surface_midi_selftest(void)
         const uint8_t runoff[] = {0x80, 13, 0};
         midi_feed_buf(runoff, sizeof runoff);
         if (g_state.soft_mid)
+            fails++;
+    }
+    /* 3b) Knob mid-hold cancels B1 — hard isolate. */
+    midi_selftest_reset();
+    {
+        const uint8_t down[] = {0x90, 12, 127};
+        midi_feed_buf(down, sizeof down);
+        const uint8_t knob[] = {0xb0, 17, 64};
+        midi_feed_buf(knob, sizeof knob);
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
+        if (g_state.soft_left)
             fails++;
     }
 
@@ -965,16 +1062,21 @@ int surface_midi_selftest(void)
         midi_feed_buf(knobs, sizeof knobs);
         const uint8_t page[] = {0x90, 12, 127};
         midi_feed_buf(page, sizeof page);
+        struct timespec hold = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+        nanosleep(&hold, NULL);
+        const uint8_t up0[] = {0x80, 12, 0};
+        midi_feed_buf(up0, sizeof up0);
         if (g_state.soft_left)
             fails++; /* must be blocked by ctrl guard */
         g_state.soft_left = 0;
-        /* After guard window, real B1 still works. */
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 320 * 1000 * 1000L};
+        /* After guard window, real B1 still works (press + hold + release). */
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 400 * 1000 * 1000L};
         nanosleep(&ts, NULL);
-        const uint8_t up[] = {0x80, 12, 0};
-        midi_feed_buf(up, sizeof up);
         const uint8_t page2[] = {0x90, 12, 127};
         midi_feed_buf(page2, sizeof page2);
+        nanosleep(&hold, NULL);
+        const uint8_t up2[] = {0x80, 12, 0};
+        midi_feed_buf(up2, sizeof up2);
         if (!g_state.soft_left)
             fails++;
     }
@@ -989,7 +1091,55 @@ int surface_midi_selftest(void)
         g_state.wheel_press = 0;
         const uint8_t page[] = {0x90, 13, 127};
         midi_feed_buf(page, sizeof page);
+        struct timespec hold = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+        nanosleep(&hold, NULL);
+        const uint8_t up[] = {0x80, 13, 0};
+        midi_feed_buf(up, sizeof up);
         if (g_state.soft_mid)
+            fails++;
+    }
+
+    /* 12) Pad activity cancels in-flight soft key + suppresses pages. */
+    midi_selftest_reset();
+    {
+        const uint8_t soft[] = {0x90, 12, 127};
+        midi_feed_buf(soft, sizeof soft);
+        const uint8_t pad[] = {0x99, 37, 100};
+        midi_feed_buf(pad, sizeof pad);
+        struct timespec hold = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
+        nanosleep(&hold, NULL);
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
+        if (g_state.soft_left)
+            fails++;
+        if (!g_state.pad_down[0])
+            fails++;
+    }
+
+    /* 13) Low-velocity pad note-on ignored (phantom guard). */
+    midi_selftest_reset();
+    {
+        const uint8_t soft[] = {0x99, 37, 5};
+        midi_feed_buf(soft, sizeof soft);
+        if (g_state.pad_down[0] || g_state.pad_vel[0])
+            fails++;
+    }
+
+    /* 14) SAMPLE explicit on/off; running-status SAMPLE on ignored. */
+    midi_selftest_reset();
+    {
+        const uint8_t on[] = {0x90, 6, 127};
+        midi_feed_buf(on, sizeof on);
+        if (!g_state.sample_held)
+            fails++;
+        const uint8_t off[] = {0x80, 6, 0};
+        midi_feed_buf(off, sizeof off);
+        if (g_state.sample_held)
+            fails++;
+        const uint8_t run[] = {0x90, 49, 127, 6, 127}; /* Shift then orphan SAMPLE */
+        midi_feed_buf(run, sizeof run);
+        /* After Shift, status cleared — orphan 6,127 dropped; SAMPLE stays off. */
+        if (g_state.sample_held)
             fails++;
     }
 

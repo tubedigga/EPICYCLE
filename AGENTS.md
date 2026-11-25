@@ -42,8 +42,8 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 ## Loop / mod model (v0)
 
 - Brace = **window** (`window_start` + `window_length`); knobs/LFO slide start across the sample.
-- Division: equal-slice grid — length = sample/N (N typically 1/2/4/8/16/32); brace
-  snaps to slice. Freeform: Start/End set width; POS slides.
+- Division: equal-slice grid — length = sample/N (N sticky 1/2/4/8/16/32 only); brace
+  snaps to slice. Freeform: Start/End set width (near-zero / 1-frame min OK); POS slides.
 - Per pad: up to **2 LFOs** and **4 mod routes** (`EpicycleModDest`: brace start/len, pitch, level, filter stub).
 - Aggressive **brace scrub** limited to first **8** pads that request it (`EPICYCLE_SCRUB_BUDGET`); others may still use pitch/level LFO.
 - Full modulation-matrix UI can come later — keep the structs/routes wired.
@@ -61,6 +61,6 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 | --- | --- |
 | Crossfade loop voices, WAV load, division/free | Phrase recorder |
 | Brace scroll (knobs/wheel/LFO), pitch ratio | Full ADSR |
-| Chamberlin SVF filter (OFF/LPF/HPF/BPF/NOTCH) | Richer filt-env shapes |
+| Chamberlin SVF filter (reso 0=min..127=max) | Richer filt-env shapes |
 | Mod matrix data model + basic LFO | Full matrix UI |
 | Host `--preview` non-silent check | Hardware sign-off |

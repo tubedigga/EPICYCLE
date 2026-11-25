@@ -55,11 +55,15 @@ DIV N   |[#][#][#][#]…                 |   equal slices; brace = one slice
 ```
 
 Division mode uses an equal-slice grid (length = 1/N), not tempo-mapped beat
-frames. Latch mode: pad press toggles loop on/off; one-shot plays through on press.
+frames. N is sticky (musical 1/2/4/8/16/32 only) with K2 hysteresis so MIDI noise
+cannot flicker the count. FREE Trim allows near-zero width (1-frame min).
+Latch mode: pad press toggles loop on/off; one-shot plays through on press.
 
 Mod destinations: `BRACE_START`, `BRACE_LEN`, `PITCH`, `LEVEL`, `FILTER` (stub).
-LFO page edits shape / rate / sync|free / depth (enables brace scrub).
-Pages cycle only via soft keys B1/B2 — knobs/encoder never change `mode_page`.
+LFO page edits shape / rate / sync|free / depth (enables brace scrub). LFO never
+rewrites DIV N. Pages cycle only via soft keys B1/B2 (clean release) — knobs /
+pads / encoder never change `mode_page`. Filter Chamberlin damping maps knob
+0=min reso … 127=max.
 
 ## Data on card
 
