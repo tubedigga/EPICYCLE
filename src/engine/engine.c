@@ -71,11 +71,13 @@ static void pad_defaults(EpicyclePad *p)
     p->semitone = 0;
     p->fine = 0.0f;
     p->crossfade = 0.05f;
-    p->loop_enable = 1; /* EPICYCLE default: latch (pad press toggles on/off) */
+    p->loop_enable = 0; /* Tombola default: one-shot; LOOP button enables latch */
     p->ping_pong = 0;   /* Forward; SHIFT on Trim selects Ping-pong */
     p->allow_scrub = 1;
     p->amp_attack = 0.0f;
-    p->amp_decay = 0.35f;
+    p->amp_decay = 0.25f;
+    p->amp_sustain = 0.85f;
+    p->amp_release = 0.35f;
     p->vel_sens = 1.0f;
     p->filter_cutoff = 1.0f; /* open */
     p->filter_reso = 0.0f;
@@ -140,15 +142,32 @@ const char *epicycle_page_name(EpicycleModePage page)
 const char *epicycle_hitmod_dest_name(EpicycleHitModDest dest)
 {
     switch (dest) {
+    case EPICYCLE_HITMOD_LEVEL:
+        return "VOL";
     case EPICYCLE_HITMOD_PITCH:
         return "PITCH";
     case EPICYCLE_HITMOD_FILTER:
-        return "FILT";
-    case EPICYCLE_HITMOD_LEVEL:
-        return "LEVEL";
+        return "CUT";
+    case EPICYCLE_HITMOD_SEND_A:
+        return "SNDA";
+    case EPICYCLE_HITMOD_SEND_B:
+        return "SNDB";
     case EPICYCLE_HITMOD_NONE:
     default:
         return "OFF";
+    }
+}
+
+const char *epicycle_hitmod_src_name(EpicycleHitModSrc src)
+{
+    switch (src) {
+    case EPICYCLE_HITMOD_SRC_ANGLE:
+        return "ANGL";
+    case EPICYCLE_HITMOD_SRC_HARDNESS:
+        return "HARD";
+    case EPICYCLE_HITMOD_SRC_IMPACT:
+    default:
+        return "IMPA";
     }
 }
 
@@ -687,6 +706,35 @@ void engine_trim_set_position(EpicycleEngine *eng, int pad, float pos01)
     engine_set_window(eng, pad, start, len);
 }
 
+enum { ENV_A = 0, ENV_D = 1, ENV_S = 2, ENV_R = 3 };
+
+/* Map 0..1 knob → seconds (A/D/R). */
+static float adsr_time_s(float kn, float min_s, float max_s)
+{
+    float t = clampf(kn, 0.0f, 1.0f);
+    /* Slightly exponential so low settings stay snappy. */
+    return min_s + (max_s - min_s) * t * t;
+}
+
+static void voice_start_attack(EpicycleVoice *v, const EpicyclePad *p, float velocity)
+{
+    v->active = 1;
+    v->phase = (double)p->mod_window_start * (double)p->sample->frames;
+    v->velocity = clampf(velocity, 0.05f, 1.0f);
+    v->env = 0.0f;
+    v->env_stage = ENV_A;
+    v->gate = 1;
+    v->in_crossfade = 0;
+    v->xfade_pos = 0;
+    v->direction = 1;
+    v->filt_z1_l = v->filt_z2_l = 0.0f;
+    v->filt_z1_r = v->filt_z2_r = 0.0f;
+    v->filt_env = 0.0f;
+    v->impact_pitch = 1.0f;
+    v->impact_filt = 0.0f;
+    v->impact_level = 1.0f;
+}
+
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
 {
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
@@ -709,33 +757,43 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     apply_modulation(eng, pad, 0);
 
     EpicycleVoice *v = &eng->voices[vidx];
-    v->active = 1;
     v->pad_index = pad;
-    v->phase = (double)p->mod_window_start * (double)p->sample->frames;
-    v->velocity = clampf(velocity, 0.05f, 1.0f);
-    v->env = 1.0f;
-    v->in_crossfade = 0;
-    v->xfade_pos = 0;
-    v->direction = 1; /* always start forward; ping-pong flips at ends */
-    v->filt_z1_l = v->filt_z2_l = 0.0f;
-    v->filt_z1_r = v->filt_z2_r = 0.0f;
-    v->filt_env = 0.0f;
-    v->impact_pitch = 1.0f;
-    v->impact_filt = 0.0f;
-    v->impact_level = 1.0f;
+    voice_start_attack(v, p, velocity);
+    v->force_oneshot = 0; /* pad press respects LOOP latch */
 }
 
 void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
                            float filt_add, float level_mul)
 {
-    engine_note_on(eng, pad, velocity);
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
+    EpicyclePad *p = &eng->pads[pad];
+    if (!p->sample || !p->sample->data)
+        return;
+
+    /* LOOP on: bounce toggles — sustaining → Release fade; else start loop. */
+    if (p->loop_enable) {
+        for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+            EpicycleVoice *v = &eng->voices[i];
+            if (!v->active || v->pad_index != pad)
+                continue;
+            if (v->gate && v->env_stage != ENV_R) {
+                v->gate = 0;
+                v->env_stage = ENV_R;
+                return; /* Release fades the loop out (Ash) */
+            }
+            break;
+        }
+    }
+
+    engine_note_on(eng, pad, velocity);
     for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
         if (eng->voices[i].active && eng->voices[i].pad_index == pad) {
             eng->voices[i].impact_pitch = clampf(pitch_mul, 0.25f, 4.0f);
             eng->voices[i].impact_filt = clampf(filt_add, -0.9f, 0.9f);
             eng->voices[i].impact_level = clampf(level_mul, 0.05f, 2.0f);
+            /* LOOP off → one-shot bounce; LOOP on → allow sample loop + ADSR. */
+            eng->voices[i].force_oneshot = p->loop_enable ? 0 : 1;
             break;
         }
     }
@@ -743,7 +801,7 @@ void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float p
 
 void engine_stop_pad(EpicycleEngine *eng, int pad)
 {
-    /* Always silence pad voices (latch toggle-off / select cleanup). */
+    /* Hard silence (MUTE ball remove). Prefer engine_note_off for musical fade. */
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
@@ -754,11 +812,67 @@ void engine_stop_pad(EpicycleEngine *eng, int pad)
 
 void engine_note_off(EpicycleEngine *eng, int pad)
 {
-    /* Gate release: ignored for both latch and one-shot.
-     * Latch: pad press toggles via engine_stop_pad / note_on.
-     * One-shot: plays through the window (render ends the voice). */
-    (void)eng;
-    (void)pad;
+    /* Enter Release — amp ADSR fades out (loop or one-shot gate end). */
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+        EpicycleVoice *v = &eng->voices[i];
+        if (!v->active || v->pad_index != pad)
+            continue;
+        v->gate = 0;
+        if (v->env_stage != ENV_R)
+            v->env_stage = ENV_R;
+    }
+}
+
+/* Advance ADSR one sample; returns 0 if voice finished Release. */
+static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr)
+{
+    float atk = adsr_time_s(pad->amp_attack, 0.001f, 2.0f);
+    float dec = adsr_time_s(pad->amp_decay, 0.005f, 3.0f);
+    float sus = clampf(pad->amp_sustain, 0.0f, 1.0f);
+    float rel = adsr_time_s(pad->amp_release, 0.005f, 4.0f);
+    float inv_sr = 1.0f / (float)(sr ? sr : 44100);
+
+    if (!v->gate && v->env_stage != ENV_R)
+        v->env_stage = ENV_R;
+
+    switch (v->env_stage) {
+    case ENV_A: {
+        float step = inv_sr / atk;
+        v->env += step;
+        if (v->env >= 1.0f) {
+            v->env = 1.0f;
+            v->env_stage = ENV_D;
+        }
+        break;
+    }
+    case ENV_D: {
+        float step = (1.0f - sus) * inv_sr / dec;
+        v->env -= step;
+        if (v->env <= sus) {
+            v->env = sus;
+            v->env_stage = ENV_S;
+        }
+        break;
+    }
+    case ENV_S:
+        v->env = sus;
+        break;
+    case ENV_R:
+    default: {
+        /* Linear release from current level → 0 over release time. */
+        float step = inv_sr / rel;
+        v->env -= step;
+        if (v->env <= 0.001f) {
+            v->env = 0.0f;
+            v->active = 0;
+            return 0;
+        }
+        break;
+    }
+    }
+    return 1;
 }
 
 int engine_pad_voice_active(const EpicycleEngine *eng, int pad)
@@ -890,12 +1004,13 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
         }
         break;
     case EPICYCLE_PAGE_AMP:
+        /* K1 A · K2 D · K3 S; SHIFT: K1 R · K2 vel (handled in main for shift). */
         if (mask & 1u)
             p->amp_attack = t1;
         if (mask & 2u)
             p->amp_decay = t2;
         if (mask & 4u)
-            p->vel_sens = t3;
+            p->amp_sustain = t3;
         break;
     case EPICYCLE_PAGE_TUNE: {
         /* Neutral at CC 64 ≈ 0. Only update axes the user moved. */
@@ -1141,8 +1256,10 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             if (v->direction < 0)
                 step = -step;
 
-            if (pad->loop_enable && pad->ping_pong) {
-                /* Ping-pong: reverse at brace ends (no wrap). Soften with xfade length. */
+            /* LOOP+bounce loops sample under ADSR; LOOP off = one-shot bounce. */
+            int do_loop = pad->loop_enable && !v->force_oneshot;
+            float edge_mul = 1.0f;
+            if (do_loop && pad->ping_pong) {
                 read_sample(s, v->phase, &L, &R);
                 v->phase += step;
                 if (v->phase >= win1) {
@@ -1156,19 +1273,15 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     v->direction = 1;
                     v->in_crossfade = 0;
                 }
-                /* Optional short edge soften using crossfade amount as amp dip. */
                 double edge = xfade_frames;
                 double dist_end = win1 - v->phase;
                 double dist_start = v->phase - win0;
                 double near = dist_end < dist_start ? dist_end : dist_start;
                 if (near < edge && edge > 1.0)
-                    v->env = (float)(0.55 + 0.45 * (near / edge));
-                else
-                    v->env = 1.0f;
-            } else if (pad->loop_enable) {
-                /* Forward loop: near end, crossfade to window start. */
+                    edge_mul = (float)(0.55 + 0.45 * (near / edge));
+            } else if (do_loop) {
                 if (v->direction < 0)
-                    v->direction = 1; /* force forward when leaving ping-pong */
+                    v->direction = 1;
                 if (v->phase >= win1 - xfade_frames && !v->in_crossfade) {
                     v->in_crossfade = 1;
                     v->xfade_pos = 0;
@@ -1196,23 +1309,28 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     v->phase += pitch;
                     if (v->phase >= win1)
                         v->phase = win0;
-                    /* If the window scrolled under us, wrap into new bounds. */
                     if (v->phase < win0 || v->phase >= win1)
                         v->phase = win0 + fmod(v->phase - win0 + (win1 - win0) * 8.0, win1 - win0);
                 }
-                v->env = 1.0f;
             } else {
+                /* One-shot: play through brace, then ADSR Release fades out. */
                 if (v->phase >= win1 || v->phase < win0) {
-                    v->active = 0;
-                    continue;
+                    if (v->env_stage != ENV_R) {
+                        v->gate = 0;
+                        v->env_stage = ENV_R;
+                    }
+                    if (v->phase >= win1)
+                        v->phase = win1 - 1.0;
+                    if (v->phase < win0)
+                        v->phase = win0;
+                } else {
+                    v->phase += pitch;
                 }
                 read_sample(s, v->phase, &L, &R);
-                v->phase += pitch;
-                /* short release near end */
-                double rem = win1 - v->phase;
-                if (rem < 64.0)
-                    v->env = (float)(rem / 64.0);
             }
+
+            if (!voice_adsr_tick(v, pad, eng->sample_rate))
+                continue;
 
             /* Filter DSP (OFF = bypass). LFO→POS scrub untouched above. */
             voice_apply_filter(v, pad, eng->sample_rate, &L, &R);
@@ -1221,7 +1339,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             if (pad->vel_sens < 0.99f)
                 vel = pad->vel_sens * v->velocity + (1.0f - pad->vel_sens);
             float ilev = v->impact_level > 0.01f ? v->impact_level : 1.0f;
-            float g = pad->mod_level * eng->kit_level * vel * v->env * ilev;
+            float g = pad->mod_level * eng->kit_level * vel * v->env * ilev * edge_mul;
             /* Equal-power-ish pan from Mix page. */
             float pan = clampf(pad->pan, 0.0f, 1.0f);
             float gl = cosf(pan * (float)(0.5 * M_PI));

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT
  *
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
- * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod stub;
+ * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.0: morph fader, spin K1, physics hit→pitch/filt stub. Freeze = phase 2.
+ * 0.3.1: K1=shape K2=spin±dir K3=balls; empty start; bounce=one-shot; HitMod rows.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -35,7 +35,7 @@ static void usage(const char *argv0)
             "  --tombola-selftest physics containment + hit + mute ball checks\n"
             "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: SAMPLE+pad select; MUTE+pad ball; FULL LEVEL=HitMod; B3 quit.\n",
+            "  On device: K1 shape K2 spin K3 balls; MUTE+pad; FULL LEVEL=HitMod; B3 quit.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -140,7 +140,10 @@ static float g_trim_lock_len = -1.0f;
 static uint8_t g_pick_target[3];
 static uint8_t g_pick_prev[3];
 static uint8_t g_pick_on[3];
-static int g_trim_pos_idle = 1000; /* ticks since POS; exclusive while < 20 */
+static int g_trim_pos_idle = 1000; /* ticks since POS; exclusive while < 6 */
+static int g_trim_rel[3];          /* 1 = Start/End tracking in frame steps */
+static uint8_t g_trim_edge_cc[3];  /* last CC while relative */
+static int g_trim_last_edge;       /* 0=Start 1=End 2=POS — encoder fine */
 
 static int clampf_u8(int v)
 {
@@ -161,12 +164,49 @@ static int u8_near(int a, int b, int eps)
 
 static int pickup_crossed(int prev, int cur, int target)
 {
-    if (u8_near(cur, target, 2))
+    /* Slightly wider catch so FREE Start/End feel less sticky (Ash). */
+    if (u8_near(cur, target, 4))
         return 1;
     /* Crossed or landed on target between prev and cur. */
     if ((prev < target && cur >= target) || (prev > target && cur <= target))
         return 1;
     return 0;
+}
+
+/* 1-frame fraction for FREE Trim fine moves. */
+static float trim_frame_frac(const EpicycleEngine *eng, int pad)
+{
+    const EpicyclePad *p = &eng->pads[pad];
+    if (p->sample && p->sample->frames > 2)
+        return 1.0f / (float)p->sample->frames;
+    return 1e-6f;
+}
+
+/* Nudge Start/End by CC delta in frames (tiny grains on long samples). */
+static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
+{
+    if (!dcc)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    float frame = trim_frame_frac(eng, pad);
+    size_t frames = (p->sample && p->sample->frames > 2) ? p->sample->frames : 44100;
+    float step;
+    if (p->window_length < 0.03f || (dcc >= -2 && dcc <= 2)) {
+        /* Near-tiny or single ticks: true frame steps. */
+        step = frame * (float)dcc;
+    } else {
+        /* Coarse slew: ~half-sample per full pot throw. */
+        float fpc = (float)frames / 512.0f;
+        if (fpc < 1.0f)
+            fpc = 1.0f;
+        step = frame * fpc * (float)dcc;
+    }
+    if (end_edge) {
+        float end = p->window_start + p->window_length + step;
+        engine_trim_set_end(eng, pad, end);
+    } else {
+        engine_trim_set_start(eng, pad, p->window_start + step);
+    }
 }
 
 static void trim_apply_pos(EpicycleEngine *eng, int pad, float pos01)
@@ -223,9 +263,15 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
                    : g_pick_prev[2];
         break;
     case EPICYCLE_PAGE_AMP:
-        t0 = (uint8_t)clampf_u8((int)(p->amp_attack * 127.0f + 0.5f));
-        t1 = (uint8_t)clampf_u8((int)(p->amp_decay * 127.0f + 0.5f));
-        t2 = (uint8_t)clampf_u8((int)(p->vel_sens * 127.0f + 0.5f));
+        if (shift) {
+            t0 = (uint8_t)clampf_u8((int)(p->amp_release * 127.0f + 0.5f));
+            t1 = (uint8_t)clampf_u8((int)(p->vel_sens * 127.0f + 0.5f));
+            t2 = g_pick_prev[2];
+        } else {
+            t0 = (uint8_t)clampf_u8((int)(p->amp_attack * 127.0f + 0.5f));
+            t1 = (uint8_t)clampf_u8((int)(p->amp_decay * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)(p->amp_sustain * 127.0f + 0.5f));
+        }
         break;
     case EPICYCLE_PAGE_TUNE:
         t0 = (uint8_t)clampf_u8(p->semitone + 24);
@@ -275,6 +321,8 @@ static void pickup_arm(const EpicycleSurfaceState *surf, EpicycleEngine *eng)
     for (int i = 0; i < 3; i++) {
         g_pick_prev[i] = cur[i];
         g_pick_on[i] = 0;
+        g_trim_rel[i] = 0;
+        g_trim_edge_cc[i] = cur[i];
     }
     g_trim_pos_idle = 1000;
     if (eng) {
@@ -351,7 +399,7 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
 {
     const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
     EpicyclePad *p = &eng->pads[eng->selected_pad];
-    int pos_exclusive = (g_trim_pos_idle < 20);
+    int pos_exclusive = (g_trim_pos_idle < 6);
     /* FREE: ignore Start/End while POS active. DIV: ignore K2(N) while sliding. */
     unsigned ignore = 0;
     if (pos_exclusive)
@@ -384,34 +432,49 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
             g_pick_target[2] =
                 (uint8_t)clampf_u8((int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
             g_trim_pos_idle = 0;
+            g_trim_last_edge = 2;
         }
         return;
     }
 
     if (p->freeform) {
         if (mask & 1u) {
-            engine_trim_set_start(eng, eng->selected_pad, (float)surf->k1 / 127.0f);
+            /* First catch: absolute snap; then frame-fine relative (Ash grains). */
+            if (!g_trim_rel[0]) {
+                engine_trim_set_start(eng, eng->selected_pad, (float)surf->k1 / 127.0f);
+                g_trim_rel[0] = 1;
+                g_trim_edge_cc[0] = surf->k1;
+            } else {
+                int d = (int)surf->k1 - (int)g_trim_edge_cc[0];
+                g_trim_edge_cc[0] = surf->k1;
+                trim_nudge_edge(eng, eng->selected_pad, 0, d);
+            }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
-            g_pick_target[1] = (uint8_t)clampf_u8(
-                (int)((eng->pads[eng->selected_pad].window_start +
-                       eng->pads[eng->selected_pad].window_length) *
-                          127.0f +
-                      0.5f));
             g_pick_target[2] = (uint8_t)clampf_u8(
                 (int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
-            g_pick_on[1] = 0;
-            g_pick_on[2] = 0; /* POS must re-cross after width change */
+            /* Do NOT disarm End — fighting Start/End made tiny grains laggy. */
+            g_pick_on[2] = 0; /* POS re-cross only */
+            g_trim_rel[2] = 0;
             g_trim_pos_idle = 1000;
+            g_trim_last_edge = 0;
         }
         if (mask & 2u) {
-            engine_trim_set_end(eng, eng->selected_pad, (float)surf->k2 / 127.0f);
+            if (!g_trim_rel[1]) {
+                engine_trim_set_end(eng, eng->selected_pad, (float)surf->k2 / 127.0f);
+                g_trim_rel[1] = 1;
+                g_trim_edge_cc[1] = surf->k2;
+            } else {
+                int d = (int)surf->k2 - (int)g_trim_edge_cc[1];
+                g_trim_edge_cc[1] = surf->k2;
+                trim_nudge_edge(eng, eng->selected_pad, 1, d);
+            }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
-            g_pick_target[0] = (uint8_t)clampf_u8(
+            g_pick_target[2] = (uint8_t)clampf_u8(
                 (int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
-            g_pick_target[2] = g_pick_target[0];
-            g_pick_on[0] = 0;
             g_pick_on[2] = 0;
+            g_trim_rel[2] = 0;
             g_trim_pos_idle = 1000;
+            g_trim_last_edge = 1;
         }
     } else {
         if (mask & 2u) {
@@ -448,6 +511,7 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
             trim_refresh_free_targets(eng);
             g_pick_target[2] =
                 (uint8_t)clampf_u8((int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
+            g_trim_last_edge = 2;
         } else {
             trim_set_div_slice_from_cc(eng, eng->selected_pad, surf->k3);
             trim_refresh_div_pos_targets(eng);
@@ -735,12 +799,14 @@ int main(int argc, char **argv)
             eng.pads[i].filter_cutoff = 1.0f;
             eng.pads[i].mod_filter_cutoff = 1.0f;
         }
-        /* Tombola prefers one-shots on wall hits; LOOP still toggles latch. */
+        /* One-shot default; LOOP button enables latch for manual pad play. */
         eng.pads[i].loop_enable = 0;
     }
 
     if (preview_out) {
-        /* Drive physics for a moment so wall hits feed the preview. */
+        /* Seed a few balls so wall hits feed the preview (empty start otherwise). */
+        tombola_set_ball_count(tb, 4);
+        tombola_set_spin_cc(tb, 100);
         for (int i = 0; i < 90; i++) {
             tombola_step(tb, 1.0f / 60.0f);
             int pads[EPICYCLE_PAD_COUNT];
@@ -812,9 +878,9 @@ int main(int argc, char **argv)
         eng.pads[0].mod_level = eng.pads[0].level;
     }
     surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
-    tombola_set_spin_cc(tb, surface_state()->k1);
-    if (surface_state()->fader_engaged)
-        tombola_set_morph(tb, (float)surface_state()->fader / 127.0f);
+    /* Tombola: empty drum; spin/morph/balls engage only after user moves pots
+     * (Ash: spin must not jump alone from dump / noise). */
+    /* Do not apply K1/K2/K3 dump here. */
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -856,15 +922,16 @@ int main(int argc, char **argv)
                     engine_sync_mod_window(&eng, i);
                     pickup_arm(surf, &eng);
                 } else if (surf->mute_held) {
+                    /* Hold MUTE + pad: add/remove ball (compose 1–2 then build). */
                     tombola_toggle_ball(tb, i);
                     if (!tombola_ball_active(tb, i))
-                        engine_stop_pad(&eng, i);
+                        engine_note_off(&eng, i); /* Release fade when removed */
                     epicycle_log(&paths, "MUTE ball %d -> %s", i + 1,
                                  tombola_ball_active(tb, i) ? "in" : "out");
                 } else if (eng.pads[i].loop_enable) {
-                    /* LOOP latch: each pad press toggles that pad on/off. */
+                    /* LOOP latch: press toggles; off uses ADSR Release fade. */
                     if (engine_pad_voice_active(&eng, i))
-                        engine_stop_pad(&eng, i);
+                        engine_note_off(&eng, i);
                     else {
                         float vel =
                             surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
@@ -909,22 +976,105 @@ int main(int argc, char **argv)
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
-        /* On Tombola: fader = morph (master fader gain stays full). Else fader = gain. */
+        /* Fader = master gain on every page (shape morph moved to K1). */
         if (surf->fader_engaged && surf->fader != last_fader) {
             last_fader = surf->fader;
-            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                tombola_set_morph(tb, (float)surf->fader / 127.0f);
-                engine_set_fader_gain_cc(&eng, 127);
-            } else {
-                engine_set_fader_gain_cc(&eng, surf->fader);
-            }
+            engine_set_fader_gain_cc(&eng, surf->fader);
         }
 
         if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-            tombola_set_spin_cc(tb, surf->k1);
+            /* Engage latches: ignore dump + pot noise until user moves ≥3. */
+            static uint8_t tk1 = 255, tk2 = 255, tk3 = 255;
+            static uint8_t tk1_dump = 255, tk2_dump = 255, tk3_dump = 255;
+            static int tk1_on, tk2_on, tk3_on;
+            static uint8_t tk2_pend = 255;
+            static int tk2_pend_n;
+            if (tk1_dump == 255) {
+                tk1_dump = surf->k1;
+                tk2_dump = surf->k2;
+                tk3_dump = surf->k3;
+                tk1 = surf->k1;
+                tk2 = surf->k2;
+                tk3 = surf->k3;
+            }
+            if (!tk1_on) {
+                int d = (int)surf->k1 - (int)tk1_dump;
+                if (d < 0)
+                    d = -d;
+                if (d >= 3)
+                    tk1_on = 1;
+            }
+            if (tk1_on && surf->k1 != tk1) {
+                tk1 = surf->k1;
+                tombola_set_morph(tb, (float)surf->k1 / 127.0f);
+            }
+            if (!tk2_on) {
+                int d = (int)surf->k2 - (int)tk2_dump;
+                if (d < 0)
+                    d = -d;
+                if (d >= 3)
+                    tk2_on = 1;
+            }
+            if (tk2_on && surf->k2 != tk2) {
+                /* Confirm spin CC twice — reject single-sample jumps (Ash). */
+                if (surf->k2 == tk2_pend) {
+                    tk2_pend_n++;
+                } else {
+                    tk2_pend = surf->k2;
+                    tk2_pend_n = 1;
+                }
+                if (tk2_pend_n >= 2) {
+                    int d = (int)surf->k2 - (int)tk2;
+                    if (d < 0)
+                        d = -d;
+                    if (d >= 2) {
+                        tk2 = surf->k2;
+                        tombola_set_spin_cc(tb, surf->k2);
+                    }
+                    tk2_pend_n = 0;
+                }
+            }
+            /* K3 ball count optional; MUTE+pad is primary compose path. */
+            if (!tk3_on) {
+                int d = (int)surf->k3 - (int)tk3_dump;
+                if (d < 0)
+                    d = -d;
+                if (d >= 3)
+                    tk3_on = 1;
+            }
+            if (tk3_on && surf->k3 != tk3) {
+                tk3 = surf->k3;
+                int n = (int)(((int)surf->k3 * EPICYCLE_PAD_COUNT + 63) / 127);
+                if (n > EPICYCLE_PAD_COUNT)
+                    n = EPICYCLE_PAD_COUNT;
+                tombola_set_ball_count(tb, n);
+                for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+                    if (!tombola_ball_active(tb, i))
+                        engine_note_off(&eng, i);
+                }
+            }
+        } else if (eng.mode_page == EPICYCLE_PAGE_AMP) {
+            const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
+            unsigned mask = pickup_mask(cur, 0);
+            if (mask) {
+                EpicyclePad *p = &eng.pads[eng.selected_pad];
+                if (surf->shift_held) {
+                    if (mask & 1u)
+                        p->amp_release = (float)surf->k1 / 127.0f;
+                    if (mask & 2u)
+                        p->vel_sens = (float)surf->k2 / 127.0f;
+                } else {
+                    engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page, surf->k1,
+                                                surf->k2, surf->k3, mask);
+                }
+            }
         } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
+            if (tb->hitmod_edit < 0)
+                tb->hitmod_edit = 0;
+            if (tb->hitmod_edit >= EPICYCLE_HITMOD_SLOTS)
+                tb->hitmod_edit = EPICYCLE_HITMOD_SLOTS - 1;
             EpicycleHitModRoute *r = &tb->hitmods[tb->hitmod_edit];
-            /* Direct knobs for stub matrix editing. */
+            /* Matrix row edit: K1=dest, K2=amount, K3=src (shift: threshold). */
             static uint8_t hk1 = 255, hk2 = 255, hk3 = 255;
             if (surf->k1 != hk1) {
                 hk1 = surf->k1;
@@ -943,7 +1093,18 @@ int main(int argc, char **argv)
             }
             if (surf->k3 != hk3) {
                 hk3 = surf->k3;
-                r->threshold = (float)surf->k3 / 127.0f;
+                if (surf->shift_held) {
+                    r->threshold = (float)surf->k3 / 127.0f;
+                } else {
+                    int s = (int)((float)surf->k3 / 127.0f *
+                                      (float)(EPICYCLE_HITMOD_SRC_COUNT - 1) +
+                                  0.5f);
+                    if (s < 0)
+                        s = 0;
+                    if (s >= EPICYCLE_HITMOD_SRC_COUNT)
+                        s = EPICYCLE_HITMOD_SRC_COUNT - 1;
+                    r->src = (EpicycleHitModSrc)s;
+                }
             }
         } else if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
             handle_trim_knobs(&eng, surf);
@@ -977,6 +1138,7 @@ int main(int argc, char **argv)
                 float pm, fa, lm;
                 tombola_eval_hitmod(tb, vels[h], &pm, &fa, &lm);
                 engine_note_on_impact(&eng, pads[h], vels[h], pm, fa, lm);
+                surface_flash_pad(pads[h]); /* LED flash = wall-hit connection */
             }
         }
 
@@ -993,9 +1155,17 @@ int main(int argc, char **argv)
                     if (p->crossfade > 0.5f)
                         p->crossfade = 0.5f;
                 } else if (p->freeform) {
-                    trim_apply_pos(&eng, eng.selected_pad,
-                                   p->window_start + (float)delta * 0.002f);
-                    trim_refresh_free_targets(&eng);
+                    /* Encoder: frame-fine last Start/End edge; else slide POS. */
+                    if (g_trim_last_edge == 0 || g_trim_last_edge == 1) {
+                        int frames = surf->shift_held ? delta : delta * 8;
+                        trim_nudge_edge(&eng, eng.selected_pad, g_trim_last_edge, frames);
+                        g_trim_lock_len = eng.pads[eng.selected_pad].window_length;
+                    } else {
+                        float frame = trim_frame_frac(&eng, eng.selected_pad);
+                        trim_apply_pos(&eng, eng.selected_pad,
+                                       p->window_start + (float)delta * frame * 8.0f);
+                        trim_refresh_free_targets(&eng);
+                    }
                     g_trim_pos_idle = 0;
                 } else {
                     /* Encoder rotates N among 1/2/4/8/16/32 — never changes page.
@@ -1047,17 +1217,27 @@ int main(int argc, char **argv)
                     s = 0;
                 tb->hitmod_edit = s;
             } else if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                /* Wheel nudges spin a little. */
-                float sp = tb->spin_speed + (float)delta * 0.15f;
-                if (sp < 0.0f)
-                    sp = 0.0f;
-                if (sp > 7.5f)
-                    sp = 7.5f;
-                tb->spin_speed = sp;
+                /* Wheel only nudges spin if already moving — never from rest
+                 * (Ash: spin must not jump alone). */
+                if (tb->spin_speed > 0.05f || tb->spin_speed < -0.05f) {
+                    float sp = tb->spin_speed + (float)delta * 0.15f;
+                    if (sp < -7.5f)
+                        sp = -7.5f;
+                    if (sp > 7.5f)
+                        sp = 7.5f;
+                    /* Crossing zero parks at stop. */
+                    if ((tb->spin_speed > 0.0f && sp < 0.0f) ||
+                        (tb->spin_speed < 0.0f && sp > 0.0f))
+                        sp = 0.0f;
+                    tb->spin_speed = sp;
+                }
             }
         }
 
-        if ((ticks % 3) == 0)
+        /* Trim / Tombola: every frame for responsive brace + spheres.
+         * Other pages can skip a couple ticks. */
+        if (eng.mode_page == EPICYCLE_PAGE_TRIM || eng.mode_page == EPICYCLE_PAGE_TOMBOLA ||
+            eng.mode_page == EPICYCLE_PAGE_HITMOD || (ticks % 2) == 0)
             ui_draw_loop(&hw, &eng, surf, tb);
 
         if (!audio_running()) {

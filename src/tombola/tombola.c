@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * Soft 2D tombola: morphing N-gon / circle drum, 16 coloured balls, wall-hit
- * triggers. Spin rotates the container; fader morphs circle → more faces.
- * Freeze/capture is phase 2 — not here.
+ * Soft 2D tombola: morphing N-gon / circle drum, coloured balls, wall-hit
+ * triggers. K1=shape morph, K2=bipolar spin, K3=ball count; MUTE+pad toggles.
+ * Empty start — add balls one by one. Freeze/capture is phase 2.
  */
 #include "epicycle.h"
 
@@ -21,6 +21,7 @@
 #define TB_WALL_RESTITUTION 0.92f
 #define TB_SPIN_KICK 0.35f
 #define TB_GRAVITY 0.55f
+#define TB_SPIN_MAX 7.5f
 
 static EpicycleTombola g_tb;
 static float g_cooldown[EPICYCLE_PAD_COUNT];
@@ -44,6 +45,17 @@ static float clampf(float v, float lo, float hi)
 static float len2(float x, float y)
 {
     return sqrtf(x * x + y * y);
+}
+
+static void place_ball(EpicycleTombolaBall *b, int pad)
+{
+    float ang = (float)pad * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
+    float r = 0.15f + 0.55f * ((float)((pad * 7) % 10) / 10.0f);
+    b->x = cosf(ang) * r;
+    b->y = sinf(ang) * r * 0.85f;
+    b->vx = -sinf(ang) * (0.4f + 0.15f * (float)(pad % 5));
+    b->vy = cosf(ang) * (0.35f + 0.12f * (float)(pad % 3));
+    b->hit_flash = 0.0f;
 }
 
 /* Face count from morph: 0 → circle; else 3..16 (circle → more faces). */
@@ -74,46 +86,58 @@ void tombola_init(EpicycleTombola *tb)
         tb = &g_tb;
     memset(tb, 0, sizeof *tb);
     tb->morph = 0.28f; /* start with a few faces visible */
-    tb->spin_speed = 1.8f;
+    tb->spin_speed = 0.0f; /* idle until K2; empty drum */
     tb->radius = TB_RADIUS;
     tb->face_count = tombola_face_count(tb->morph);
+    tb->ball_target = 0;
     tb->hitmod_edit = 0;
-    /* Default physics matrix stub: impact → pitch + LPF; angularity hardens. */
+    /* Multi-slot physics matrix defaults (impact → pitch / LPF / level). */
+    tb->hitmods[0].src = EPICYCLE_HITMOD_SRC_IMPACT;
     tb->hitmods[0].dest = EPICYCLE_HITMOD_PITCH;
     tb->hitmods[0].enabled = 1;
     tb->hitmods[0].amount = 0.55f;
     tb->hitmods[0].threshold = 0.12f;
-    tb->hitmods[0].range = 7.0f; /* ±semitone-ish scale via ratio */
+    tb->hitmods[0].range = 7.0f;
+    tb->hitmods[1].src = EPICYCLE_HITMOD_SRC_IMPACT;
     tb->hitmods[1].dest = EPICYCLE_HITMOD_FILTER;
     tb->hitmods[1].enabled = 1;
     tb->hitmods[1].amount = 0.65f;
     tb->hitmods[1].threshold = 0.08f;
-    tb->hitmods[1].range = 0.55f; /* cutoff add */
+    tb->hitmods[1].range = 0.55f;
+    tb->hitmods[2].src = EPICYCLE_HITMOD_SRC_IMPACT;
     tb->hitmods[2].dest = EPICYCLE_HITMOD_LEVEL;
     tb->hitmods[2].enabled = 0;
     tb->hitmods[2].amount = 0.4f;
     tb->hitmods[2].threshold = 0.2f;
     tb->hitmods[2].range = 0.5f;
-    tb->hitmods[3].dest = EPICYCLE_HITMOD_NONE;
+    tb->hitmods[3].src = EPICYCLE_HITMOD_SRC_HARDNESS;
+    tb->hitmods[3].dest = EPICYCLE_HITMOD_SEND_A;
     tb->hitmods[3].enabled = 0;
-    /* Scatter balls inside with varied velocities. */
+    tb->hitmods[3].amount = 0.5f;
+    tb->hitmods[3].threshold = 0.15f;
+    tb->hitmods[3].range = 1.0f;
+    for (int i = 4; i < EPICYCLE_HITMOD_SLOTS; i++) {
+        tb->hitmods[i].src = EPICYCLE_HITMOD_SRC_IMPACT;
+        tb->hitmods[i].dest = EPICYCLE_HITMOD_NONE;
+        tb->hitmods[i].enabled = 0;
+        tb->hitmods[i].amount = 0.5f;
+        tb->hitmods[i].threshold = 0.1f;
+        tb->hitmods[i].range = 0.5f;
+    }
+    /* Empty start — MUTE+pad (or K3) adds balls one by one. */
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        float ang = (float)i * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
-        float r = 0.15f + 0.55f * ((float)((i * 7) % 10) / 10.0f);
-        tb->balls[i].x = cosf(ang) * r;
-        tb->balls[i].y = sinf(ang) * r * 0.85f;
-        tb->balls[i].vx = -sinf(ang) * (0.4f + 0.15f * (float)(i % 5));
-        tb->balls[i].vy = cosf(ang) * (0.35f + 0.12f * (float)(i % 3));
-        tb->balls[i].active = 1;
-        tb->balls[i].hit_flash = 0.0f;
+        place_ball(&tb->balls[i], i);
+        tb->balls[i].active = 0;
+        tb->balls[i].vx = 0;
+        tb->balls[i].vy = 0;
         g_cooldown[i] = 0.0f;
     }
     if (tb != &g_tb)
         g_tb = *tb;
 }
 
-void tombola_eval_hitmod(const EpicycleTombola *tb, float impact, float *pitch_mul,
-                         float *filt_add, float *level_mul)
+void tombola_eval_hitmod(EpicycleTombola *tb, float impact, float *pitch_mul, float *filt_add,
+                         float *level_mul)
 {
     float pitch = 1.0f, filt = 0.0f, level = 1.0f;
     if (!tb) {
@@ -135,20 +159,27 @@ void tombola_eval_hitmod(const EpicycleTombola *tb, float impact, float *pitch_m
     else
         ang = clampf(1.0f - (float)(tb->face_count - 4) / 12.0f, 0.15f, 1.0f);
     float hard = clampf(imp * (0.65f + 0.55f * ang), 0.0f, 1.0f);
+    tb->send_a *= 0.92f; /* decay stub sends each eval */
+    tb->send_b *= 0.92f;
 
     for (int i = 0; i < EPICYCLE_HITMOD_SLOTS; i++) {
         const EpicycleHitModRoute *r = &tb->hitmods[i];
         if (!r->enabled || r->dest == EPICYCLE_HITMOD_NONE)
             continue;
-        if (imp < r->threshold)
+        /* Resolve source value (IMPACT wired; ANGLE/HARDNESS stubbed from shape). */
+        float src_v = imp;
+        if (r->src == EPICYCLE_HITMOD_SRC_ANGLE)
+            src_v = hard;
+        else if (r->src == EPICYCLE_HITMOD_SRC_HARDNESS)
+            src_v = ang;
+        if (src_v < r->threshold)
             continue;
-        float t = (imp - r->threshold) / (1.0f - r->threshold + 1e-5f);
+        float t = (src_v - r->threshold) / (1.0f - r->threshold + 1e-5f);
         t = clampf(t, 0.0f, 1.0f) * r->amount * (0.7f + 0.3f * ang);
         t = clampf(t * (0.85f + 0.3f * hard), 0.0f, 1.0f);
         switch (r->dest) {
         case EPICYCLE_HITMOD_PITCH: {
-            /* Map to ratio via approx semitone range. */
-            float semis = (t * 2.0f - 0.35f) * r->range; /* bias slight up */
+            float semis = (t * 2.0f - 0.35f) * r->range;
             pitch *= powf(2.0f, semis / 12.0f);
             break;
         }
@@ -157,6 +188,12 @@ void tombola_eval_hitmod(const EpicycleTombola *tb, float impact, float *pitch_m
             break;
         case EPICYCLE_HITMOD_LEVEL:
             level *= 1.0f + t * r->range;
+            break;
+        case EPICYCLE_HITMOD_SEND_A:
+            tb->send_a = clampf(tb->send_a + t * r->range, 0.0f, 1.0f);
+            break;
+        case EPICYCLE_HITMOD_SEND_B:
+            tb->send_b = clampf(tb->send_b + t * r->range, 0.0f, 1.0f);
             break;
         default:
             break;
@@ -183,12 +220,60 @@ void tombola_set_morph(EpicycleTombola *tb, float morph01)
     tb->face_count = tombola_face_count(tb->morph);
 }
 
-void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1)
+void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k2)
 {
     if (!tb)
         tb = &g_tb;
-    /* 0 = still, 127 ≈ 7.5 rad/s */
-    tb->spin_speed = ((float)k1 / 127.0f) * 7.5f;
+    /* Bipolar: 64 ± wide deadband = stop (Ash: spin must not jump alone). */
+    int c = (int)k2 - 64;
+    if (c > -8 && c < 8) {
+        tb->spin_speed = 0.0f;
+        return;
+    }
+    float n = (float)c / 56.0f; /* map outside deadband → ±1 */
+    if (n < -1.0f)
+        n = -1.0f;
+    if (n > 1.0f)
+        n = 1.0f;
+    tb->spin_speed = n * TB_SPIN_MAX;
+}
+
+void tombola_set_ball_count(EpicycleTombola *tb, int count)
+{
+    if (!tb)
+        tb = &g_tb;
+    if (count < 0)
+        count = 0;
+    if (count > EPICYCLE_PAD_COUNT)
+        count = EPICYCLE_PAD_COUNT;
+    tb->ball_target = count;
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        int want = i < count;
+        if (want && !tb->balls[i].active) {
+            place_ball(&tb->balls[i], i);
+            tb->balls[i].active = 1;
+            /* Nudge so newly added balls start moving. */
+            float ang = (float)i * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
+            tb->balls[i].vx = -sinf(ang) * 0.55f;
+            tb->balls[i].vy = cosf(ang) * 0.45f;
+        } else if (!want && tb->balls[i].active) {
+            tb->balls[i].active = 0;
+            tb->balls[i].vx = 0;
+            tb->balls[i].vy = 0;
+            tb->balls[i].hit_flash = 0;
+        }
+    }
+}
+
+int tombola_active_count(const EpicycleTombola *tb)
+{
+    if (!tb)
+        tb = &g_tb;
+    int n = 0;
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
+        if (tb->balls[i].active)
+            n++;
+    return n;
 }
 
 void tombola_toggle_ball(EpicycleTombola *tb, int pad)
@@ -203,13 +288,13 @@ void tombola_toggle_ball(EpicycleTombola *tb, int pad)
         tb->balls[pad].vy = 0;
         tb->balls[pad].hit_flash = 0;
     } else {
-        /* Nudge back in near center if re-added. */
         float ang = (float)pad * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
         tb->balls[pad].x = cosf(ang) * 0.25f;
         tb->balls[pad].y = sinf(ang) * 0.2f;
         tb->balls[pad].vx = -sinf(ang) * 0.5f;
         tb->balls[pad].vy = cosf(ang) * 0.4f;
     }
+    tb->ball_target = tombola_active_count(tb);
 }
 
 int tombola_ball_active(const EpicycleTombola *tb, int pad)
@@ -255,7 +340,6 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
             float ny = *y / d;
             float vn = (*vx) * nx + (*vy) * ny;
             if (vn > 0.0f) {
-                /* Reflect + tangential kick from spinning wall. */
                 float tx = -ny;
                 float ty = nx;
                 *vx -= (1.0f + TB_WALL_RESTITUTION) * vn * nx;
@@ -272,16 +356,14 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
         for (int e = 0; e < faces; e++) {
             float a0 = (float)e * (float)(2.0 * M_PI / faces) - (float)M_PI / (float)faces;
             float a1 = (float)(e + 1) * (float)(2.0 * M_PI / faces) - (float)M_PI / (float)faces;
-            /* Outward normal of edge between unit verts scaled to R. */
             float x0 = cosf(a0) * R, y0 = sinf(a0) * R;
             float x1 = cosf(a1) * R, y1 = sinf(a1) * R;
             float ex = x1 - x0, ey = y1 - y0;
             float el = len2(ex, ey);
             if (el < 1e-6f)
                 continue;
-            float nx = ey / el; /* outward for CCW polygon about origin */
+            float nx = ey / el;
             float ny = -ex / el;
-            /* Ensure outward (away from origin). */
             float midx = 0.5f * (x0 + x1), midy = 0.5f * (y0 + y1);
             if (midx * nx + midy * ny < 0.0f) {
                 nx = -nx;
@@ -289,7 +371,6 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
             }
             float dist = (*x - x0) * nx + (*y - y0) * ny;
             if (dist > 0.0f) {
-                /* Outside this edge — project back. */
                 float vn = (*vx) * nx + (*vy) * ny;
                 if (vn > 0.0f) {
                     float tx = -ny, ty = nx;
@@ -304,7 +385,6 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
                 *y -= ny * dist;
             }
         }
-        /* Safety: keep inside circumradius. */
         float d = len2(*x, *y);
         if (d > R * 1.05f && d > 1e-5f) {
             *x *= R / d;
@@ -329,7 +409,6 @@ void tombola_step(EpicycleTombola *tb, float dt)
     tb->hit_n = 0;
     tb->face_count = tombola_face_count(tb->morph);
     tb->spin_rad += tb->spin_speed * dt;
-    /* Wrap angle. */
     if (tb->spin_rad > (float)(2.0 * M_PI) || tb->spin_rad < (float)(-2.0 * M_PI))
         tb->spin_rad = fmodf(tb->spin_rad, (float)(2.0 * M_PI));
 
@@ -351,14 +430,12 @@ void tombola_step(EpicycleTombola *tb, float dt)
         if (!b->active)
             continue;
 
-        /* Integrate in world space with light gravity (screen-down). */
         b->vy -= TB_GRAVITY * dt;
         b->vx *= TB_DAMP;
         b->vy *= TB_DAMP;
         b->x += b->vx * dt;
         b->y += b->vy * dt;
 
-        /* Transform into drum-local (unspin), collide, transform back. */
         float lx = b->x * c + b->y * s;
         float ly = -b->x * s + b->y * c;
         float lvx = b->vx * c + b->vy * s;
@@ -369,7 +446,6 @@ void tombola_step(EpicycleTombola *tb, float dt)
         b->vx = lvx * c - lvy * s;
         b->vy = lvx * s + lvy * c;
 
-        /* Soft speed cap. */
         float spd = len2(b->vx, b->vy);
         if (spd > 4.5f) {
             b->vx *= 4.5f / spd;
@@ -377,7 +453,6 @@ void tombola_step(EpicycleTombola *tb, float dt)
         }
     }
 
-    /* Cheap ball–ball separation (no trigger — wall hits only for v0). */
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
         if (!tb->balls[i].active)
             continue;
@@ -395,7 +470,6 @@ void tombola_step(EpicycleTombola *tb, float dt)
                 tb->balls[i].y -= ny * push;
                 tb->balls[j].x += nx * push;
                 tb->balls[j].y += ny * push;
-                /* Exchange normal velocity component lightly. */
                 float vi = tb->balls[i].vx * nx + tb->balls[i].vy * ny;
                 float vj = tb->balls[j].vx * nx + tb->balls[j].vy * ny;
                 float share = 0.5f * (vi - vj);
@@ -425,12 +499,10 @@ int tombola_drain_hits(EpicycleTombola *tb, int *pads_out, float *vels_out, int 
     return n;
 }
 
-/* Project local drum point → screen with slight 3D tilt. */
 void tombola_world_to_screen(const EpicycleTombola *tb, float x, float y, int cx, int cy,
                              int scale, int *sx, int *sy)
 {
     (void)tb;
-    /* Foreshorten Y for a lying-drum look; mild perspective by depth. */
     float depth = 1.0f + y * 0.08f;
     float px = x * depth;
     float py = y * 0.72f * depth;
@@ -469,8 +541,24 @@ int tombola_selftest(void)
 {
     EpicycleTombola tb;
     tombola_init(&tb);
+    /* Empty start. */
+    if (tombola_active_count(&tb) != 0)
+        return -10;
+    tombola_set_ball_count(&tb, 8);
+    if (tombola_active_count(&tb) != 8)
+        return -11;
     tombola_set_morph(&tb, 0.0f); /* circle */
-    tombola_set_spin_cc(&tb, 80);
+    tombola_set_spin_cc(&tb, 100); /* CW */
+    if (tb.spin_speed <= 0.0f)
+        return -12;
+    tombola_set_spin_cc(&tb, 20); /* CCW */
+    if (tb.spin_speed >= 0.0f)
+        return -13;
+    tombola_set_spin_cc(&tb, 64); /* stop */
+    if (fabsf(tb.spin_speed) > 0.01f)
+        return -14;
+    tombola_set_spin_cc(&tb, 100);
+
     int hits_total = 0;
     for (int i = 0; i < 400; i++) {
         tombola_step(&tb, 1.0f / 60.0f);
@@ -486,7 +574,6 @@ int tombola_selftest(void)
     if (hits_total < 1)
         return -2; /* should have bounced */
 
-    /* Morph to triangle; still contained. */
     tombola_set_morph(&tb, 1.0f);
     if (tb.face_count < 3)
         return -3;
@@ -499,6 +586,10 @@ int tombola_selftest(void)
     tombola_toggle_ball(&tb, 3);
     if (!tombola_ball_active(&tb, 3))
         return -5;
+
+    tombola_set_ball_count(&tb, 0);
+    if (tombola_active_count(&tb) != 0)
+        return -6;
 
     return 0;
 }

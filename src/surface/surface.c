@@ -23,6 +23,8 @@
  *     Soft keys also suppressed while controls or pads were recently active.
  *   - Pad note-ons need explicit status + vel≥8; status cleared after pads.
  *   - SAMPLE LED tracks sample_held; forced off after open drain (no boot flash).
+ *   - Pad LEDs: selected = solid amber; flash only on tombola wall hit; never
+ *     from pad press / AT / dump phantoms (Ash 0.3.1).
  *   - Volume CC path never lights buttons or pages.
  *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys / SAMPLE.
  */
@@ -73,25 +75,27 @@ static int m_sysex;         /* inside SysEx (drop payload) */
 static int m_fresh_status;  /* 1 if status byte opened this message */
 static uint8_t m_d[2];
 static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT];
+/* Wall-hit flash remaining (seconds); selected pad stays solid underneath. */
+static float g_pad_flash[EPICYCLE_PAD_COUNT];
+#define PAD_FLASH_S 0.14f
 
 /*
  * Soft keys: hard-isolated from pads/knobs.
- * Arm on explicit press; fire on clean release after a short hold.
- * Any non-soft MIDI during the hold cancels the arm (Ash: phantom pages).
- * B3 quit needs a longer hold. Stuck latch times out on missed note-off.
+ * B1/B2 fire on press (snappy — Ash 0.3.1); B3 quit still on clean release.
+ * Short bus guards block phantom pages from knob/pad bleed without feeling dead.
+ * Stuck latch times out on missed note-off.
  */
 static uint8_t g_soft_down[3];
 static double g_soft_down_t[3];
 static double g_soft_last_fire_t[3];
-#define SOFT_PAGE_HOLD_S 0.035
-#define SOFT_QUIT_HOLD_S 0.120
+#define SOFT_QUIT_HOLD_S 0.100
 #define SOFT_STUCK_S 1.50
-#define SOFT_PAGE_GAP_S 0.100
-/* Knobs/encoder/pads must never page — suppress soft keys after bus activity. */
+#define SOFT_PAGE_GAP_S 0.040
+/* Knobs/encoder/pads must never page — brief suppress after bus activity. */
 static double g_ctrl_activity_t;
 static double g_pad_activity_t;
-#define CTRL_PAGE_GUARD_S 0.350
-#define PAD_PAGE_GUARD_S 0.400
+#define CTRL_PAGE_GUARD_S 0.080
+#define PAD_PAGE_GUARD_S 0.100
 /* Shift / SAMPLE momentary; auto-clear if note-off was lost. */
 static double g_shift_down_t;
 static double g_sample_down_t;
@@ -253,16 +257,62 @@ static void light_button(int fd, uint8_t note_cc, uint8_t level)
     (void)midi_write_all(fd, m, sizeof m);
 }
 
+/* Pad RGB from tombola ball colour (SysEx pad LED is full RGB). */
+static void pad_rgb(int pad, int flash, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    uint32_t c = tombola_ball_color(pad);
+    int rr = (int)((c >> 16) & 0xff);
+    int gg = (int)((c >> 8) & 0xff);
+    int bb = (int)(c & 0xff);
+    if (flash) {
+        /* Brighten same hue for wall-hit flash. */
+        rr = rr + (255 - rr) / 2;
+        gg = gg + (255 - gg) / 2;
+        bb = bb + (255 - bb) / 2;
+        if (rr > 255)
+            rr = 255;
+        if (gg > 255)
+            gg = 255;
+        if (bb > 255)
+            bb = 255;
+    }
+    *r = (uint8_t)rr;
+    *g = (uint8_t)gg;
+    *b = (uint8_t)bb;
+}
+
 static void refresh_pad_led(int pad)
 {
     if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
-    if (g_state.pad_vel[pad] > 0)
-        light_pad(g_fd, pad, 40, 180, 160);
-    else if (pad == g_selected_pad)
-        light_pad(g_fd, pad, 200, 140, 40);
-    else
+    /* Flash (wall hit, pad colour) > selected solid (pad colour) > off.
+     * Never from pad_vel / phantoms. */
+    if (g_pad_flash[pad] > 0.0f) {
+        uint8_t r, g, b;
+        pad_rgb(pad, 1, &r, &g, &b);
+        light_pad(g_fd, pad, r, g, b);
+    } else if (pad == g_selected_pad) {
+        uint8_t r, g, b;
+        pad_rgb(pad, 0, &r, &g, &b);
+        light_pad(g_fd, pad, r, g, b);
+    } else {
         light_pad(g_fd, pad, 0, 0, 0);
+    }
+}
+
+static void tick_pad_flashes(float dt)
+{
+    if (dt <= 0.0f)
+        return;
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        if (g_pad_flash[i] <= 0.0f)
+            continue;
+        g_pad_flash[i] -= dt;
+        if (g_pad_flash[i] <= 0.0f) {
+            g_pad_flash[i] = 0.0f;
+            refresh_pad_led(i); /* restore selected solid / off */
+        }
+    }
 }
 
 static void sync_pad_lights(int fd)
@@ -270,11 +320,11 @@ static void sync_pad_lights(int fd)
     if (fd < 0)
         return;
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        int want_lit = (g_state.pad_vel[i] > 0) || (i == g_selected_pad);
+        int want_lit = (g_pad_flash[i] > 0.0f) || (i == g_selected_pad);
         if (g_pad_lit[i] && !want_lit)
             light_pad(fd, i, 0, 0, 0);
-        else if (!g_pad_lit[i] && want_lit && g_state.pad_vel[i] == 0 && i == g_selected_pad)
-            light_pad(fd, i, 200, 140, 40);
+        else if (!g_pad_lit[i] && want_lit)
+            refresh_pad_led(i);
     }
 }
 
@@ -306,7 +356,7 @@ static void soft_clear_stuck(void)
     }
 }
 
-/* Soft key: arm on press; fire on clean release after hold. Hard-isolated. */
+/* Soft keys: B1/B2 page on press; B3 quit on clean release. Hard-isolated. */
 static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
 {
     if (which < 0 || which > 2)
@@ -327,38 +377,37 @@ static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
             return;
         g_soft_down[which] = 1;
         g_soft_down_t[which] = t;
+
+        /* B1/B2: fire immediately on press (Ash: snappy page nav). */
+        if (which == 0 || which == 1) {
+            g_soft_last_fire_t[which] = t;
+            if (which == 0)
+                g_state.soft_left = 1;
+            else
+                g_state.soft_mid = 1;
+            g_state.shift_held = 0;
+            g_shift_down_t = 0.0;
+        }
         return;
     }
 
-    /* note-off — fire only if still armed (not cancelled mid-hold). */
+    /* note-off */
     if (!g_soft_down[which])
         return;
     double held = t - g_soft_down_t[which];
     g_soft_down[which] = 0;
     g_soft_down_t[which] = 0;
 
+    if (which == 0 || which == 1)
+        return; /* pages already fired on press */
+
+    /* B3 quit: clean release after hold (never on press). */
     if (held > SOFT_STUCK_S)
         return;
-    if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
+    if ((t - g_soft_last_fire_t[2]) < SOFT_PAGE_GAP_S)
         return;
-    /* Re-check bus: a late pad/CC must not let a release finish the page. */
     if (bus_blocks_pages())
         return;
-
-    if (which == 0 || which == 1) {
-        if (held < SOFT_PAGE_HOLD_S)
-            return;
-        g_soft_last_fire_t[which] = t;
-        if (which == 0)
-            g_state.soft_left = 1;
-        else
-            g_state.soft_mid = 1;
-        g_state.shift_held = 0;
-        g_shift_down_t = 0.0;
-        return;
-    }
-
-    /* B3 quit: longer hold. */
     if (held < SOFT_QUIT_HOLD_S)
         return;
     g_soft_last_fire_t[2] = t;
@@ -602,7 +651,7 @@ static void dispatch_msg(int explicit_status)
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1;
             mark_pad_activity();
-            refresh_pad_led(idx); /* LED only on real note-on */
+            /* Pad press does not drive LEDs — selected solid + wall-hit flash only. */
         } else {
             if (!explicit_status && g_state.pad_vel[idx] == 0) {
                 clear_ch_running();
@@ -611,7 +660,6 @@ static void dispatch_msg(int explicit_status)
             if (g_state.pad_vel[idx] > 0)
                 g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
-            refresh_pad_led(idx); /* LED only on real note-off */
         }
         /* Kill running status so orphan AT data cannot become pad notes. */
         clear_ch_running();
@@ -701,6 +749,7 @@ int surface_open(void)
 {
     memset(&g_state, 0, sizeof g_state);
     memset(g_pad_lit, 0, sizeof g_pad_lit);
+    memset(g_pad_flash, 0, sizeof g_pad_flash);
     memset(g_soft_down, 0, sizeof g_soft_down);
     memset(g_soft_down_t, 0, sizeof g_soft_down_t);
     memset(g_soft_last_fire_t, 0, sizeof g_soft_last_fire_t);
@@ -808,6 +857,8 @@ void surface_poll(void)
         for (ssize_t i = 0; i < n; i++)
             midi_feed(buf[i]);
     }
+    /* ~60 Hz poll from main; decay wall-hit flashes back to selected/off. */
+    tick_pad_flashes(1.0f / 60.0f);
     sync_pad_lights(g_fd);
 }
 
@@ -840,6 +891,16 @@ void surface_set_selected_pad(int pad)
     int prev = g_selected_pad;
     g_selected_pad = pad;
     refresh_pad_led(prev);
+    refresh_pad_led(pad);
+}
+
+void surface_flash_pad(int pad)
+{
+    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    if (g_fd < 0)
+        return;
+    g_pad_flash[pad] = PAD_FLASH_S;
     refresh_pad_led(pad);
 }
 
@@ -932,32 +993,28 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 3) B1/B2 fire on clean release after hold; press alone does not page. */
+    /* 3) B1/B2 fire on press (snappy); release is a no-op for pages. */
     midi_selftest_reset();
     {
         const uint8_t press[] = {0x90, 12, 127};
         midi_feed_buf(press, sizeof press);
-        if (g_state.soft_left)
-            fails++; /* arm only — no fire on press */
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&ts, NULL);
+        if (!g_state.soft_left)
+            fails++; /* fire on press */
+        g_state.soft_left = 0;
         const uint8_t up[] = {0x80, 12, 0};
         midi_feed_buf(up, sizeof up);
-        if (!g_state.soft_left)
-            fails++; /* clean release fires */
-        g_state.soft_left = 0;
+        if (g_state.soft_left)
+            fails++; /* release must not re-fire */
     }
     midi_selftest_reset();
     {
         const uint8_t down[] = {0x90, 12, 127};
         midi_feed_buf(down, sizeof down);
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&ts, NULL);
-        const uint8_t up[] = {0x80, 12, 0};
-        midi_feed_buf(up, sizeof up);
         if (!g_state.soft_left)
             fails++;
         g_state.soft_left = 0;
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
 
         /* Running-status continuation must NOT arm soft key */
         const uint8_t run[] = {13, 127}; /* would be soft-mid under 0x90 */
@@ -967,19 +1024,15 @@ int surface_midi_selftest(void)
         if (g_state.soft_mid)
             fails++;
     }
-    /* 3b) Knob mid-hold cancels B1 — hard isolate. */
+    /* 3b) Knob activity first → B1 press blocked by ctrl guard. */
     midi_selftest_reset();
     {
-        const uint8_t down[] = {0x90, 12, 127};
-        midi_feed_buf(down, sizeof down);
         const uint8_t knob[] = {0xb0, 17, 64};
         midi_feed_buf(knob, sizeof knob);
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&ts, NULL);
-        const uint8_t up[] = {0x80, 12, 0};
-        midi_feed_buf(up, sizeof up);
+        const uint8_t down[] = {0x90, 12, 127};
+        midi_feed_buf(down, sizeof down);
         if (g_state.soft_left)
-            fails++;
+            fails++; /* blocked by ctrl guard */
     }
 
     /* 4) B3 quit needs longer hold; brief press must not quit. */
@@ -1129,21 +1182,14 @@ int surface_midi_selftest(void)
         midi_feed_buf(knobs, sizeof knobs);
         const uint8_t page[] = {0x90, 12, 127};
         midi_feed_buf(page, sizeof page);
-        struct timespec hold = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&hold, NULL);
-        const uint8_t up0[] = {0x80, 12, 0};
-        midi_feed_buf(up0, sizeof up0);
         if (g_state.soft_left)
             fails++; /* must be blocked by ctrl guard */
         g_state.soft_left = 0;
-        /* After guard window, real B1 still works (press + hold + release). */
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 400 * 1000 * 1000L};
+        /* After short guard window, real B1 press pages immediately. */
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000L};
         nanosleep(&ts, NULL);
         const uint8_t page2[] = {0x90, 12, 127};
         midi_feed_buf(page2, sizeof page2);
-        nanosleep(&hold, NULL);
-        const uint8_t up2[] = {0x80, 12, 0};
-        midi_feed_buf(up2, sizeof up2);
         if (!g_state.soft_left)
             fails++;
     }
@@ -1158,27 +1204,19 @@ int surface_midi_selftest(void)
         g_state.wheel_press = 0;
         const uint8_t page[] = {0x90, 13, 127};
         midi_feed_buf(page, sizeof page);
-        struct timespec hold = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&hold, NULL);
-        const uint8_t up[] = {0x80, 13, 0};
-        midi_feed_buf(up, sizeof up);
         if (g_state.soft_mid)
             fails++;
     }
 
-    /* 12) Pad activity cancels in-flight soft key + suppresses pages. */
+    /* 12) Pad first suppresses pages; pad after B1 still clears same-frame edge in app. */
     midi_selftest_reset();
     {
-        const uint8_t soft[] = {0x90, 12, 127};
-        midi_feed_buf(soft, sizeof soft);
         const uint8_t pad[] = {0x99, 37, 100};
         midi_feed_buf(pad, sizeof pad);
-        struct timespec hold = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&hold, NULL);
-        const uint8_t up[] = {0x80, 12, 0};
-        midi_feed_buf(up, sizeof up);
+        const uint8_t soft[] = {0x90, 12, 127};
+        midi_feed_buf(soft, sizeof soft);
         if (g_state.soft_left)
-            fails++;
+            fails++; /* blocked by pad guard */
         if (!g_state.pad_down[0])
             fails++;
     }

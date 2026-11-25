@@ -38,12 +38,14 @@ Power on
   AT ignored. MIT rewrite of SampleBoot / sample-base / mpc-sample-lab notes.
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
-- **tombola** — soft 2D drum: morphing N-gon/circle, spin, 16 balls, wall-hit
-  queue; hit-mod stub (impact → pitch/filt/level; angularity hardens).
+- **tombola** — soft 2D drum: morphing N-gon/circle, bipolar spin, balls
+  (empty start + MUTE/K3), wall-hit queue; multi-slot hit-mod matrix
+  (impact/angle/hardness → vol/pitch/cut/send stubs; angularity hardens).
 - **engine** — 16 pads × brace window; division/freeform; pitch; crossfade +
-  ping-pong; LOOP latch / one-shot; Chamberlin SVF; impact pitch/filt/level on
-  voices; 2 LFOs + 4 mod routes; scrub budget = 8.
-- **ui** — splash; Tombola projection; Hit Mod stub; Trim waveform + edit pages.
+  ping-pong; LOOP latch / one-shot; bounce forces one-shot; Chamberlin SVF;
+  impact pitch/filt/level on voices; 2 LFOs + 4 mod routes; scrub budget = 8.
+- **ui** — splash; smoother Tombola projection; Hit Mod matrix rows; Trim + edits.
+- **surface** — pad LEDs: selected solid amber; flash only on wall hit (no phantoms).
 
 ## Loop brace / modulation
 

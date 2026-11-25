@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.0-tombola"
+#define EPICYCLE_VERSION "0.3.1-tombola-fix"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -13,7 +13,8 @@
 #define EPICYCLE_VOICE_COUNT 16
 #define EPICYCLE_LFO_PER_PAD 2
 #define EPICYCLE_MOD_SLOTS 4
-#define EPICYCLE_HITMOD_SLOTS 4
+#define EPICYCLE_HITMOD_SLOTS 8 /* matrix rows; UI shows ~6, encoder scrolls */
+#define EPICYCLE_HITMOD_VISIBLE 6
 #define EPICYCLE_SCRUB_BUDGET 8 /* aggressive LFO window-scan limit */
 #define EPICYCLE_MAX_DIVISION 32
 #define EPICYCLE_XFADE_MAX 2048
@@ -70,16 +71,27 @@ typedef enum EpicycleModePage {
     EPICYCLE_PAGE_COUNT
 } EpicycleModePage;
 
-/* Physics impact destinations (not MIDI velocity). */
+/* Physics mod sources (phase 1.5; IMPACT wired, others stub-selectable). */
+typedef enum EpicycleHitModSrc {
+    EPICYCLE_HITMOD_SRC_IMPACT = 0, /* wall impact speed */
+    EPICYCLE_HITMOD_SRC_ANGLE,      /* stub: wall angle */
+    EPICYCLE_HITMOD_SRC_HARDNESS,   /* stub: shape angularity */
+    EPICYCLE_HITMOD_SRC_COUNT
+} EpicycleHitModSrc;
+
+/* Physics impact destinations (not MIDI velocity). Sends are stubbed. */
 typedef enum EpicycleHitModDest {
     EPICYCLE_HITMOD_NONE = 0,
+    EPICYCLE_HITMOD_LEVEL,   /* volume */
     EPICYCLE_HITMOD_PITCH,
-    EPICYCLE_HITMOD_FILTER,
-    EPICYCLE_HITMOD_LEVEL,
+    EPICYCLE_HITMOD_FILTER,  /* cutoff */
+    EPICYCLE_HITMOD_SEND_A,  /* stub reverb send */
+    EPICYCLE_HITMOD_SEND_B,  /* stub delay send */
     EPICYCLE_HITMOD_DEST_COUNT
 } EpicycleHitModDest;
 
 typedef struct EpicycleHitModRoute {
+    EpicycleHitModSrc src;
     EpicycleHitModDest dest;
     float amount;    /* 0..1 depth at max impact */
     float threshold; /* impact 0..1 below = no mod */
@@ -127,8 +139,10 @@ typedef struct EpicyclePad {
     int ping_pong;          /* 1 = reverse at brace ends; 0 = forward only */
     int allow_scrub;        /* 1 = may use LFO brace scan (budgeted) */
     /* Amp / filter page params — Chamberlin SVF in the voice path. */
-    float amp_attack;  /* 0..1 */
-    float amp_decay;   /* 0..1 */
+    float amp_attack;  /* 0..1 → time */
+    float amp_decay;   /* 0..1 → time */
+    float amp_sustain; /* 0..1 level */
+    float amp_release; /* 0..1 → time */
     float vel_sens;    /* 0..1 */
     float filter_cutoff; /* 0..1 (open = full); mapped exponentially in DSP */
     float filter_reso;   /* 0..1 */
@@ -151,7 +165,9 @@ typedef struct EpicycleVoice {
     int pad_index;
     double phase;       /* sample-frame position within absolute sample */
     float velocity;
-    float env;          /* simple amp for one-shots */
+    float env;          /* ADSR amp level 0..1 */
+    int env_stage;      /* 0=A 1=D 2=S 3=R */
+    int gate;           /* 1 = held (sustain); 0 = releasing */
     int in_crossfade;
     double xfade_pos;   /* 0..1 through crossfade */
     int direction;      /* +1 forward, -1 reverse (ping-pong) */
@@ -163,6 +179,8 @@ typedef struct EpicycleVoice {
     float impact_pitch; /* pitch ratio multiplier */
     float impact_filt;  /* added to filter cutoff 0..1 */
     float impact_level; /* level multiplier */
+    /* 1 = bounce one-shot when LOOP off; 0 = bounce may loop when LOOP on */
+    int force_oneshot;
 } EpicycleVoice;
 
 typedef struct EpicycleTombolaBall {
@@ -174,18 +192,22 @@ typedef struct EpicycleTombolaBall {
 
 typedef struct EpicycleTombola {
     EpicycleTombolaBall balls[EPICYCLE_PAD_COUNT];
-    float morph;      /* 0..1 fader: circle → more faces */
+    float morph;      /* 0..1 K1: circle → more faces */
     float spin_rad;   /* container rotation */
-    float spin_speed; /* rad/s from K1 */
+    float spin_speed; /* rad/s from K2 (signed: +CW / −CCW) */
     float radius;
     int face_count; /* 0 = circle, else 3..16 */
+    int ball_target; /* last K3 count request 0..16 (−1 = MUTE-only) */
     /* Hit queue drained by main each tick */
     int hit_pad[EPICYCLE_PAD_COUNT];
     float hit_vel[EPICYCLE_PAD_COUNT];
     int hit_n;
-    /* Global physics → param matrix (stub; per-pad matrix = phase 1.5) */
+    /* Global physics → param matrix (multi-slot UI) */
     EpicycleHitModRoute hitmods[EPICYCLE_HITMOD_SLOTS];
-    int hitmod_edit; /* which slot Hit Mod page edits 0..3 */
+    int hitmod_edit; /* which slot Hit Mod page edits 0..SLOTS-1 */
+    /* Stub send accumulators (no FX yet — UI + eval wire them) */
+    float send_a;
+    float send_b;
 } EpicycleTombola;
 
 typedef struct EpicycleEngine {
@@ -278,8 +300,10 @@ int surface_poll_quit(void);
 const EpicycleSurfaceState *surface_state(void);
 EpicycleSurfaceState *surface_state_mut(void);
 const char *surface_info(void);
-/* Keep selected-pad LED amber when not struck (pad LEDs = active focus). */
+/* Selected pad = solid pad RGB; wall-hit flash = brighter same colour. */
 void surface_set_selected_pad(int pad /* 0..15 */);
+/* Brief pad LED flash on tombola wall hit (pad colour; connection feedback). */
+void surface_flash_pad(int pad /* 0..15 */);
 
 /* samples */
 void sample_free(EpicycleSample *s);
@@ -299,8 +323,8 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
 /* Tombola wall-hit: velocity + optional physics hit-mod (pitch/filt/level). */
 void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
                            float filt_add, float level_mul);
-void engine_note_off(EpicycleEngine *eng, int pad); /* gate stop — no-op while latch looping */
-void engine_stop_pad(EpicycleEngine *eng, int pad); /* always stop pad voices (latch toggle-off) */
+void engine_note_off(EpicycleEngine *eng, int pad); /* start Release stage (ADSR fade) */
+void engine_stop_pad(EpicycleEngine *eng, int pad); /* hard stop (MUTE ball / emergency) */
 int engine_pad_voice_active(const EpicycleEngine *eng, int pad); /* 1 if any voice for pad */
 /* Division helpers: equal-slice length; snap start to grid; map CC → N. */
 float engine_division_slice_frac(int slices);
@@ -337,6 +361,7 @@ void engine_host_demo_setup(EpicycleEngine *eng); /* load synth tones for host t
 const char *epicycle_page_name(EpicycleModePage page);
 const char *epicycle_filter_type_name(int type); /* OFF/LPF/HPF/BPF/NOTCH */
 const char *epicycle_hitmod_dest_name(EpicycleHitModDest dest);
+const char *epicycle_hitmod_src_name(EpicycleHitModSrc src);
 /* Keep selected-pad LOOP button LED in sync (surface). */
 void surface_set_loop_led(int on);
 void surface_set_mute_led(int on);
@@ -348,7 +373,11 @@ int surface_midi_selftest(void);
 void tombola_init(EpicycleTombola *tb);
 EpicycleTombola *tombola_state(void);
 void tombola_set_morph(EpicycleTombola *tb, float morph01);
-void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1);
+/* K2: bipolar spin — 0 = max CCW, 64 ≈ stop, 127 = max CW. */
+void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k2);
+/* K3: activate first N balls (0..16); MUTE+pad still toggles individually. */
+void tombola_set_ball_count(EpicycleTombola *tb, int count);
+int tombola_active_count(const EpicycleTombola *tb);
 void tombola_toggle_ball(EpicycleTombola *tb, int pad);
 int tombola_ball_active(const EpicycleTombola *tb, int pad);
 int tombola_face_count(float morph01);
@@ -358,9 +387,9 @@ int tombola_drain_hits(EpicycleTombola *tb, int *pads_out, float *vels_out, int 
 void tombola_world_to_screen(const EpicycleTombola *tb, float x, float y, int cx, int cy,
                              int scale, int *sx, int *sy);
 void tombola_edge_point(const EpicycleTombola *tb, int edge, float t, float *ox, float *oy);
-/* Map impact + shape angularity → pitch/filt/level via hitmod routes. */
-void tombola_eval_hitmod(const EpicycleTombola *tb, float impact, float *pitch_mul,
-                         float *filt_add, float *level_mul);
+/* Map impact + shape angularity → pitch/filt/level/sends via hitmod routes. */
+void tombola_eval_hitmod(EpicycleTombola *tb, float impact, float *pitch_mul, float *filt_add,
+                         float *level_mul);
 int tombola_selftest(void);
 
 /* PNG (stb_image) — RGB buffer is 0x00RRGGBB, alpha already on black */

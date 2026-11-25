@@ -4,9 +4,9 @@
 
 **EPICYCLE** is a generative **tombola** for the Akai MPC Sample (AC50 SD autorun).
 Primary UI: 2D projected drum; coloured balls bounce; wall hits trigger pad samples.
-Fader morphs shape; knob spins; SAMPLE+pad selects; MUTE toggles balls.
-Edit pages (Trim/Mix/Amp/…) still reuse brace/env/filter. Freeze / full physics
-matrix / reverb = later. MIT static C (thin C++ allowed later).
+K1=shape morph, K2=spin±dir, K3/MUTE=balls (empty start); SAMPLE+pad selects.
+Edit pages (Trim/Mix/Amp/…) still reuse brace/env/filter. HitMod = multi-slot
+physics matrix. Freeze / reverb DSP = later. MIT static C (thin C++ allowed later).
 
 ## Hard rules
 
@@ -62,8 +62,8 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 
 | Real | Still stub / later |
 | --- | --- |
-| Tombola 2D morph + spin + wall-hit triggers | Freeze 2–5 s → loop |
-| SAMPLE select / MUTE ball toggle | Reverb/delay sends |
-| Hit Mod stub (impact → pitch/filt) | Full physics matrix + ball–ball actions |
-| Crossfade voices, Trim/env/filter pages | Phrase recorder |
+| Tombola 2D morph + bipolar spin + wall-hit | Freeze 2–5 s → loop |
+| Empty start; MUTE/K3 add balls one-by-one | Reverb/delay DSP (sends stubbed) |
+| HitMod multi-slot matrix UI (vol/pitch/cut/sends) | Ball–ball consequence list |
+| Bounce = one-shot; pad LED flash on hit | Phrase recorder |
 | Host `--preview` + tombola selftest | Hardware sign-off |
