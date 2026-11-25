@@ -114,6 +114,8 @@ static void pad_defaults(EpicyclePad *p)
 const char *epicycle_page_name(EpicycleModePage page)
 {
     switch (page) {
+    case EPICYCLE_PAGE_TOMBOLA:
+        return "TOMBOLA";
     case EPICYCLE_PAGE_TRIM:
         return "TRIM";
     case EPICYCLE_PAGE_MIX:
@@ -128,8 +130,25 @@ const char *epicycle_page_name(EpicycleModePage page)
         return "FENV";
     case EPICYCLE_PAGE_LFO:
         return "LFO";
+    case EPICYCLE_PAGE_HITMOD:
+        return "HITMOD";
     default:
         return "?";
+    }
+}
+
+const char *epicycle_hitmod_dest_name(EpicycleHitModDest dest)
+{
+    switch (dest) {
+    case EPICYCLE_HITMOD_PITCH:
+        return "PITCH";
+    case EPICYCLE_HITMOD_FILTER:
+        return "FILT";
+    case EPICYCLE_HITMOD_LEVEL:
+        return "LEVEL";
+    case EPICYCLE_HITMOD_NONE:
+    default:
+        return "OFF";
     }
 }
 
@@ -506,7 +525,7 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->fader_gain = 1.0f; /* CC20 default full until first fader event */
     eng->master_gain = 1.0f;
     eng->kit_level = 1.0f;
-    eng->mode_page = EPICYCLE_PAGE_TRIM;
+    eng->mode_page = EPICYCLE_PAGE_TOMBOLA;
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
@@ -701,6 +720,25 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     v->filt_z1_l = v->filt_z2_l = 0.0f;
     v->filt_z1_r = v->filt_z2_r = 0.0f;
     v->filt_env = 0.0f;
+    v->impact_pitch = 1.0f;
+    v->impact_filt = 0.0f;
+    v->impact_level = 1.0f;
+}
+
+void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
+                           float filt_add, float level_mul)
+{
+    engine_note_on(eng, pad, velocity);
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+        if (eng->voices[i].active && eng->voices[i].pad_index == pad) {
+            eng->voices[i].impact_pitch = clampf(pitch_mul, 0.25f, 4.0f);
+            eng->voices[i].impact_filt = clampf(filt_add, -0.9f, 0.9f);
+            eng->voices[i].impact_level = clampf(level_mul, 0.05f, 2.0f);
+            break;
+        }
+    }
 }
 
 void engine_stop_pad(EpicycleEngine *eng, int pad)
@@ -1013,7 +1051,7 @@ static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigne
     if (type <= 0 || type > 4)
         return; /* OFF — bypass, fully hearable */
 
-    float cut = pad->mod_filter_cutoff;
+    float cut = clampf(pad->mod_filter_cutoff + v->impact_filt, 0.0f, 1.0f);
     /* Filt env: simple rise then fall, depth scales cutoff down from open. */
     float depth = pad->filt_depth;
     if (depth > 0.001f) {
@@ -1098,7 +1136,8 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 xfade_frames = (win1 - win0) * 0.45;
 
             float L = 0, R = 0;
-            double step = (double)pad->mod_pitch_ratio;
+            float pitch = pad->mod_pitch_ratio * (v->impact_pitch > 0.01f ? v->impact_pitch : 1.0f);
+            double step = (double)pitch;
             if (v->direction < 0)
                 step = -step;
 
@@ -1145,8 +1184,8 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     float a = (float)fade;
                     L = L0 * (1.0f - a) + L1 * a;
                     R = R0 * (1.0f - a) + R1 * a;
-                    v->xfade_pos += pad->mod_pitch_ratio;
-                    v->phase += pad->mod_pitch_ratio;
+                    v->xfade_pos += pitch;
+                    v->phase += pitch;
                     if (fade >= 1.0) {
                         v->phase = restart;
                         v->in_crossfade = 0;
@@ -1154,7 +1193,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     }
                 } else {
                     read_sample(s, v->phase, &L, &R);
-                    v->phase += pad->mod_pitch_ratio;
+                    v->phase += pitch;
                     if (v->phase >= win1)
                         v->phase = win0;
                     /* If the window scrolled under us, wrap into new bounds. */
@@ -1168,7 +1207,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     continue;
                 }
                 read_sample(s, v->phase, &L, &R);
-                v->phase += pad->mod_pitch_ratio;
+                v->phase += pitch;
                 /* short release near end */
                 double rem = win1 - v->phase;
                 if (rem < 64.0)
@@ -1181,7 +1220,8 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             float vel = v->velocity;
             if (pad->vel_sens < 0.99f)
                 vel = pad->vel_sens * v->velocity + (1.0f - pad->vel_sens);
-            float g = pad->mod_level * eng->kit_level * vel * v->env;
+            float ilev = v->impact_level > 0.01f ? v->impact_level : 1.0f;
+            float g = pad->mod_level * eng->kit_level * vel * v->env * ilev;
             /* Equal-power-ish pan from Mix page. */
             float pan = clampf(pad->pan, 0.0f, 1.0f);
             float gl = cosf(pan * (float)(0.5 * M_PI));

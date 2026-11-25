@@ -2,9 +2,11 @@
 
 ## Product
 
-**EPICYCLE** is an experimental freeform looping playground for the Akai MPC Sample.
-Per-pad scrollable loop brace (window), knobs + LFOs, time-division or freeform regions,
-crossfade loops, phrase recorder (later). This repo is MIT static C (thin C++ allowed later).
+**EPICYCLE** is a generative **tombola** for the Akai MPC Sample (AC50 SD autorun).
+Primary UI: 2D projected drum; coloured balls bounce; wall hits trigger pad samples.
+Fader morphs shape; knob spins; SAMPLE+pad selects; MUTE toggles balls.
+Edit pages (Trim/Mix/Amp/…) still reuse brace/env/filter. Freeze / full physics
+matrix / reverb = later. MIT static C (thin C++ allowed later).
 
 ## Hard rules
 
@@ -19,7 +21,8 @@ crossfade loops, phrase recorder (later). This repo is MIT static C (thin C++ al
 
 | Path | Role |
 | --- | --- |
-| `src/` | App: DRM/fb, ALSA I2S (ioctl), surface MIDI, loop engine, WAV, PNG, UI |
+| `src/` | App: DRM/fb, ALSA I2S (ioctl), surface MIDI, tombola, loop engine, WAV, PNG, UI |
+| `src/tombola/` | Soft 2D drum physics + hit → sample; hit-mod stub |
 | `assets/boot.png` | Ash boot splash (320×226 RGBA); packaged as `autorun/epicycle/assets/boot.png` |
 | `third_party/stb/` | `stb_image.h` (public domain / MIT) — PNG decode only; no AGPL |
 | `tools/make_autorun.py` | Pack `autorun/` (+ top `autorun.sh`), compute 1.3 `autorun.check`, zip |
@@ -55,12 +58,12 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 - OS under `autorun/epicycle/`; user data under `<card>/Epicycle/`.
 - On exit: restore stock with `systemctl start ac50` (launcher trap / start script).
 
-## Stub vs real (loop engine)
+## Stub vs real
 
 | Real | Still stub / later |
 | --- | --- |
-| Crossfade loop voices, WAV load, division/free | Phrase recorder |
-| Brace scroll (knobs/wheel/LFO), pitch ratio | Full ADSR |
-| Chamberlin SVF filter (reso 0=min..127=max) | Richer filt-env shapes |
-| Mod matrix data model + basic LFO | Full matrix UI |
-| Host `--preview` non-silent check | Hardware sign-off |
+| Tombola 2D morph + spin + wall-hit triggers | Freeze 2–5 s → loop |
+| SAMPLE select / MUTE ball toggle | Reverb/delay sends |
+| Hit Mod stub (impact → pitch/filt) | Full physics matrix + ball–ball actions |
+| Crossfade voices, Trim/env/filter pages | Phrase recorder |
+| Host `--preview` + tombola selftest | Hardware sign-off |

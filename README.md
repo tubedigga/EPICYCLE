@@ -1,12 +1,12 @@
 # EPICYCLE
 
-**Loop engine** for EPICYCLE — an experimental freeform looping playground for the [Akai MPC Sample](https://www.akaipro.com/).
+**Tombola** for EPICYCLE on the [Akai MPC Sample](https://www.akaipro.com/) — generative geometric drum: balls bounce, wall hits fire pads.
 
-Per pad: sample **start / end / loop brace** (a **window** you can scroll across the sample), three knobs + LFOs, musical **time-division** or **freeform** regions, crossfade loops, pitch (octave / semi / fine — no warp). Clean playback by default; the window slides when you turn knobs or when an LFO scans it.
+Primary screen: 2D projected tombola (fader morphs circle → faces; K1 = spin). **SAMPLE + pad** selects; **MUTE + pad** removes/adds a ball. Edit pages keep Trim start/end, loop, amp env, filter. Freeze capture and full physics matrix are later.
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.2.11-trim-midi-harden` — soft keys hard-isolated; FREE Trim near-zero width; SAMPLE LED boot sync; filter reso 0=min..127=max; DIV N sticky (no spontaneous jumps). Host-tested. Needs Ash card retest + `Epicycle/logs/last-session.log`.
+> **Status:** `0.3.0-tombola` — first playable spin + bounce + select (+ Hit Mod stub). Host-tested. Needs Ash card boot + `Epicycle/logs/last-session.log`.
 
 ## Update the SD card (Ash — firmware 1.4)
 
@@ -17,7 +17,7 @@ Replace the **autorun payload only**; keep your `Epicycle/` user data.
 3. On the card root, **delete or rename** the old `autorun/` folder (and old top-level `autorun.sh` if present).
 4. Copy the new `autorun.sh` + `autorun/` onto the card root. Leave `Epicycle/` alone (projects / samples / logs stay).
 5. Reinsert → power on → Developer Mode autorun prompt → **Yes**.
-6. Expect: splash **PRESS ANY PAD TO CONTINUE** → Trim waveform; **B1/B2** pages; **B3** quits; encoder push does **not** quit. Paste `Epicycle/logs/last-session.log`.
+6. Expect: splash **PRESS ANY PAD TO CONTINUE** → Tombola; **B1/B2** pages; **B3** quits; encoder push does **not** quit. Paste `Epicycle/logs/last-session.log`.
 
 Rollback: remove the card, or rename `autorun` → `autorun-off`.
 
@@ -52,11 +52,11 @@ make test-host    # demo bank + non-silent preview WAV check
 ### What you should try on the device
 
 1. Splash holds; centered **PRESS ANY PAD TO CONTINUE** under logo.
-2. **Hold SAMPLE + pad** = select; plain pad = play (see LOOP mode).
-3. Soft keys: **B1** prev page, **B2** next, **B3 QUIT** (clean release). Pages: Trim / Mix / Amp / Tune / Filt / FEnv / LFO. Knobs/pads/encoder never change pages.
-4. **Trim FREE:** K1/K2 = Start/End (near-zero width OK); K3 = POS slide. **DIV:** N sticky at 1/2/4/8/16/32 (no noise flicker); K2=N; K1/K3 pick slice; encoder wheel steps N; push = free↔div.
-5. **LOOP** = latch-toggle ↔ one-shot. **SAMPLE+pad** = select (LED tracks hold). **Filter reso:** 0=min … 127=max.
-6. Fader stays full until you move it; Main Volume tracks the knob.
+2. **Tombola** home: balls bounce; wall hits fire samples. **Fader** = morph; **K1** = spin.
+3. **SAMPLE + pad** = select; **MUTE + pad** = remove/add ball; plain pad = play.
+4. Soft keys: **B1** prev, **B2** next, **B3 QUIT**. Pages: Tombola / Trim / Mix / Amp / Tune / Filt / FEnv / LFO / HitMod.
+5. **FULL LEVEL** (or enc push on Tombola) = Hit Mod stub. **LOOP** = latch ↔ one-shot. Main Volume = level.
+6. Prefer short grains in `Epicycle/samples/`; ~8 active balls = messy generative texture.
 
 Session log: `Epicycle/logs/last-session.log` on the card.
 
@@ -101,13 +101,12 @@ install/                 templates shipped into the package
 
 | Piece | This release | Still later |
 | --- | --- | --- |
-| Loop brace window | Scrollable start + length; knobs + wheel | Full ADSR one-shots |
-| Division / free | Equal-slice grid (sample/N) vs freeform | Scene snapshots |
-| Crossfade loops | Per-pad amount (K3) | Streaming long beds from SD |
-| Pitch | Octave / semi / fine (API + UI readout) | Dedicated pitch knobs page |
-| LFO / mod matrix | 2 LFOs × 4 routes per pad; brace scrub budgeted to 8 | Full matrix UI, filter DSP |
-| Samples | WAV load from card; synth demo bank | Record from line/mic |
-| Phrase recorder | — | Next milestone |
+| Tombola | 2D morph + spin + wall-hit triggers | Full 3D mesh morph |
+| Ball select / mute | SAMPLE+pad; MUTE+pad | Mute groups on collision |
+| Hit Mod | Stub: impact → pitch/filt/level | Full matrix + ball–ball actions |
+| Trim / env / filter | Edit pages reused | Freeze 2–5 s → loop export |
+| FX | — | Reverb / delay sends (soon) |
+| Samples | WAV + synth demo bank | Record from line/mic |
 | Hardware sign-off | Needs Ash’s card boot + log | — |
 
 ## License
@@ -116,4 +115,4 @@ install/                 templates shipped into the package
 
 ## Product vision
 
-Full identity and phased plan live in the Project docs (`mpc-sample-os-plan.md` / `project-context.md`). Short version: freeform region-loop playground, not a Melodee clone or classic MPC-3000 OS.
+Tombola vision + phased plan live in the Project docs (`tombola-vision.md` / `mpc-sample-os-plan.md`). Short version: generative geometric tombola on MPC Sample, not a Melodee clone.

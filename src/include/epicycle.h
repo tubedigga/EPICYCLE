@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.11-trim-midi-harden"
+#define EPICYCLE_VERSION "0.3.0-tombola"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -13,6 +13,7 @@
 #define EPICYCLE_VOICE_COUNT 16
 #define EPICYCLE_LFO_PER_PAD 2
 #define EPICYCLE_MOD_SLOTS 4
+#define EPICYCLE_HITMOD_SLOTS 4
 #define EPICYCLE_SCRUB_BUDGET 8 /* aggressive LFO window-scan limit */
 #define EPICYCLE_MAX_DIVISION 32
 #define EPICYCLE_XFADE_MAX 2048
@@ -53,19 +54,38 @@ typedef enum EpicycleModDest {
 } EpicycleModDest;
 
 /*
- * Sample-Mode-style pages (stock B1–B3 cycle mapping, EPICYCLE identity).
- * Trim keeps the large waveform home; LFO is EPICYCLE-only.
+ * Pages: Tombola is primary home; Sample-Mode-style edit pages follow.
+ * HITMOD = physics impact → param matrix (stub UI; full matrix = phase 1.5).
  */
 typedef enum EpicycleModePage {
-    EPICYCLE_PAGE_TRIM = 0,
+    EPICYCLE_PAGE_TOMBOLA = 0,
+    EPICYCLE_PAGE_TRIM,
     EPICYCLE_PAGE_MIX,
     EPICYCLE_PAGE_AMP,
     EPICYCLE_PAGE_TUNE,
     EPICYCLE_PAGE_FILTER,
     EPICYCLE_PAGE_FILT_ENV,
     EPICYCLE_PAGE_LFO,
+    EPICYCLE_PAGE_HITMOD,
     EPICYCLE_PAGE_COUNT
 } EpicycleModePage;
+
+/* Physics impact destinations (not MIDI velocity). */
+typedef enum EpicycleHitModDest {
+    EPICYCLE_HITMOD_NONE = 0,
+    EPICYCLE_HITMOD_PITCH,
+    EPICYCLE_HITMOD_FILTER,
+    EPICYCLE_HITMOD_LEVEL,
+    EPICYCLE_HITMOD_DEST_COUNT
+} EpicycleHitModDest;
+
+typedef struct EpicycleHitModRoute {
+    EpicycleHitModDest dest;
+    float amount;    /* 0..1 depth at max impact */
+    float threshold; /* impact 0..1 below = no mod */
+    float range;     /* destination units at amount=1 (semitones / cutoff / level) */
+    int enabled;
+} EpicycleHitModRoute;
 
 typedef struct EpicycleLfo {
     EpicycleLfoShape shape;
@@ -139,7 +159,34 @@ typedef struct EpicycleVoice {
     float filt_z1_l, filt_z2_l;
     float filt_z1_r, filt_z2_r;
     float filt_env; /* 0..1 filt-env level after note-on */
+    /* Physics hit-mod (tombola wall impact); 1 / 0 = none */
+    float impact_pitch; /* pitch ratio multiplier */
+    float impact_filt;  /* added to filter cutoff 0..1 */
+    float impact_level; /* level multiplier */
 } EpicycleVoice;
+
+typedef struct EpicycleTombolaBall {
+    float x, y;
+    float vx, vy;
+    int active;
+    float hit_flash; /* 0..1 visual flash after wall hit */
+} EpicycleTombolaBall;
+
+typedef struct EpicycleTombola {
+    EpicycleTombolaBall balls[EPICYCLE_PAD_COUNT];
+    float morph;      /* 0..1 fader: circle → more faces */
+    float spin_rad;   /* container rotation */
+    float spin_speed; /* rad/s from K1 */
+    float radius;
+    int face_count; /* 0 = circle, else 3..16 */
+    /* Hit queue drained by main each tick */
+    int hit_pad[EPICYCLE_PAD_COUNT];
+    float hit_vel[EPICYCLE_PAD_COUNT];
+    int hit_n;
+    /* Global physics → param matrix (stub; per-pad matrix = phase 1.5) */
+    EpicycleHitModRoute hitmods[EPICYCLE_HITMOD_SLOTS];
+    int hitmod_edit; /* which slot Hit Mod page edits 0..3 */
+} EpicycleTombola;
 
 typedef struct EpicycleEngine {
     EpicyclePad pads[EPICYCLE_PAD_COUNT];
@@ -182,7 +229,9 @@ typedef struct EpicycleSurfaceState {
     int soft_mid;                        /* note 13 edge — next page */
     int soft_right;                      /* note 14 edge — quit (after splash) */
     int sample_held;                     /* SAMPLE mode button (ch1 note 6) */
+    int mute_held;                       /* MUTE (ch1 note 43) — +pad toggles ball */
     int loop_btn;                        /* LOOP (ch1 note 74) edge — toggle latch */
+    int hitmod_btn;                      /* FULL LEVEL (ch1 note 7) edge — Hit Mod page */
     int shift_held;                      /* SHIFT (ch1 note 49) */
     int open;                            /* 1 if MIDI port bound */
 } EpicycleSurfaceState;
@@ -247,6 +296,9 @@ void engine_set_division(EpicycleEngine *eng, int pad, int slices); /* 0 = freef
 void engine_set_window(EpicycleEngine *eng, int pad, float start, float length);
 void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float fine);
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
+/* Tombola wall-hit: velocity + optional physics hit-mod (pitch/filt/level). */
+void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
+                           float filt_add, float level_mul);
 void engine_note_off(EpicycleEngine *eng, int pad); /* gate stop — no-op while latch looping */
 void engine_stop_pad(EpicycleEngine *eng, int pad); /* always stop pad voices (latch toggle-off) */
 int engine_pad_voice_active(const EpicycleEngine *eng, int pad); /* 1 if any voice for pad */
@@ -284,10 +336,32 @@ void engine_host_demo_setup(EpicycleEngine *eng); /* load synth tones for host t
 
 const char *epicycle_page_name(EpicycleModePage page);
 const char *epicycle_filter_type_name(int type); /* OFF/LPF/HPF/BPF/NOTCH */
+const char *epicycle_hitmod_dest_name(EpicycleHitModDest dest);
 /* Keep selected-pad LOOP button LED in sync (surface). */
 void surface_set_loop_led(int on);
+void surface_set_mute_led(int on);
+void surface_set_hitmod_led(int on);
 /* Host/CI: feed synthetic MIDI streams; 0 = ok. */
 int surface_midi_selftest(void);
+
+/* Tombola physics (2D projected drum). */
+void tombola_init(EpicycleTombola *tb);
+EpicycleTombola *tombola_state(void);
+void tombola_set_morph(EpicycleTombola *tb, float morph01);
+void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1);
+void tombola_toggle_ball(EpicycleTombola *tb, int pad);
+int tombola_ball_active(const EpicycleTombola *tb, int pad);
+int tombola_face_count(float morph01);
+uint32_t tombola_ball_color(int pad);
+void tombola_step(EpicycleTombola *tb, float dt);
+int tombola_drain_hits(EpicycleTombola *tb, int *pads_out, float *vels_out, int max_n);
+void tombola_world_to_screen(const EpicycleTombola *tb, float x, float y, int cx, int cy,
+                             int scale, int *sx, int *sy);
+void tombola_edge_point(const EpicycleTombola *tb, int edge, float t, float *ox, float *oy);
+/* Map impact + shape angularity → pitch/filt/level via hitmod routes. */
+void tombola_eval_hitmod(const EpicycleTombola *tb, float impact, float *pitch_mul,
+                         float *filt_add, float *level_mul);
+int tombola_selftest(void);
 
 /* PNG (stb_image) — RGB buffer is 0x00RRGGBB, alpha already on black */
 int epicycle_png_load_rgb(const char *path, uint32_t **out_pixels, int *out_w, int *out_h);
@@ -299,6 +373,6 @@ void ui_draw_splash(const char *status_line); /* logo letterboxed on black; stat
 /* Bottom strip prompt only (does not cover logo body). */
 void ui_draw_splash_prompt(const char *prompt_line);
 void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
-                  const EpicycleSurfaceState *surf);
+                  const EpicycleSurfaceState *surf, const EpicycleTombola *tb);
 
 #endif /* EPICYCLE_H */
