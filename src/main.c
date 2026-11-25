@@ -3,8 +3,7 @@
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
  * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.2: fader=morph, MAIN=vol, K2=spin; MUTE-only balls; HitMod empty;
- *        rest-at-bottom physics; LED flash-only; LOOP-off one-shot.
+ * 0.3.3: FREE Trim true near-zero Start/End width; POS/LFO scrub grains.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -183,20 +182,45 @@ static float trim_frame_frac(const EpicycleEngine *eng, int pad)
     return 1e-6f;
 }
 
-/* Nudge Start/End by CC delta in frames (tiny grains on long samples). */
+/*
+ * Nudge Start/End by CC delta.
+ * Ash: relative coarse used to stall (~0.25–0.47) because one pot throw
+ * could not close remaining width. Closing is width-proportional so ~32
+ * ticks reach 1-frame min; opening stays moderate; tiny = true frames.
+ */
 static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
 {
     if (!dcc)
         return;
     EpicyclePad *p = &eng->pads[pad];
     float frame = trim_frame_frac(eng, pad);
-    size_t frames = (p->sample && p->sample->frames > 2) ? p->sample->frames : 44100;
+    float width = p->window_length;
+    if (width < frame)
+        width = frame;
+    int closing = 0;
+    if (end_edge && dcc < 0)
+        closing = 1;
+    if (!end_edge && dcc > 0)
+        closing = 1;
+
     float step;
-    if (p->window_length < 0.03f || (dcc >= -2 && dcc <= 2)) {
-        /* Near-tiny or single ticks: true frame steps. */
+    if (closing) {
+        /* Aggressive close until true grain; then frame steps.
+         * Ash: 0.25–0.47 stalled when coarse→frame switch left a fat brace. */
+        if (width <= frame * 16.0f) {
+            step = frame * (float)dcc;
+        } else {
+            float per = width * 0.22f;
+            if (per < frame * 16.0f)
+                per = frame * 16.0f;
+            step = per * (float)dcc;
+        }
+    } else if (width < 0.02f || (dcc >= -1 && dcc <= 1)) {
+        /* Tiny open / single tick: true sample frames. */
         step = frame * (float)dcc;
     } else {
-        /* Coarse slew: ~half-sample per full pot throw. */
+        /* Opening: moderate slew (~1/4 sample per full throw). */
+        size_t frames = (p->sample && p->sample->frames > 2) ? p->sample->frames : 44100;
         float fpc = (float)frames / 512.0f;
         if (fpc < 1.0f)
             fpc = 1.0f;
@@ -210,15 +234,44 @@ static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
     }
 }
 
+/* Absolute pot → edge, but never fight a closing gesture past the other edge. */
+static void trim_set_edge_abs(EpicycleEngine *eng, int pad, int end_edge, uint8_t cc)
+{
+    EpicyclePad *p = &eng->pads[pad];
+    float abs01 = (float)cc / 127.0f;
+    float start = p->window_start;
+    float end = start + p->window_length;
+    if (end > 1.0f)
+        end = 1.0f;
+    float frame = trim_frame_frac(eng, pad);
+
+    if (end_edge) {
+        /* Pot at/under Start → snap to 1-frame grain. */
+        if (abs01 <= start + frame * 2.0f)
+            engine_trim_set_end(eng, pad, start + frame);
+        else
+            engine_trim_set_end(eng, pad, abs01);
+    } else {
+        /* Pot at/over End → snap to 1-frame grain. */
+        if (abs01 >= end - frame * 2.0f)
+            engine_trim_set_start(eng, pad, end - frame);
+        else
+            engine_trim_set_start(eng, pad, abs01);
+    }
+}
+
 static void trim_apply_pos(EpicycleEngine *eng, int pad, float pos01)
 {
-    /* Preserve locked width exactly — even near-zero (no 2% inflate). */
-    float lock = g_trim_lock_len > 0.0f ? g_trim_lock_len : eng->pads[pad].window_length;
+    /* Preserve locked width exactly — including 1-frame grains (no 2% inflate). */
+    float lock = g_trim_lock_len;
     if (lock < 0.0f)
+        lock = eng->pads[pad].window_length;
+    /* Keep even sub-0.01 locks; only reject NaN/neg. */
+    if (!(lock >= 0.0f))
         lock = eng->pads[pad].window_length;
     eng->pads[pad].window_length = lock;
     engine_trim_set_position(eng, pad, pos01);
-    /* engine_trim_set_position may nudge to 1-frame min; re-read actual. */
+    /* engine_trim_set_position may floor to 1-frame min; re-read actual. */
     lock = eng->pads[pad].window_length;
     if (eng->pads[pad].window_start + lock > 1.0f)
         eng->pads[pad].window_start = 1.0f - lock;
@@ -440,15 +493,21 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
 
     if (p->freeform) {
         if (mask & 1u) {
-            /* First catch: absolute snap; then frame-fine relative (Ash grains). */
+            /* First catch: absolute (with near-zero snap); then relative close. */
             if (!g_trim_rel[0]) {
-                engine_trim_set_start(eng, eng->selected_pad, (float)surf->k1 / 127.0f);
+                trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
                 g_trim_rel[0] = 1;
                 g_trim_edge_cc[0] = surf->k1;
             } else {
                 int d = (int)surf->k1 - (int)g_trim_edge_cc[0];
                 g_trim_edge_cc[0] = surf->k1;
-                trim_nudge_edge(eng, eng->selected_pad, 0, d);
+                /* Closing toward End: also honour absolute if pot nears End. */
+                float abs01 = (float)surf->k1 / 127.0f;
+                float end = p->window_start + p->window_length;
+                if (d > 0 && abs01 >= end - 0.04f)
+                    trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
+                else
+                    trim_nudge_edge(eng, eng->selected_pad, 0, d);
             }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
             g_pick_target[2] = (uint8_t)clampf_u8(
@@ -461,13 +520,17 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
         }
         if (mask & 2u) {
             if (!g_trim_rel[1]) {
-                engine_trim_set_end(eng, eng->selected_pad, (float)surf->k2 / 127.0f);
+                trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
                 g_trim_rel[1] = 1;
                 g_trim_edge_cc[1] = surf->k2;
             } else {
                 int d = (int)surf->k2 - (int)g_trim_edge_cc[1];
                 g_trim_edge_cc[1] = surf->k2;
-                trim_nudge_edge(eng, eng->selected_pad, 1, d);
+                float abs01 = (float)surf->k2 / 127.0f;
+                if (d < 0 && abs01 <= p->window_start + 0.04f)
+                    trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
+                else
+                    trim_nudge_edge(eng, eng->selected_pad, 1, d);
             }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
             g_pick_target[2] = (uint8_t)clampf_u8(
@@ -713,6 +776,34 @@ int main(int argc, char **argv)
                     rc = -1;
                 if (engine_division_from_cc_sticky(55, 8) != 4)
                     rc = -1;
+            }
+            /* FREE Trim: Start/End can reach 1-frame grain; POS keeps lock. */
+            {
+                EpicycleEngine eng;
+                engine_init(&eng, 44100);
+                engine_host_demo_setup(&eng);
+                int pad = 0;
+                eng.pads[pad].freeform = 1;
+                engine_set_window(&eng, pad, 0.25f, 0.22f); /* Ash 0.25–0.47 case */
+                if (eng.pads[pad].window_length < 0.20f)
+                    rc = -20;
+                /* Close End toward Start repeatedly (simulates ~32 closing ticks). */
+                for (int n = 0; n < 40; n++)
+                    trim_nudge_edge(&eng, pad, 1, -1);
+                float frame = trim_frame_frac(&eng, pad);
+                if (eng.pads[pad].window_length > frame * 4.0f)
+                    rc = -21; /* must reach near-zero */
+                float lock = eng.pads[pad].window_length;
+                g_trim_lock_len = lock;
+                trim_apply_pos(&eng, pad, 0.6f);
+                if (eng.pads[pad].window_length > lock * 1.01f + frame)
+                    rc = -22; /* POS must not inflate grain */
+                /* Absolute End at/under Start → 1-frame. */
+                engine_set_window(&eng, pad, 0.40f, 0.20f);
+                trim_set_edge_abs(&eng, pad, 1, (uint8_t)(0.40f * 127.0f));
+                if (eng.pads[pad].window_length > frame * 3.0f)
+                    rc = -23;
+                engine_shutdown(&eng);
             }
             puts(rc == 0 ? "midi-selftest: ok" : "midi-selftest: FAIL");
             return rc == 0 ? 0 : 1;
