@@ -261,7 +261,9 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->sample_rate = sample_rate ? sample_rate : 44100;
     eng->running = 1;
     eng->selected_pad = 0;
-    eng->master_gain = 1.0f; /* until surface CC19 arrives (position SysEx 0x42) */
+    eng->main_sq = 1.0f;    /* until surface CC19 arrives */
+    eng->fader_gain = 1.0f; /* CC20 default full until first fader event */
+    eng->master_gain = 1.0f;
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
@@ -411,14 +413,30 @@ void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, ui
     p->crossfade = 0.01f + 0.49f * ((float)k3 / 127.0f);
 }
 
+static void recompute_master(EpicycleEngine *eng)
+{
+    /* Either control at 0 → true silence. */
+    eng->master_gain = eng->main_sq * eng->fader_gain;
+}
+
 void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19)
 {
     if (!eng)
         return;
     /* sample-base HARDWARE.md: Main Volume is surface MIDI only (no ALSA
-     * mixer); map CC19 → software output gain with a squared taper. */
+     * mixer); map CC19 → squared taper. */
     float t = (float)cc19 / 127.0f;
-    eng->master_gain = t * t;
+    eng->main_sq = t * t;
+    recompute_master(eng);
+}
+
+void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20)
+{
+    if (!eng)
+        return;
+    /* Control slider (CC20): linear; bottom detent = exact 0. */
+    eng->fader_gain = (float)cc20 / 127.0f;
+    recompute_master(eng);
 }
 
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames)

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.2-panel-fix"
+#define EPICYCLE_VERSION "0.2.3-display-drm"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -118,7 +118,9 @@ typedef struct EpicycleEngine {
     int selected_pad; /* UI focus 0..15 */
     uint64_t transport_frames; /* free-run clock for sync LFOs / divisions */
     int scrub_active; /* how many pads currently LFO-scanning brace */
-    float master_gain; /* 0..1 software main volume (surface CC19, squared) */
+    float main_sq;     /* CC19 squared taper 0..1 */
+    float fader_gain;  /* CC20 linear 0..1; 0 = true silence */
+    float master_gain; /* main_sq * fader_gain (cached for render) */
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */
@@ -150,7 +152,7 @@ int epicycle_paths_resolve(EpicyclePaths *out, const char *argv0, const char *en
 void epicycle_log(const EpicyclePaths *paths, const char *fmt, ...);
 int epicycle_find_alsa_card(const char *want_id);
 
-/* display: software 320×240 → /dev/fb0 (DRM/fb via tinydrm), stride/bpp aware */
+/* display: software 320×240 → DRM /dev/dri/card0 (preferred) or /dev/fb0 */
 int display_open(void);
 void display_clear(uint32_t rgb);
 void display_present(void);
@@ -158,6 +160,8 @@ void display_close(void);
 uint32_t *display_pixels(void); /* 0x00RRGGBB pixels */
 int display_ok(void);
 const char *display_info(void);
+int display_log_count(void);          /* verbose probe/present lines for session log */
+const char *display_log_line(int i);
 
 /* audio: ALSA I2S stereo S32 @ 44.1 kHz; engine callback via audio_set_engine */
 int audio_open(void);
@@ -194,6 +198,7 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
 void engine_note_off(EpicycleEngine *eng, int pad);
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3);
 void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* squared taper */
+void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* linear; 0 = silence */
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames);
 void engine_host_demo_setup(EpicycleEngine *eng); /* load synth tones for host test */
 

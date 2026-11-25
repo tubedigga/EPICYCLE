@@ -207,6 +207,8 @@ int main(int argc, char **argv)
     hw.display_ok = display_open() == 0;
     snprintf(hw.display_info, sizeof hw.display_info, "%s", display_info());
     epicycle_log(&paths, "display: %s", hw.display_info);
+    for (int i = 0; i < display_log_count(); i++)
+        epicycle_log(&paths, "display-diag: %s", display_log_line(i));
 
     hw.audio_ok = audio_open() == 0;
     hw.audio_rate = audio_rate();
@@ -267,6 +269,8 @@ int main(int argc, char **argv)
     }
 
     ui_draw_splash(hw.display_ok ? "online" : "offline");
+    for (int i = 0; i < display_log_count(); i++)
+        epicycle_log(&paths, "display-diag: %s", display_log_line(i));
     sleep_ms(800);
 
     /* Auto-fire demo pads on host so something is audible if audio exists. */
@@ -277,12 +281,16 @@ int main(int argc, char **argv)
 #endif
 
     int ticks = 0;
-    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255;
+    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255, last_fader = 255;
+    uint8_t last_pad_vel[EPICYCLE_PAD_COUNT];
+    memset(last_pad_vel, 0, sizeof last_pad_vel);
 
-    /* Apply any main-volume reply from surface position SysEx 0x42. */
+    /* Apply any main-volume / fader reply from surface position SysEx 0x42. */
     surface_poll();
     engine_set_master_gain_cc(&eng, surface_state()->main_vol);
+    engine_set_fader_gain_cc(&eng, surface_state()->fader);
     last_main = surface_state()->main_vol;
+    last_fader = surface_state()->fader;
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -298,11 +306,19 @@ int main(int argc, char **argv)
                 float vel = surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
                 engine_note_on(&eng, i, vel);
             }
+            /* Note-off / light clear path: velocity fell to 0. */
+            if (last_pad_vel[i] > 0 && surf->pad_vel[i] == 0)
+                engine_note_off(&eng, i);
+            last_pad_vel[i] = surf->pad_vel[i];
         }
 
         if (surf->main_vol != last_main) {
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
+        }
+        if (surf->fader != last_fader) {
+            engine_set_fader_gain_cc(&eng, surf->fader);
+            last_fader = surf->fader;
         }
 
         if (surf->k1 != last_k1 || surf->k2 != last_k2 || surf->k3 != last_k3) {
