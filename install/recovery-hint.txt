@@ -1,0 +1,15 @@
+EPICYCLE recovery (card-level — no firmware flash)
+
+Hang at boot:
+  Hold POWER until the unit powers off. Remove the microSD card. Boot stock.
+
+Bad build:
+  Rename the card's "autorun" folder to "autorun-off" (or delete it), then boot.
+  With SampleBoot: encoder → stock or a previous mod folder.
+
+App crash mid-session:
+  The launcher should restart ac50.service (stock). If not, power-cycle without
+  the card, or rename autorun as above.
+
+User projects and samples live in Epicycle/ on the card root and are not
+replaced when you overwrite autorun/.
