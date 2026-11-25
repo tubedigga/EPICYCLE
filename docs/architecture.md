@@ -28,10 +28,12 @@ Power on
 - **surface** — Control Surface raw MIDI: pads, K1–K3, soft keys (free/div, LFO),
   wheel scroll/quit, lights off, position-request SysEx.
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
+- **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
 - **engine** — 16 pads × scrollable brace window; division (1–32 beats) or freeform;
   pitch (oct/semi/fine); crossfade loopers; 16 voices; 2 LFOs + 4 mod routes per pad;
   brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8).
-- **ui** — brand splash + loop screen (grid, waveform, brace, knob legend).
+- **ui** — Ash boot logo (320×226 letterboxed on 320×240 black) + optional status;
+  loop screen (grid, waveform, brace, knob legend).
 
 ## Loop brace / modulation
 
@@ -52,7 +54,10 @@ Mod destinations (hooks for later UI): `BRACE_START`, `BRACE_LEN`, `PITCH`,
   autorun/
     autorun.sh|json|check
     sampleboot.txt
-    epicycle/epicycle        # binary + hints
+    epicycle/
+      epicycle               # binary
+      assets/boot.png        # splash logo
+      *.txt                  # recovery / samples hints
   Epicycle/
     projects/ samples/ kits/ logs/ settings.json
     samples/pad01.wav …      # optional; else synth demo bank

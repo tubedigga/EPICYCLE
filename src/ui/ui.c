@@ -1,12 +1,17 @@
 /* SPDX-License-Identifier: MIT
  *
- * Loop-engine UI: brand splash + pad grid, selected pad waveform with brace
- * window, knob roles, division/free + LFO scrub hints.
+ * Loop-engine UI: PNG boot splash (letterboxed on black) + pad grid,
+ * selected pad waveform with brace window, knob roles, division/free + LFO scrub.
  */
 #include "epicycle.h"
 
 #include <stdio.h>
 #include <string.h>
+
+/* Cached splash logo (decoded once). */
+static uint32_t *g_logo;
+static int g_logo_w;
+static int g_logo_h;
 
 static void fill_rect(uint32_t *px, int x, int y, int w, int h, uint32_t c)
 {
@@ -138,17 +143,58 @@ enum {
     COL_MOD = 0x0060B090u,
 };
 
+int ui_load_splash_logo(const char *path)
+{
+    if (g_logo) {
+        epicycle_png_free(g_logo);
+        g_logo = NULL;
+        g_logo_w = g_logo_h = 0;
+    }
+    if (!path || !path[0])
+        return -1;
+    if (epicycle_png_load_rgb(path, &g_logo, &g_logo_w, &g_logo_h) != 0)
+        return -1;
+    return 0;
+}
+
+static void blit_logo_letterbox(uint32_t *px)
+{
+    if (!g_logo || g_logo_w <= 0 || g_logo_h <= 0)
+        return;
+    int x0 = (EPICYCLE_FB_W - g_logo_w) / 2;
+    int y0 = (EPICYCLE_FB_H - g_logo_h) / 2;
+    for (int row = 0; row < g_logo_h; row++) {
+        int dy = y0 + row;
+        if (dy < 0 || dy >= EPICYCLE_FB_H)
+            continue;
+        for (int col = 0; col < g_logo_w; col++) {
+            int dx = x0 + col;
+            if (dx < 0 || dx >= EPICYCLE_FB_W)
+                continue;
+            px[dy * EPICYCLE_FB_W + dx] = g_logo[row * g_logo_w + col];
+        }
+    }
+}
+
 void ui_draw_splash(const char *status_line)
 {
     uint32_t *px = display_pixels();
-    display_clear(COL_BG);
-    fill_rect(px, 0, 36, EPICYCLE_FB_W, 3, COL_ACCENT);
-    draw_text(px, 28, 78, "EPICYCLE", COL_FG, 4);
-    draw_text(px, 28, 128, "v0.2.0-loop", COL_MUTED, 1);
-    if (status_line && status_line[0])
-        draw_text(px, 28, 156, status_line, COL_FG, 1);
-    draw_text(px, 28, 190, "loop engine", COL_MUTED, 1);
-    fill_rect(px, 0, EPICYCLE_FB_H - 40, EPICYCLE_FB_W, 3, COL_ACCENT);
+    /* Ash boot logo: 320×226 on 320×240 black letterbox. */
+    display_clear(0x00000000u);
+    if (g_logo) {
+        blit_logo_letterbox(px);
+    } else {
+        /* Fallback if assets/boot.png missing (host without package copy). */
+        draw_text(px, 28, 100, "EPICYCLE", COL_FG, 4);
+        draw_text(px, 28, 150, "v" EPICYCLE_VERSION, COL_MUTED, 1);
+    }
+    if (status_line && status_line[0]) {
+        /* Short optional status in the bottom letterbox (~7 px under a 226-tall logo). */
+        int y = g_logo ? (EPICYCLE_FB_H + g_logo_h) / 2 : EPICYCLE_FB_H - 12;
+        if (y > EPICYCLE_FB_H - 5)
+            y = EPICYCLE_FB_H - 5;
+        draw_text(px, 8, y, status_line, COL_MUTED, 1);
+    }
     display_present();
 }
 

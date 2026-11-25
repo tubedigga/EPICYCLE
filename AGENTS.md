@@ -19,7 +19,9 @@ crossfade loops, phrase recorder (later). This repo is MIT static C (thin C++ al
 
 | Path | Role |
 | --- | --- |
-| `src/` | App: DRM/fb, ALSA I2S (ioctl), surface MIDI, loop engine, WAV, UI |
+| `src/` | App: DRM/fb, ALSA I2S (ioctl), surface MIDI, loop engine, WAV, PNG, UI |
+| `assets/boot.png` | Ash boot splash (320×226 RGBA); packaged as `autorun/epicycle/assets/boot.png` |
+| `third_party/stb/` | `stb_image.h` (public domain / MIT) — PNG decode only; no AGPL |
 | `tools/make_autorun.py` | Pack `autorun/` (+ top `autorun.sh`), compute 1.3 `autorun.check`, zip |
 | `tools/check_preview.py` | Host preview WAV must be non-silent |
 | `install/` | Templates and recovery helpers copied into the package |

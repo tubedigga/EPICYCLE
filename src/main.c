@@ -257,8 +257,17 @@ int main(int argc, char **argv)
 
     audio_set_engine(&eng);
 
-    ui_draw_splash(hw.display_ok ? "loop engine online" : "panel offline (host?)");
-    sleep_ms(600);
+    {
+        char logo_path[640];
+        snprintf(logo_path, sizeof logo_path, "%s/assets/boot.png", paths.app_dir);
+        if (ui_load_splash_logo(logo_path) != 0)
+            epicycle_log(&paths, "splash logo missing (%s) — text fallback", logo_path);
+        else
+            epicycle_log(&paths, "splash logo loaded %s", logo_path);
+    }
+
+    ui_draw_splash(hw.display_ok ? "online" : "offline");
+    sleep_ms(800);
 
     /* Auto-fire demo pads on host so something is audible if audio exists. */
 #ifndef EPICYCLE_ON_DEVICE
@@ -319,7 +328,7 @@ int main(int argc, char **argv)
 #endif
     }
 
-    ui_draw_splash("quitting to stock");
+    ui_draw_splash("quit");
     sleep_ms(250);
 
     audio_set_engine(NULL);
