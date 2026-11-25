@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.9-trim-vol-filt"
+#define EPICYCLE_VERSION "0.2.10-div-latch"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -87,22 +87,23 @@ typedef struct EpicycleModRoute {
  *   window_start  — left edge (0..1 of sample)
  *   window_length — width (0..1); end = start + length (clamped)
  * Knobs / LFOs slide the window (start) or resize it (length).
- * Time-locked mode snaps length to N beats at project tempo vs sample rate
- * (no warp — length in samples = beats * 60/tempo * sample_rate).
+ * Division mode: equal-slice grid — sample split into N equal slices
+ * (N = division_beats, typically 1/2/4/8/16/32); brace length = 1/N,
+ * start snapped to a slice boundary. (Not tempo-mapped beat length.)
  */
 typedef struct EpicyclePad {
     EpicycleSample *sample; /* borrowed; may be NULL */
     float window_start;     /* 0..1 */
     float window_length;    /* 0..1, >0 */
-    int freeform;           /* 1 = free length; 0 = division snap */
-    int division_beats;     /* 1..32 when !freeform */
+    int freeform;           /* 1 = free length; 0 = equal-slice grid */
+    int division_beats;     /* slice count N = 1..32 when !freeform */
     float level;            /* 0..1 pad volume (Mix) */
     float pan;              /* 0 = L, 0.5 = C, 1 = R */
     int octave;             /* -4..+4 */
     int semitone;           /* -24..+24 (Tune page; engine clamps pitch) */
     float fine;             /* -100..+100 cents */
     float crossfade;        /* 0..1 of window length used for Xfade */
-    int loop_enable;        /* 1 = crossfade loop; 0 = one-shot through window */
+    int loop_enable;        /* 1 = pad press toggles latch; 0 = one-shot on press */
     int ping_pong;          /* 1 = reverse at brace ends; 0 = forward only */
     int allow_scrub;        /* 1 = may use LFO brace scan (budgeted) */
     /* Amp / filter page params — Chamberlin SVF in the voice path. */
@@ -242,11 +243,21 @@ void engine_shutdown(EpicycleEngine *eng);
 int engine_load_bank_wav(EpicycleEngine *eng, int slot, const char *path);
 int engine_assign_sample(EpicycleEngine *eng, int pad, int bank_slot);
 void engine_set_tempo(EpicycleEngine *eng, float bpm);
-void engine_set_division(EpicycleEngine *eng, int pad, int beats); /* 0 = freeform */
+void engine_set_division(EpicycleEngine *eng, int pad, int slices); /* 0 = freeform; else N slices */
 void engine_set_window(EpicycleEngine *eng, int pad, float start, float length);
 void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float fine);
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
-void engine_note_off(EpicycleEngine *eng, int pad); /* stop that pad's voice(s) */
+void engine_note_off(EpicycleEngine *eng, int pad); /* gate stop — no-op while latch looping */
+void engine_stop_pad(EpicycleEngine *eng, int pad); /* always stop pad voices (latch toggle-off) */
+int engine_pad_voice_active(const EpicycleEngine *eng, int pad); /* 1 if any voice for pad */
+/* Division helpers: equal-slice length; snap start to grid; map CC → N. */
+float engine_division_slice_frac(int slices);
+int engine_division_quantize_slices(int slices);
+int engine_division_from_cc(uint8_t cc); /* discrete musical N from K2 */
+int engine_division_step(int slices, int delta); /* encoder: step 1/2/4/8/16/32 */
+void engine_division_snap_brace(EpicycleEngine *eng, int pad); /* start→slice, len=1/N */
+void engine_division_set_slice_index(EpicycleEngine *eng, int pad, int slice_index);
+int engine_division_slice_index(const EpicyclePad *pad);
 /* Playhead 0..1 in sample, or -1 if pad has no active voice. */
 float engine_pad_playhead(const EpicycleEngine *eng, int pad);
 /* Page-aware K1–K3 mapping. mask bits: 1=K1, 2=K2, 4=K3 (only touched knobs). */

@@ -2,7 +2,7 @@
  *
  * EPICYCLE loop engine v0:
  *  - Per-pad sample with scrollable loop brace (window start + length)
- *  - Time-locked division (1..32 beats) or free-run length
+ *  - Equal-slice division (sample / N) or free-run length
  *  - Crossfade looping; pitch via octave/semi/fine (no warp)
  *  - Up to 16 voices; LFO brace scrub budgeted to EPICYCLE_SCRUB_BUDGET pads
  *  - Per-pad modulation matrix hooks (multi-LFO → brace/pitch/level/filter)
@@ -62,7 +62,7 @@ static void pad_defaults(EpicyclePad *p)
     p->semitone = 0;
     p->fine = 0.0f;
     p->crossfade = 0.05f;
-    p->loop_enable = 1; /* EPICYCLE default: latch loop (LOOP button toggles) */
+    p->loop_enable = 1; /* EPICYCLE default: latch (pad press toggles on/off) */
     p->ping_pong = 0;   /* Forward; SHIFT on Trim selects Ping-pong */
     p->allow_scrub = 1;
     p->amp_attack = 0.0f;
@@ -141,21 +141,123 @@ const char *epicycle_filter_type_name(int type)
     }
 }
 
-static float division_length_frac(const EpicycleEngine *eng, const EpicyclePad *pad)
+/* Musical slice counts for encoder / discoverability (Ash equal-slice grid). */
+static const int k_div_steps[] = {1, 2, 4, 8, 16, 32};
+#define K_DIV_STEP_N ((int)(sizeof k_div_steps / sizeof k_div_steps[0]))
+
+float engine_division_slice_frac(int slices)
 {
-    if (!pad->sample || pad->sample->frames == 0)
-        return pad->window_length;
-    float beats = (float)(pad->division_beats < 1 ? 1 : pad->division_beats);
-    float seconds = beats * (60.0f / eng->tempo_bpm);
-    float frames = seconds * (float)pad->sample->rate;
-    float frac = frames / (float)pad->sample->frames;
-    return clampf(frac, 1.0f / (float)pad->sample->frames, 1.0f);
+    int n = slices < 1 ? 1 : slices;
+    if (n > EPICYCLE_MAX_DIVISION)
+        n = EPICYCLE_MAX_DIVISION;
+    return 1.0f / (float)n;
+}
+
+int engine_division_quantize_slices(int slices)
+{
+    if (slices < 1)
+        return 1;
+    if (slices > EPICYCLE_MAX_DIVISION)
+        return EPICYCLE_MAX_DIVISION;
+    return slices;
+}
+
+int engine_division_from_cc(uint8_t cc)
+{
+    /* Map pot across musical powers of two (not linear 1..32 — Ash DIV32 was
+     * "full sample" under old tempo math; equal-slice wants DIV32 = 1/32). */
+    int idx = (int)((cc * (K_DIV_STEP_N - 1) + 63) / 127);
+    if (idx < 0)
+        idx = 0;
+    if (idx >= K_DIV_STEP_N)
+        idx = K_DIV_STEP_N - 1;
+    return k_div_steps[idx];
+}
+
+int engine_division_step(int slices, int delta)
+{
+    int cur = engine_division_quantize_slices(slices);
+    int best = 0;
+    int best_d = 999;
+    for (int i = 0; i < K_DIV_STEP_N; i++) {
+        int d = k_div_steps[i] - cur;
+        if (d < 0)
+            d = -d;
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    best += delta;
+    if (best < 0)
+        best = 0;
+    if (best >= K_DIV_STEP_N)
+        best = K_DIV_STEP_N - 1;
+    return k_div_steps[best];
+}
+
+int engine_division_slice_index(const EpicyclePad *pad)
+{
+    if (!pad)
+        return 0;
+    int n = engine_division_quantize_slices(pad->division_beats);
+    float slice = engine_division_slice_frac(n);
+    int idx = (int)(pad->window_start / slice + 0.5f);
+    if (idx < 0)
+        idx = 0;
+    if (idx >= n)
+        idx = n - 1;
+    return idx;
+}
+
+void engine_division_snap_brace(EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    if (p->freeform)
+        return;
+    int n = engine_division_quantize_slices(p->division_beats);
+    float slice = engine_division_slice_frac(n);
+    int idx = engine_division_slice_index(p);
+    p->division_beats = n;
+    p->window_length = slice;
+    p->window_start = (float)idx * slice;
+    if (p->window_start + p->window_length > 1.0f)
+        p->window_start = 1.0f - p->window_length;
+    if (p->window_start < 0.0f)
+        p->window_start = 0.0f;
+    engine_sync_mod_window(eng, pad);
+}
+
+void engine_division_set_slice_index(EpicycleEngine *eng, int pad, int slice_index)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    if (p->freeform)
+        return;
+    int n = engine_division_quantize_slices(p->division_beats);
+    if (slice_index < 0)
+        slice_index = 0;
+    if (slice_index >= n)
+        slice_index = n - 1;
+    p->window_length = engine_division_slice_frac(n);
+    p->window_start = (float)slice_index * p->window_length;
+    engine_sync_mod_window(eng, pad);
+}
+
+static float division_length_frac(const EpicyclePad *pad)
+{
+    /* Equal-slice: length = 1/N of the sample (Ash musical chops). */
+    return engine_division_slice_frac(pad->division_beats);
 }
 
 static void resolve_window(const EpicycleEngine *eng, EpicyclePad *pad, float *start_out,
                            float *len_out)
 {
-    float len = pad->freeform ? pad->window_length : division_length_frac(eng, pad);
+    (void)eng;
+    float len = pad->freeform ? pad->window_length : division_length_frac(pad);
     len = clampf(len, 0.001f, 1.0f);
     float start = clampf(pad->window_start, 0.0f, 1.0f - len);
     *start_out = start;
@@ -380,36 +482,33 @@ int engine_assign_sample(EpicycleEngine *eng, int pad, int bank_slot)
     eng->pads[pad].sample = &eng->bank[bank_slot];
     eng->pads[pad].window_start = 0.0f;
     eng->pads[pad].window_length =
-        eng->pads[pad].freeform ? 0.5f : division_length_frac(eng, &eng->pads[pad]);
-    engine_sync_mod_window(eng, pad);
+        eng->pads[pad].freeform ? 0.5f : division_length_frac(&eng->pads[pad]);
+    if (!eng->pads[pad].freeform)
+        engine_division_snap_brace(eng, pad);
+    else
+        engine_sync_mod_window(eng, pad);
     return 0;
 }
 
 void engine_set_tempo(EpicycleEngine *eng, float bpm)
 {
+    /* Tempo still drives LFO sync; equal-slice division is tempo-independent. */
     eng->tempo_bpm = clampf(bpm, 40.0f, 300.0f);
-    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        if (!eng->pads[i].freeform)
-            eng->pads[i].window_length = division_length_frac(eng, &eng->pads[i]);
-    }
 }
 
-void engine_set_division(EpicycleEngine *eng, int pad, int beats)
+void engine_set_division(EpicycleEngine *eng, int pad, int slices)
 {
     if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     EpicyclePad *p = &eng->pads[pad];
-    if (beats <= 0) {
+    if (slices <= 0) {
         p->freeform = 1;
         engine_sync_mod_window(eng, pad);
         return;
     }
     p->freeform = 0;
-    p->division_beats = beats > EPICYCLE_MAX_DIVISION ? EPICYCLE_MAX_DIVISION : beats;
-    p->window_length = division_length_frac(eng, p);
-    if (p->window_start + p->window_length > 1.0f)
-        p->window_start = 1.0f - p->window_length;
-    engine_sync_mod_window(eng, pad);
+    p->division_beats = engine_division_quantize_slices(slices);
+    engine_division_snap_brace(eng, pad);
 }
 
 void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
@@ -417,10 +516,14 @@ void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
     if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     EpicyclePad *p = &eng->pads[pad];
+    if (!p->freeform) {
+        /* Division: length locked to 1/N; start snapped to grid. */
+        p->window_start = clampf(start, 0.0f, 1.0f);
+        engine_division_snap_brace(eng, pad);
+        return;
+    }
     p->window_length = clampf(length, 0.001f, 1.0f);
     p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
-    if (!p->freeform)
-        p->window_length = division_length_frac(eng, p);
     engine_sync_mod_window(eng, pad);
 }
 
@@ -530,18 +633,35 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     v->filt_env = 0.0f;
 }
 
-void engine_note_off(EpicycleEngine *eng, int pad)
+void engine_stop_pad(EpicycleEngine *eng, int pad)
 {
-    /* Latch (loop_enable): keep looping after release — EPICYCLE default.
-     * One-shot: stop on note-off. LOOP button toggles the mode. */
+    /* Always silence pad voices (latch toggle-off / select cleanup). */
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
-        return;
-    if (eng->pads[pad].loop_enable)
         return;
     for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
         if (eng->voices[i].active && eng->voices[i].pad_index == pad)
             eng->voices[i].active = 0;
     }
+}
+
+void engine_note_off(EpicycleEngine *eng, int pad)
+{
+    /* Gate release: ignored for both latch and one-shot.
+     * Latch: pad press toggles via engine_stop_pad / note_on.
+     * One-shot: plays through the window (render ends the voice). */
+    (void)eng;
+    (void)pad;
+}
+
+int engine_pad_voice_active(const EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return 0;
+    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+        if (eng->voices[i].active && eng->voices[i].pad_index == pad)
+            return 1;
+    }
+    return 0;
 }
 
 float engine_pad_playhead(const EpicycleEngine *eng, int pad)
@@ -613,9 +733,8 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
          * Primary (no Shift): K1 Start + K2 End = region width (other edge fixed);
          * K3 Position = slide whole brace. Crossfade / ping-pong are Shift overlays
          * in main (not applied here).
-         * Division mode: length locked to beats — K1 slides brace (same as POS),
-         * K2 selects beat count, K3 still Position. (K1 was previously unused,
-         * which looked like "Start broken" on division pads.)
+         * Division mode: equal-slice grid — K2 picks N (1/2/4/8/16/32),
+         * K1/K3 pick/slide brace onto a slice. Length always 1/N.
          */
         if (p->freeform) {
             if (mask & 1u)
@@ -623,15 +742,27 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
             if (mask & 2u)
                 engine_trim_set_end(eng, pad, t2);
         } else {
-            if (mask & 1u)
-                engine_trim_set_position(eng, pad, t1);
-            if (mask & 2u) {
-                int beats = 1 + (int)((k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
-                engine_set_division(eng, pad, beats);
+            if (mask & 2u)
+                engine_set_division(eng, pad, engine_division_from_cc(k2));
+            if (mask & 1u) {
+                int n = engine_division_quantize_slices(p->division_beats);
+                int idx = (int)((t1 * (float)n));
+                if (idx >= n)
+                    idx = n - 1;
+                engine_division_set_slice_index(eng, pad, idx);
             }
         }
-        if (mask & 4u)
-            engine_trim_set_position(eng, pad, t3);
+        if (mask & 4u) {
+            if (p->freeform) {
+                engine_trim_set_position(eng, pad, t3);
+            } else {
+                int n = engine_division_quantize_slices(p->division_beats);
+                int idx = (int)((t3 * (float)n));
+                if (idx >= n)
+                    idx = n - 1;
+                engine_division_set_slice_index(eng, pad, idx);
+            }
+        }
         break;
     }
     case EPICYCLE_PAGE_MIX:
@@ -1015,12 +1146,12 @@ void engine_host_demo_setup(EpicycleEngine *eng)
         engine_assign_sample(eng, i, i);
         engine_assign_sample(eng, i + 4, i);
     }
-    /* Pads 0,1: shared 4-beat division (synced braces, different content). */
+    /* Pads 0,1: shared 4-slice equal grid (quarter chops). */
     engine_set_division(eng, 0, 4);
     engine_set_division(eng, 1, 4);
-    /* Pads 2,3: 3 vs 5 beat polymeter. */
-    engine_set_division(eng, 2, 3);
-    engine_set_division(eng, 3, 5);
+    /* Pads 2,3: 8 vs 16 slice grids (different chop density). */
+    engine_set_division(eng, 2, 8);
+    engine_set_division(eng, 3, 16);
     /* Pads 4+: freeform with optional LFO scrub on first scrub-budget pads. */
     for (int i = 4; i < 8; i++) {
         eng->pads[i].freeform = 1;

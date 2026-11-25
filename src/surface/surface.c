@@ -13,13 +13,16 @@
  *   - SAMPLE=6, SHIFT=49, LOOP=74, MUTE=43; soft B1/B2/B3 = 12/13/14
  *   - 0x42 position request → dump CC19,16,17,18,20 + CC100=0
  *
- * Untrusted-stream rules (0.2.8 rewrite after 0.2.7 still false-quit / phantoms):
+ * Untrusted-stream rules (0.2.8+; 0.2.10 hardens page/phantom further):
  *   - Prefer drop junk over acting on it.
  *   - SysEx cancels running status; never restore.
  *   - AT/pressure/pitch-bend/program: consume & ignore (no snap to notes).
  *   - Soft keys need an explicit status byte (no running-status soft keys);
  *     B1/B2 fire on press; B3 quit on release after a minimum hold; hold
  *     timeout unsticks missed note-offs.
+ *   - HARD: knobs / fader / wheel / encoder NEVER change pages. Soft-key
+ *     page fires are suppressed while controls were recently active
+ *     (CC16–20, CC100, encoder push). Pages only from real B1/B2 presses.
  *   - Pad LEDs only from real note-on/off (never AT).
  *   - Volume CC path never lights buttons or pages.
  *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys.
@@ -82,16 +85,37 @@ static double g_soft_down_t[3];
 static double g_soft_last_fire_t[3];
 #define SOFT_QUIT_HOLD_S 0.120
 #define SOFT_STUCK_S 1.50
-#define SOFT_PAGE_GAP_S 0.080
+#define SOFT_PAGE_GAP_S 0.120
+/* Knobs/encoder must never page — suppress B1/B2 briefly after control CCs. */
+static double g_ctrl_activity_t;
+#define CTRL_PAGE_GUARD_S 0.280
 /* Shift is momentary; auto-clear if note-off was lost (Ash: sticky xfade UI). */
 static double g_shift_down_t;
 #define SHIFT_STUCK_S 3.00
 
-/* Volume latch: confirm large drops (CC fight / dump glitch). */
 static uint8_t g_main_pending;
 static int g_main_pending_n;
 static uint8_t g_fader_pending;
 static int g_fader_pending_n;
+
+static double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void mark_ctrl_activity(void)
+{
+    g_ctrl_activity_t = now_s();
+}
+
+static int ctrl_blocks_pages(void)
+{
+    if (g_ctrl_activity_t <= 0.0)
+        return 0;
+    return (now_s() - g_ctrl_activity_t) < CTRL_PAGE_GUARD_S;
+}
 
 static int pad_index(uint8_t note)
 {
@@ -100,13 +124,6 @@ static int pad_index(uint8_t note)
             return i;
     }
     return -1;
-}
-
-static double now_s(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 static int midi_write_all(int fd, const uint8_t *buf, size_t n)
@@ -235,6 +252,10 @@ static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
             return;
         if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
             return;
+        /* HARD: while knobs/encoder are moving, ignore page soft keys.
+         * Ash 0.2.9: adjusting division / pots jumped pages toward LFO. */
+        if ((which == 0 || which == 1) && ctrl_blocks_pages())
+            return;
         g_soft_down[which] = 1;
         g_soft_down_t[which] = t;
         /* Pages: immediate on press (not release) so flips feel instant. */
@@ -362,18 +383,23 @@ static void dispatch_msg(int explicit_status)
         switch (m_d[0]) {
         case 16:
             g_state.k1 = m_d[1];
+            mark_ctrl_activity();
             break;
         case 17:
             g_state.k2 = m_d[1];
+            mark_ctrl_activity();
             break;
         case 18:
             g_state.k3 = m_d[1];
+            mark_ctrl_activity();
             break;
         case 19:
             apply_main_vol_cc(m_d[1]);
+            mark_ctrl_activity();
             break;
         case 20:
             apply_fader_cc(m_d[1]);
+            mark_ctrl_activity();
             break;
         case 100:
             if (m_d[1] == 0)
@@ -382,10 +408,16 @@ static void dispatch_msg(int explicit_status)
                 g_state.wheel_accum += (int)m_d[1];
             else if (m_d[1] >= 64)
                 g_state.wheel_accum += (int)m_d[1] - 128;
+            mark_ctrl_activity();
             break;
         default:
             break; /* unknown CC — ignore (never treat as notes/LEDs) */
         }
+        /* Knobs/wheel never leave note running-status that could fake pages. */
+        m_status = 0;
+        m_need = 0;
+        m_n = 0;
+        m_fresh_status = 0;
         return;
     }
 
@@ -425,15 +457,30 @@ static void dispatch_msg(int explicit_status)
         if (m_d[0] == NOTE_LOOP) {
             if (on && explicit_status)
                 g_state.loop_btn = 1;
+            m_status = 0;
+            m_need = 0;
+            m_n = 0;
+            m_fresh_status = 0;
             return;
         }
         if (m_d[0] == 111) {
-            if (on && explicit_status)
+            if (on && explicit_status) {
                 g_state.wheel_press = 1;
+                mark_ctrl_activity(); /* encoder push never pages */
+            }
+            m_status = 0;
+            m_need = 0;
+            m_n = 0;
+            m_fresh_status = 0;
             return;
         }
         if (m_d[0] == NOTE_SOFT0 || m_d[0] == NOTE_SOFT1 || m_d[0] == NOTE_SOFT2) {
             soft_key_msg((int)m_d[0] - NOTE_SOFT0, on, explicit_status);
+            /* Kill running status so soft-key data cannot chain into pads. */
+            m_status = 0;
+            m_need = 0;
+            m_n = 0;
+            m_fresh_status = 0;
             return;
         }
         (void)NOTE_MUTE;
@@ -691,6 +738,7 @@ static void midi_selftest_reset(void)
     g_main_pending_n = 0;
     g_fader_pending_n = 0;
     g_shift_down_t = 0.0;
+    g_ctrl_activity_t = 0.0;
 }
 
 static void midi_feed_buf(const uint8_t *b, size_t n)
@@ -907,6 +955,41 @@ int surface_midi_selftest(void)
         /* After SAMPLE on, status is 0x90; data 49,127 would be Shift under running
          * status — must NOT latch Shift. */
         if (g_state.shift_held)
+            fails++;
+    }
+
+    /* 10) Knobs / encoder NEVER page — B1 suppressed during control activity. */
+    midi_selftest_reset();
+    {
+        const uint8_t knobs[] = {0xb0, 17, 40, 0xb0, 17, 80, 0xb0, 100, 2};
+        midi_feed_buf(knobs, sizeof knobs);
+        const uint8_t page[] = {0x90, 12, 127};
+        midi_feed_buf(page, sizeof page);
+        if (g_state.soft_left)
+            fails++; /* must be blocked by ctrl guard */
+        g_state.soft_left = 0;
+        /* After guard window, real B1 still works. */
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 320 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
+        const uint8_t page2[] = {0x90, 12, 127};
+        midi_feed_buf(page2, sizeof page2);
+        if (!g_state.soft_left)
+            fails++;
+    }
+
+    /* 11) Encoder push marks control activity — cannot fake a page. */
+    midi_selftest_reset();
+    {
+        const uint8_t enc[] = {0x90, 111, 127};
+        midi_feed_buf(enc, sizeof enc);
+        if (!g_state.wheel_press)
+            fails++;
+        g_state.wheel_press = 0;
+        const uint8_t page[] = {0x90, 13, 127};
+        midi_feed_buf(page, sizeof page);
+        if (g_state.soft_mid)
             fails++;
     }
 

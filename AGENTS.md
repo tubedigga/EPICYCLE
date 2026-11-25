@@ -42,7 +42,8 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 ## Loop / mod model (v0)
 
 - Brace = **window** (`window_start` + `window_length`); knobs/LFO slide start across the sample.
-- Time-locked: length = N beats × tempo × sample rate (no warp). Freeform: length from K2.
+- Division: equal-slice grid — length = sample/N (N typically 1/2/4/8/16/32); brace
+  snaps to slice. Freeform: Start/End set width; POS slides.
 - Per pad: up to **2 LFOs** and **4 mod routes** (`EpicycleModDest`: brace start/len, pitch, level, filter stub).
 - Aggressive **brace scrub** limited to first **8** pads that request it (`EPICYCLE_SCRUB_BUDGET`); others may still use pitch/level LFO.
 - Full modulation-matrix UI can come later — keep the structs/routes wired.
