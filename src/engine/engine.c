@@ -71,7 +71,7 @@ static void pad_defaults(EpicyclePad *p)
     p->semitone = 0;
     p->fine = 0.0f;
     p->crossfade = 0.05f;
-    p->loop_enable = 1; /* EPICYCLE default: latch (pad press toggles on/off) */
+    p->loop_enable = 0; /* Tombola default: one-shot; LOOP button enables latch */
     p->ping_pong = 0;   /* Forward; SHIFT on Trim selects Ping-pong */
     p->allow_scrub = 1;
     p->amp_attack = 0.0f;
@@ -140,15 +140,32 @@ const char *epicycle_page_name(EpicycleModePage page)
 const char *epicycle_hitmod_dest_name(EpicycleHitModDest dest)
 {
     switch (dest) {
+    case EPICYCLE_HITMOD_LEVEL:
+        return "VOL";
     case EPICYCLE_HITMOD_PITCH:
         return "PITCH";
     case EPICYCLE_HITMOD_FILTER:
-        return "FILT";
-    case EPICYCLE_HITMOD_LEVEL:
-        return "LEVEL";
+        return "CUT";
+    case EPICYCLE_HITMOD_SEND_A:
+        return "SNDA";
+    case EPICYCLE_HITMOD_SEND_B:
+        return "SNDB";
     case EPICYCLE_HITMOD_NONE:
     default:
         return "OFF";
+    }
+}
+
+const char *epicycle_hitmod_src_name(EpicycleHitModSrc src)
+{
+    switch (src) {
+    case EPICYCLE_HITMOD_SRC_ANGLE:
+        return "ANGL";
+    case EPICYCLE_HITMOD_SRC_HARDNESS:
+        return "HARD";
+    case EPICYCLE_HITMOD_SRC_IMPACT:
+    default:
+        return "IMPA";
     }
 }
 
@@ -723,6 +740,7 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     v->impact_pitch = 1.0f;
     v->impact_filt = 0.0f;
     v->impact_level = 1.0f;
+    v->force_oneshot = 0; /* pad press respects LOOP latch */
 }
 
 void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
@@ -736,6 +754,8 @@ void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float p
             eng->voices[i].impact_pitch = clampf(pitch_mul, 0.25f, 4.0f);
             eng->voices[i].impact_filt = clampf(filt_add, -0.9f, 0.9f);
             eng->voices[i].impact_level = clampf(level_mul, 0.05f, 2.0f);
+            /* Bounce triggers are always one-shots — never latch-loop (Ash). */
+            eng->voices[i].force_oneshot = 1;
             break;
         }
     }
@@ -1141,7 +1161,9 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             if (v->direction < 0)
                 step = -step;
 
-            if (pad->loop_enable && pad->ping_pong) {
+            /* Impact/bounce forces one-shot even if pad LOOP latch is on. */
+            int do_loop = pad->loop_enable && !v->force_oneshot;
+            if (do_loop && pad->ping_pong) {
                 /* Ping-pong: reverse at brace ends (no wrap). Soften with xfade length. */
                 read_sample(s, v->phase, &L, &R);
                 v->phase += step;
@@ -1165,7 +1187,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     v->env = (float)(0.55 + 0.45 * (near / edge));
                 else
                     v->env = 1.0f;
-            } else if (pad->loop_enable) {
+            } else if (do_loop) {
                 /* Forward loop: near end, crossfade to window start. */
                 if (v->direction < 0)
                     v->direction = 1; /* force forward when leaving ping-pong */

@@ -2,7 +2,7 @@
 
 **Tombola** for EPICYCLE on the [Akai MPC Sample](https://www.akaipro.com/) — generative geometric drum: balls bounce, wall hits fire pads.
 
-Primary screen: 2D projected tombola (fader morphs circle → faces; K1 = spin). **SAMPLE + pad** selects; **MUTE + pad** removes/adds a ball. Edit pages keep Trim start/end, loop, amp env, filter. Freeze capture and full physics matrix are later.
+Primary screen: 2D projected tombola — **K1** shape, **K2** spin±dir, **K3**/MUTE balls (empty start). **SAMPLE + pad** selects; pad LED flashes on wall hit. HitMod = multi-slot physics matrix. Freeze capture and reverb DSP are later.
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 

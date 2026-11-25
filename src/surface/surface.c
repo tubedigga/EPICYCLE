@@ -23,6 +23,8 @@
  *     Soft keys also suppressed while controls or pads were recently active.
  *   - Pad note-ons need explicit status + vel≥8; status cleared after pads.
  *   - SAMPLE LED tracks sample_held; forced off after open drain (no boot flash).
+ *   - Pad LEDs: selected = solid amber; flash only on tombola wall hit; never
+ *     from pad press / AT / dump phantoms (Ash 0.3.1).
  *   - Volume CC path never lights buttons or pages.
  *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys / SAMPLE.
  */
@@ -73,6 +75,9 @@ static int m_sysex;         /* inside SysEx (drop payload) */
 static int m_fresh_status;  /* 1 if status byte opened this message */
 static uint8_t m_d[2];
 static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT];
+/* Wall-hit flash remaining (seconds); selected pad stays solid underneath. */
+static float g_pad_flash[EPICYCLE_PAD_COUNT];
+#define PAD_FLASH_S 0.14f
 
 /*
  * Soft keys: hard-isolated from pads/knobs.
@@ -257,12 +262,28 @@ static void refresh_pad_led(int pad)
 {
     if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
-    if (g_state.pad_vel[pad] > 0)
-        light_pad(g_fd, pad, 40, 180, 160);
+    /* Flash (wall hit) > selected solid > off. Never from pad_vel / phantoms. */
+    if (g_pad_flash[pad] > 0.0f)
+        light_pad(g_fd, pad, 80, 220, 200); /* bright teal flash = connection */
     else if (pad == g_selected_pad)
-        light_pad(g_fd, pad, 200, 140, 40);
+        light_pad(g_fd, pad, 200, 140, 40); /* solid amber = edit focus */
     else
         light_pad(g_fd, pad, 0, 0, 0);
+}
+
+static void tick_pad_flashes(float dt)
+{
+    if (dt <= 0.0f)
+        return;
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        if (g_pad_flash[i] <= 0.0f)
+            continue;
+        g_pad_flash[i] -= dt;
+        if (g_pad_flash[i] <= 0.0f) {
+            g_pad_flash[i] = 0.0f;
+            refresh_pad_led(i); /* restore selected solid / off */
+        }
+    }
 }
 
 static void sync_pad_lights(int fd)
@@ -270,11 +291,15 @@ static void sync_pad_lights(int fd)
     if (fd < 0)
         return;
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        int want_lit = (g_state.pad_vel[i] > 0) || (i == g_selected_pad);
+        int want_lit = (g_pad_flash[i] > 0.0f) || (i == g_selected_pad);
         if (g_pad_lit[i] && !want_lit)
             light_pad(fd, i, 0, 0, 0);
-        else if (!g_pad_lit[i] && want_lit && g_state.pad_vel[i] == 0 && i == g_selected_pad)
-            light_pad(fd, i, 200, 140, 40);
+        else if (!g_pad_lit[i] && want_lit) {
+            if (g_pad_flash[i] > 0.0f)
+                light_pad(fd, i, 80, 220, 200);
+            else
+                light_pad(fd, i, 200, 140, 40);
+        }
     }
 }
 
@@ -602,7 +627,7 @@ static void dispatch_msg(int explicit_status)
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1;
             mark_pad_activity();
-            refresh_pad_led(idx); /* LED only on real note-on */
+            /* Pad press does not drive LEDs — selected solid + wall-hit flash only. */
         } else {
             if (!explicit_status && g_state.pad_vel[idx] == 0) {
                 clear_ch_running();
@@ -611,7 +636,6 @@ static void dispatch_msg(int explicit_status)
             if (g_state.pad_vel[idx] > 0)
                 g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
-            refresh_pad_led(idx); /* LED only on real note-off */
         }
         /* Kill running status so orphan AT data cannot become pad notes. */
         clear_ch_running();
@@ -701,6 +725,7 @@ int surface_open(void)
 {
     memset(&g_state, 0, sizeof g_state);
     memset(g_pad_lit, 0, sizeof g_pad_lit);
+    memset(g_pad_flash, 0, sizeof g_pad_flash);
     memset(g_soft_down, 0, sizeof g_soft_down);
     memset(g_soft_down_t, 0, sizeof g_soft_down_t);
     memset(g_soft_last_fire_t, 0, sizeof g_soft_last_fire_t);
@@ -808,6 +833,8 @@ void surface_poll(void)
         for (ssize_t i = 0; i < n; i++)
             midi_feed(buf[i]);
     }
+    /* ~60 Hz poll from main; decay wall-hit flashes back to selected/off. */
+    tick_pad_flashes(1.0f / 60.0f);
     sync_pad_lights(g_fd);
 }
 
@@ -840,6 +867,16 @@ void surface_set_selected_pad(int pad)
     int prev = g_selected_pad;
     g_selected_pad = pad;
     refresh_pad_led(prev);
+    refresh_pad_led(pad);
+}
+
+void surface_flash_pad(int pad)
+{
+    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    if (g_fd < 0)
+        return;
+    g_pad_flash[pad] = PAD_FLASH_S;
     refresh_pad_led(pad);
 }
 

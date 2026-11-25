@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT
  *
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
- * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod stub;
+ * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.0: morph fader, spin K1, physics hit→pitch/filt stub. Freeze = phase 2.
+ * 0.3.1: K1=shape K2=spin±dir K3=balls; empty start; bounce=one-shot; HitMod rows.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -35,7 +35,7 @@ static void usage(const char *argv0)
             "  --tombola-selftest physics containment + hit + mute ball checks\n"
             "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: SAMPLE+pad select; MUTE+pad ball; FULL LEVEL=HitMod; B3 quit.\n",
+            "  On device: K1 shape K2 spin K3 balls; MUTE+pad; FULL LEVEL=HitMod; B3 quit.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -735,12 +735,14 @@ int main(int argc, char **argv)
             eng.pads[i].filter_cutoff = 1.0f;
             eng.pads[i].mod_filter_cutoff = 1.0f;
         }
-        /* Tombola prefers one-shots on wall hits; LOOP still toggles latch. */
+        /* One-shot default; LOOP button enables latch for manual pad play. */
         eng.pads[i].loop_enable = 0;
     }
 
     if (preview_out) {
-        /* Drive physics for a moment so wall hits feed the preview. */
+        /* Seed a few balls so wall hits feed the preview (empty start otherwise). */
+        tombola_set_ball_count(tb, 4);
+        tombola_set_spin_cc(tb, 100);
         for (int i = 0; i < 90; i++) {
             tombola_step(tb, 1.0f / 60.0f);
             int pads[EPICYCLE_PAD_COUNT];
@@ -812,9 +814,10 @@ int main(int argc, char **argv)
         eng.pads[0].mod_level = eng.pads[0].level;
     }
     surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
-    tombola_set_spin_cc(tb, surface_state()->k1);
-    if (surface_state()->fader_engaged)
-        tombola_set_morph(tb, (float)surface_state()->fader / 127.0f);
+    /* Tombola knobs: K1=shape, K2=spin±dir, K3=balls. Empty until MUTE/K3. */
+    tombola_set_morph(tb, (float)surface_state()->k1 / 127.0f);
+    tombola_set_spin_cc(tb, surface_state()->k2);
+    /* Do not seed balls from dump K3 — stay empty until user adds. */
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -909,22 +912,42 @@ int main(int argc, char **argv)
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
-        /* On Tombola: fader = morph (master fader gain stays full). Else fader = gain. */
+        /* Fader = master gain on every page (shape morph moved to K1). */
         if (surf->fader_engaged && surf->fader != last_fader) {
             last_fader = surf->fader;
-            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                tombola_set_morph(tb, (float)surf->fader / 127.0f);
-                engine_set_fader_gain_cc(&eng, 127);
-            } else {
-                engine_set_fader_gain_cc(&eng, surf->fader);
-            }
+            engine_set_fader_gain_cc(&eng, surf->fader);
         }
 
         if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-            tombola_set_spin_cc(tb, surf->k1);
+            static uint8_t tk1 = 255, tk2 = 255, tk3 = 255;
+            if (surf->k1 != tk1) {
+                tk1 = surf->k1;
+                tombola_set_morph(tb, (float)surf->k1 / 127.0f);
+            }
+            if (surf->k2 != tk2) {
+                tk2 = surf->k2;
+                tombola_set_spin_cc(tb, surf->k2);
+            }
+            if (surf->k3 != tk3) {
+                tk3 = surf->k3;
+                /* Map 0..127 → 0..16 ball count (pads 1..N). */
+                int n = (int)(((int)surf->k3 * EPICYCLE_PAD_COUNT + 63) / 127);
+                if (n > EPICYCLE_PAD_COUNT)
+                    n = EPICYCLE_PAD_COUNT;
+                tombola_set_ball_count(tb, n);
+                /* Stop voices for pads that just left the drum. */
+                for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+                    if (!tombola_ball_active(tb, i))
+                        engine_stop_pad(&eng, i);
+                }
+            }
         } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
+            if (tb->hitmod_edit < 0)
+                tb->hitmod_edit = 0;
+            if (tb->hitmod_edit >= EPICYCLE_HITMOD_SLOTS)
+                tb->hitmod_edit = EPICYCLE_HITMOD_SLOTS - 1;
             EpicycleHitModRoute *r = &tb->hitmods[tb->hitmod_edit];
-            /* Direct knobs for stub matrix editing. */
+            /* Matrix row edit: K1=dest, K2=amount, K3=src (shift: threshold). */
             static uint8_t hk1 = 255, hk2 = 255, hk3 = 255;
             if (surf->k1 != hk1) {
                 hk1 = surf->k1;
@@ -943,7 +966,18 @@ int main(int argc, char **argv)
             }
             if (surf->k3 != hk3) {
                 hk3 = surf->k3;
-                r->threshold = (float)surf->k3 / 127.0f;
+                if (surf->shift_held) {
+                    r->threshold = (float)surf->k3 / 127.0f;
+                } else {
+                    int s = (int)((float)surf->k3 / 127.0f *
+                                      (float)(EPICYCLE_HITMOD_SRC_COUNT - 1) +
+                                  0.5f);
+                    if (s < 0)
+                        s = 0;
+                    if (s >= EPICYCLE_HITMOD_SRC_COUNT)
+                        s = EPICYCLE_HITMOD_SRC_COUNT - 1;
+                    r->src = (EpicycleHitModSrc)s;
+                }
             }
         } else if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
             handle_trim_knobs(&eng, surf);
@@ -977,6 +1011,7 @@ int main(int argc, char **argv)
                 float pm, fa, lm;
                 tombola_eval_hitmod(tb, vels[h], &pm, &fa, &lm);
                 engine_note_on_impact(&eng, pads[h], vels[h], pm, fa, lm);
+                surface_flash_pad(pads[h]); /* LED flash = wall-hit connection */
             }
         }
 
@@ -1047,10 +1082,10 @@ int main(int argc, char **argv)
                     s = 0;
                 tb->hitmod_edit = s;
             } else if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                /* Wheel nudges spin a little. */
+                /* Wheel nudges bipolar spin. */
                 float sp = tb->spin_speed + (float)delta * 0.15f;
-                if (sp < 0.0f)
-                    sp = 0.0f;
+                if (sp < -7.5f)
+                    sp = -7.5f;
                 if (sp > 7.5f)
                     sp = 7.5f;
                 tb->spin_speed = sp;
