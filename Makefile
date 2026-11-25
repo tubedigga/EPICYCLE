@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.2.2-panel-fix
+VERSION    := 0.2.3-display-drm
 BUILD      := build
 DIST       := dist
 
@@ -10,7 +10,7 @@ CROSS      ?= aarch64-linux-gnu-
 CC_CROSS   := $(CROSS)gcc
 CC_HOST    := gcc
 
-INCLUDES      := -Isrc/include -Ithird_party/stb
+INCLUDES      := -Isrc/include -Isrc/display -Ithird_party/stb
 CFLAGS_COMMON := -std=c11 -Wall -Wextra -Wpedantic -O2 $(INCLUDES) -pthread
 CFLAGS_CROSS  := $(CFLAGS_COMMON) -static -DEPICYCLE_ON_DEVICE
 CFLAGS_HOST   := $(CFLAGS_COMMON)

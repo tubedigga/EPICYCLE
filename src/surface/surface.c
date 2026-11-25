@@ -38,7 +38,9 @@ static char g_info[64] = "surface closed";
 
 /* MIDI parser */
 static int m_status, m_need, m_n, m_sysex;
+static int m_voice_status; /* last channel-voice status; kept across SysEx */
 static uint8_t m_d[2];
+static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT]; /* 1 if we last sent a non-black pad LED */
 
 static int pad_index(uint8_t note)
 {
@@ -115,7 +117,19 @@ static void light_pad(int fd, int pad /* 0..15 */, uint8_t r, uint8_t g, uint8_t
     uint8_t m[] = {0xf0, 0x47, 0x7f, 0x5c, 0x65, 0x00, 0x04,
                    (uint8_t)pad, (uint8_t)(r >> 1), (uint8_t)(g >> 1),
                    (uint8_t)(b >> 1), 0xf7};
-    (void)midi_write_all(fd, m, sizeof m);
+    if (midi_write_all(fd, m, sizeof m) == 0)
+        g_pad_lit[pad] = (r | g | b) ? 1 : 0;
+}
+
+/* Clear any pad LED that is lit while pad_vel==0 (missed note-off / latch). */
+static void sync_pad_lights(int fd)
+{
+    if (fd < 0)
+        return;
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        if (g_pad_lit[i] && g_state.pad_vel[i] == 0)
+            light_pad(fd, i, 0, 0, 0);
+    }
 }
 
 static void midi_feed(uint8_t b)
@@ -125,16 +139,24 @@ static void midi_feed(uint8_t b)
     if (b & 0x80) {
         if (b == 0xf0) {
             m_sysex = 1;
+            /* Spec cancels running status; the Surface sometimes keeps
+             * sending bare data bytes after our LED SysEx / 0x42 reply.
+             * Keep m_voice_status so pad note-offs are not dropped (LED latch). */
             m_status = 0;
             return;
         }
         if (b == 0xf7) {
             m_sysex = 0;
+            /* Restore last channel-voice status for quirky running-status. */
+            if (m_voice_status)
+                m_status = m_voice_status;
             return;
         }
         m_sysex = 0;
         if (b < 0xf0) {
             m_status = b;
+            if ((b & 0xf0) >= 0x80 && (b & 0xf0) <= 0xe0)
+                m_voice_status = b;
             /* Program change / channel pressure: 1 data byte; else 2. */
             m_need = ((b & 0xf0) == 0xc0 || (b & 0xf0) == 0xd0) ? 1 : 2;
             m_n = 0;
@@ -143,8 +165,16 @@ static void midi_feed(uint8_t b)
         }
         return;
     }
-    if (m_sysex || !m_status)
+    if (m_sysex)
         return;
+    /* Bare data: prefer current status, else restored voice status. */
+    if (!m_status) {
+        if (!m_voice_status)
+            return;
+        m_status = m_voice_status;
+        m_need = ((m_status & 0xf0) == 0xc0 || (m_status & 0xf0) == 0xd0) ? 1 : 2;
+        m_n = 0;
+    }
     m_d[m_n++] = b;
     if (m_n < m_need)
         return;
@@ -211,6 +241,7 @@ static void midi_feed(uint8_t b)
             g_state.pad_down[idx] = 1; /* edge for note-on; app clears */
             light_pad(g_fd, idx, 40, 180, 160);
         } else {
+            /* note-off (0x80) or note-on vel 0 — clear LED + velocity */
             g_state.pad_vel[idx] = 0;
             light_pad(g_fd, idx, 0, 0, 0);
         }
@@ -220,9 +251,12 @@ static void midi_feed(uint8_t b)
 int surface_open(void)
 {
     memset(&g_state, 0, sizeof g_state);
+    memset(g_pad_lit, 0, sizeof g_pad_lit);
     g_state.main_vol = 100;
+    g_state.fader = 127; /* full until first CC20 — bottom will silence */
     g_fd = -1;
     m_status = m_need = m_n = m_sysex = 0;
+    m_voice_status = 0;
     snprintf(g_info, sizeof g_info, "no Surface card");
 
 #ifndef EPICYCLE_ON_DEVICE
@@ -288,6 +322,8 @@ void surface_poll(void)
         for (ssize_t i = 0; i < n; i++)
             midi_feed(buf[i]);
     }
+    /* Reconcile stuck pad LEDs after any missed note-off. */
+    sync_pad_lights(g_fd);
 }
 
 int surface_poll_quit(void)
