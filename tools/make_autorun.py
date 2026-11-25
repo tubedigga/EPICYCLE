@@ -156,6 +156,12 @@ def main() -> None:
         type=Path,
         help="extra file to copy into autorun/epicycle/ (repeatable)",
     )
+    ap.add_argument(
+        "--assets",
+        type=Path,
+        default=None,
+        help="directory copied to autorun/epicycle/assets/ (boot.png, etc.)",
+    )
     args = ap.parse_args()
 
     name = args.name
@@ -197,6 +203,17 @@ def main() -> None:
         if base in ("autorun.sh", "autorun.json", "autorun.check", name):
             die(f"refusing to overwrite launcher with extra {base}")
         shutil.copyfile(extra, payload / base)
+
+    if args.assets is not None:
+        if not args.assets.is_dir():
+            die(f"assets dir not found: {args.assets}")
+        dest_assets = payload / "assets"
+        if dest_assets.exists():
+            shutil.rmtree(dest_assets)
+        shutil.copytree(args.assets, dest_assets)
+        boot = dest_assets / "boot.png"
+        if not boot.is_file():
+            die(f"assets/boot.png missing under {args.assets}")
 
     # Firmware 1.4 top-of-card bridge.
     if args.top_autorun:
