@@ -1,4 +1,4 @@
-# Architecture (scaffold)
+# Architecture (panel bring-up)
 
 EPICYCLE runs as a userspace app started from microSD autorun after stock
 `ac50.service` comes up. It does not replace the kernel or flash firmware.
@@ -10,19 +10,24 @@ Power on
   → 1.4: Developer Mode prompt → top-level autorun.sh → autorun/autorun.sh
      1.3: autorun.check → autorun/autorun.sh
   → launcher copies binary to /run, stops ac50, runs epicycle
-  → display + audio + surface stubs → splash → quit
+  → display (/dev/fb0) + I2S ALSA + Surface MIDI
+  → splash → home UI (pads / knobs)
+  → wheel push → clean close
   → systemctl start ac50
 ```
 
 ## Modules
 
 - **platform** — app dir from `$0` / `MPC_APP_DIR`; card root from `/proc/mounts`;
-  user data under `<card>/Epicycle/`.
-- **display** — 320×240 software framebuffer (BGRX), optional `/dev/fb0` write.
-- **audio** — placeholder for AK4558 I2S ALSA (44.1 on firmware 1.4).
-- **surface** — placeholder for Control Surface raw MIDI.
+  user data under `<card>/Epicycle/`; ALSA card id lookup via `/proc/asound/cards`.
+- **display** — software 320×240 `0x00RRGGBB` buffer; present via mmap/write to
+  `/dev/fb0` using `FBIOGET_*` stride and bpp (RGB565 or 32-bit).
+- **audio** — I2S card PCM via kernel ioctls (no alsa-lib): S32_LE stereo 44.1 kHz,
+  silent keep-alive thread, `DROP` on close.
+- **surface** — Control Surface raw MIDI: published pad/knob/wheel map, lights off,
+  position-request SysEx, quit on wheel push / right soft key.
 - **engine** — 16 pads with start/end/loop fields; silent render callback shape.
-- **ui** — brand splash only.
+- **ui** — brand splash + home (status, pad grid, knob bars, quit hint).
 
 ## Data on card
 

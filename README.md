@@ -1,12 +1,12 @@
 # EPICYCLE
 
-**Bring-up scaffold** for EPICYCLE — an experimental freeform looping playground for the [Akai MPC Sample](https://www.akaipro.com/).
+**Panel bring-up** for EPICYCLE — an experimental freeform looping playground for the [Akai MPC Sample](https://www.akaipro.com/).
 
 Per pad: sample **start / end / loop brace**, three knobs + LFOs, musical **time-division** or **freeform** regions, crossfade loops, shared mix FX, and a **phrase recorder**. Clean playback by default; granular character only when modulation scans the sample.
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** scaffold only — **not hardware-tested**. Expect path resolution, stubs for display / ALSA / surface MIDI, autorun packaging, and a host smoke binary. Real panel takeover and audio still to come.
+> **Status:** hardware bring-up — draws on the 320×240 panel, reads pads/knobs over surface MIDI, opens the I2S ALSA path with silence, and quits back to stock. **Loop engine / sampling still later.** Not yet signed off on Ash’s unit until a card boot pastes `Epicycle/logs/last-session.log`.
 
 ## Requirements
 
@@ -35,6 +35,15 @@ make test-host    # run host binary once
 4. Insert the card and power on. Stock boots, then asks to run the autorun script — choose **Yes**.
 5. The launcher stops `ac50.service`, runs EPICYCLE from `/run`, and on exit starts stock again.
 
+### What you should see on the device
+
+1. Short **EPICYCLE** splash (“taking over panel”).
+2. Home screen: brand, `fb` / `alsa` / `midi` status, a **4×4 pad grid**, and **K1 / K2 / K3** bars.
+3. Hit pads → cells light (and pad LEDs if surface write works). Turn knobs → bars move.
+4. **Push the data wheel** (or the right soft key above the screen) → splash “quitting to stock” → stock OS returns.
+
+Session log: `Epicycle/logs/last-session.log` on the card.
+
 ### Firmware 1.3 packaging
 
 `make package` also writes `autorun/autorun.check` (`sha256` of `autorun.json` + `autorun.sh` + the public platform salt) for 1.3.0.12 cards. On 1.3 you only need the `autorun/` folder at the card root (no top-level bridge required).
@@ -58,14 +67,14 @@ Copy the packaged `autorun/` folder into `autorun/mods/EPICYCLE/` on a SampleBoo
 
 ```text
 src/
-  main.c                 entry
+  main.c                 entry + bring-up loop
   include/epicycle.h     shared types
-  platform/              card paths + session log
-  display/               320×240 fb stub
-  audio/                 ALSA I2S stub
-  surface/               surface MIDI stub
-  engine/                loop-engine stubs (16 pads)
-  ui/                    splash stub
+  platform/              card paths, session log, ALSA card lookup
+  display/               320×240 DRM/fb present (stride/bpp)
+  audio/                 I2S ALSA open/close (kernel ioctls, silent stream)
+  surface/               surface MIDI pads/knobs/quit + light clear
+  engine/                loop-engine stubs (16 pads, silent)
+  ui/                    splash + home UI
 tools/make_autorun.py    1.4 bridge + 1.3 check + zip
 install/                 templates shipped into the package
 AGENTS.md                notes for future agents
@@ -73,14 +82,15 @@ AGENTS.md                notes for future agents
 
 ## Stub vs real
 
-| Piece | Scaffold | Later |
+| Piece | This PR | Still later |
 | --- | --- | --- |
 | Paths / logging | Real (`/proc/mounts`, `Epicycle/logs/`) | — |
-| Display | Software buffer; optional write to `/dev/fb0` | DRM format/stride, handoff |
-| Audio | Open stub (silence) | ALSA S32 @ 44.1, click-free codec |
-| Surface | Open stub; host auto-quits | Pads/knobs/wheel, LEDs |
+| Display | Real `/dev/fb0` mmap/write with stride + RGB565/32 | Tear-free panel module (blocked on 1.4 LoadPin) |
+| Audio | Real I2S open @ 44.1 S32, silent keep-alive, DROP on close | Click-free DAPM/volume ramp, playback engine |
+| Surface | Real Surface MIDI: pads, K1–K3, wheel quit, lights off | Full button map, richer LEDs |
 | Engine | 16 pad structs, silent render | Samples, LFO, crossfade, recorder |
 | Autorun pack | 1.4 top `autorun.sh` + 1.3 `autorun.check` | Release CI |
+| Hardware sign-off | Needs Ash’s card boot + log | — |
 
 ## License
 

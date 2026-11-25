@@ -1,8 +1,8 @@
-# EPICYCLE — MIT bring-up scaffold for Akai MPC Sample
+# EPICYCLE — MIT panel bring-up for Akai MPC Sample
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.0.1-scaffold
+VERSION    := 0.1.0-bringup
 BUILD      := build
 DIST       := dist
 
@@ -10,13 +10,15 @@ CROSS      ?= aarch64-linux-gnu-
 CC_CROSS   := $(CROSS)gcc
 CC_HOST    := gcc
 
-CFLAGS_COMMON := -std=c11 -Wall -Wextra -Wpedantic -O2 -Isrc/include
+CFLAGS_COMMON := -std=c11 -Wall -Wextra -Wpedantic -O2 -Isrc/include -pthread
 CFLAGS_CROSS  := $(CFLAGS_COMMON) -static -DEPICYCLE_ON_DEVICE
 CFLAGS_HOST   := $(CFLAGS_COMMON)
+LDFLAGS_COMMON := -pthread
 
 SRCS := \
 	src/main.c \
 	src/platform/paths.c \
+	src/platform/alsa_card.c \
 	src/display/display.c \
 	src/audio/audio.c \
 	src/surface/surface.c \
@@ -30,18 +32,18 @@ all: $(BUILD)/$(APP)
 host: $(BUILD)/$(APP)-host
 
 help:
-	@echo "make / make all   — aarch64 binary → $(BUILD)/$(APP)"
+	@echo "make / make all   — aarch64 static binary → $(BUILD)/$(APP)"
 	@echo "make host         — native smoke binary"
 	@echo "make package      — SD zip via tools/make_autorun.py → $(DIST)/"
 	@echo "make test-host    — run host binary once"
 	@echo "make clean"
 
 $(BUILD)/$(APP): $(SRCS) | $(BUILD)
-	$(CC_CROSS) $(CFLAGS_CROSS) -o $@ $(SRCS)
+	$(CC_CROSS) $(CFLAGS_CROSS) -o $@ $(SRCS) $(LDFLAGS_COMMON)
 	@echo "built $@"
 
 $(BUILD)/$(APP)-host: $(SRCS) | $(BUILD)
-	$(CC_HOST) $(CFLAGS_HOST) -o $@ $(SRCS)
+	$(CC_HOST) $(CFLAGS_HOST) -o $@ $(SRCS) $(LDFLAGS_COMMON)
 	@echo "built $@"
 
 $(BUILD):

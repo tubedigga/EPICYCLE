@@ -19,7 +19,7 @@ crossfade loops, phrase recorder. This repo is MIT static C (thin C++ allowed la
 
 | Path | Role |
 | --- | --- |
-| `src/` | App: display, ALSA audio stubs, surface MIDI stubs, loop engine stubs, UI |
+| `src/` | App: DRM/fb display, ALSA I2S (ioctl), surface MIDI, loop engine stubs, UI |
 | `tools/make_autorun.py` | Pack `autorun/` (+ top `autorun.sh`), compute 1.3 `autorun.check`, zip |
 | `install/` | Templates and recovery helpers copied into the package |
 | `docs/` | Design notes that belong in-repo (keep Project store docs as source of vision) |
@@ -27,22 +27,26 @@ crossfade loops, phrase recorder. This repo is MIT static C (thin C++ allowed la
 ## Build
 
 ```sh
-make                # aarch64 static-ish binary → build/epicycle
-make host           # native stub for CI / desktop smoke
+make                # aarch64 static binary → build/epicycle
+make host           # native smoke for CI / desktop
 make package        # dist/EPICYCLE-*.zip SD payload
 ```
 
-Cross compiler: `aarch64-linux-gnu-gcc` (or set `CROSS=`).
+Cross compiler: `aarch64-linux-gnu-gcc` (or set `CROSS=`). Links with `-pthread`
+(audio keep-alive thread). No alsa-lib — kernel ioctls only so static builds stay simple.
 
 ## Boot / recovery patterns (SampleBoot OS-AUTHORS)
 
 - Resolve app dir from `$0`, not a hardcoded `/autorun`.
 - Resolve **card root from `/proc/mounts`** (longest mount prefix).
 - OS under `autorun/epicycle/`; user data under `<card>/Epicycle/`.
-- On exit: restore stock with `systemctl start ac50` (trap EXIT).
+- On exit: restore stock with `systemctl start ac50` (launcher trap / start script).
 - Optional SampleBoot assets: `sampleboot.txt`, `sampleboot.png` (320×240).
 
-## Stub vs real
+## Stub vs real (bring-up)
 
-Bring-up scaffold: display/ALSA/MIDI open paths are stubs that log and no-op or
-fail soft off-device. Real DRM/ALSA/MIDI wiring is Phase 1 hardware work.
+| Real | Still stub |
+| --- | --- |
+| `/dev/fb0` present with stride/bpp | Loop engine / samples |
+| Surface MIDI pads/knobs/wheel quit | Full LED scenes, every button |
+| I2S silent stream open/close | Click-free volume ramp, capture |
