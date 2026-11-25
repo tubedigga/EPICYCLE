@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.8-midi-rewrite"
+#define EPICYCLE_VERSION "0.2.9-trim-vol-filt"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -105,16 +105,16 @@ typedef struct EpicyclePad {
     int loop_enable;        /* 1 = crossfade loop; 0 = one-shot through window */
     int ping_pong;          /* 1 = reverse at brace ends; 0 = forward only */
     int allow_scrub;        /* 1 = may use LFO brace scan (budgeted) */
-    /* Amp / filter page params (filter DSP still stub; values stored for UI). */
+    /* Amp / filter page params — Chamberlin SVF in the voice path. */
     float amp_attack;  /* 0..1 */
     float amp_decay;   /* 0..1 */
     float vel_sens;    /* 0..1 */
-    float filter_cutoff;
-    float filter_reso;
-    int filter_type; /* 0=OFF 1=LPF 2=HPF 3=BPF 4=NOTCH (DSP stub) */
+    float filter_cutoff; /* 0..1 (open = full); mapped exponentially in DSP */
+    float filter_reso;   /* 0..1 */
+    int filter_type; /* 0=OFF 1=LPF 2=HPF 3=BPF 4=NOTCH */
     float filt_attack;
     float filt_decay;
-    float filt_depth;
+    float filt_depth; /* 0..1 cutoff env depth */
     EpicycleLfo lfos[EPICYCLE_LFO_PER_PAD];
     EpicycleModRoute mods[EPICYCLE_MOD_SLOTS];
     /* Runtime modulated (engine fills each block; UI may read) */
@@ -122,6 +122,7 @@ typedef struct EpicyclePad {
     float mod_window_length;
     float mod_pitch_ratio;
     float mod_level;
+    float mod_filter_cutoff; /* after LFO / filt-env */
 } EpicyclePad;
 
 typedef struct EpicycleVoice {
@@ -133,6 +134,10 @@ typedef struct EpicycleVoice {
     int in_crossfade;
     double xfade_pos;   /* 0..1 through crossfade */
     int direction;      /* +1 forward, -1 reverse (ping-pong) */
+    /* Per-voice stereo Chamberlin SVF state */
+    float filt_z1_l, filt_z2_l;
+    float filt_z1_r, filt_z2_r;
+    float filt_env; /* 0..1 filt-env level after note-on */
 } EpicycleVoice;
 
 typedef struct EpicycleEngine {
@@ -147,10 +152,11 @@ typedef struct EpicycleEngine {
     EpicycleModePage mode_page; /* Sample-Mode-style page */
     uint64_t transport_frames; /* free-run clock for sync LFOs / divisions */
     int scrub_active; /* how many pads currently LFO-scanning brace */
-    float main_sq;     /* CC19 squared taper 0..1 */
-    float fader_gain;  /* CC20 linear 0..1; 0 = true silence */
-    float master_gain; /* main_sq * fader_gain (cached for render) */
-    float kit_level;   /* Mix SHIFT-K2 analogue: global pad trim 0..1 */
+    float main_sq;        /* smoothed CC19 squared taper 0..1 (render) */
+    float main_sq_target; /* raw target from CC19 — gain only, no voice touch */
+    float fader_gain;     /* CC20 linear 0..1; 0 = true silence */
+    float master_gain;    /* main_sq * fader_gain (cached for render) */
+    float kit_level;      /* Mix SHIFT-K2 analogue: global pad trim 0..1 */
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */

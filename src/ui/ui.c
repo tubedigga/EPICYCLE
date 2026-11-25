@@ -403,11 +403,16 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             draw_text(px, UI_COL1, 184, line, COL_FG, 3);
             snprintf(line, sizeof line, "%.2f", (double)pos);
             draw_text(px, UI_COL2, 184, line, COL_BRACE, 3);
-            if (pad && pad->freeform)
-                draw_text(px, 8, 212, "K1/K2 width  K3 slide  FREE", COL_MUTED, 1);
-            else
-                draw_text(px, 8, 212, "K2 div  K3 slide  DIV", COL_MUTED, 1);
-            draw_text(px, 8, 226, "enc: free/div  SHIFT: xfade/dir", COL_MUTED, 1);
+            /* Large FREE / DIVn badge — encoder push toggles (Ash discoverability). */
+            if (pad && pad->freeform) {
+                draw_text(px, 214, 52, "FREE", COL_BRACE, 3);
+                draw_text(px, 8, 212, "K1/K2 width  K3 slide", COL_MUTED, 1);
+            } else {
+                snprintf(line, sizeof line, "DIV%d", pad ? pad->division_beats : 4);
+                draw_text(px, 200, 52, line, COL_MOD, 3);
+                draw_text(px, 8, 212, "K2 beats  K3 slide", COL_MUTED, 1);
+            }
+            draw_text(px, 8, 226, "ENC free/div  hold SHIFT xfade/dir", COL_MUTED, 1);
         }
     } else if (page == EPICYCLE_PAGE_MIX) {
         draw_text(px, 8, 56, "MIX", COL_FG, 4);
@@ -457,7 +462,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         snprintf(v3, sizeof v3, "%s",
                  epicycle_filter_type_name(pad ? pad->filter_type : 0));
         draw_param_row(px, 100, "CUT", v1, "RES", v2, "TYPE", v3);
-        draw_text(px, 8, 160, "(DSP stub — values stored)", COL_MUTED, 1);
+        draw_text(px, 8, 160, "default OFF = open/hearable", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 cutoff  K2 reso  K3 type", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_FILT_ENV) {
         draw_text(px, 8, 56, "FILT ENV", COL_FG, 4);
@@ -465,7 +470,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->filt_decay * 127.0f) : 0);
         snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->filt_depth * 127.0f) : 0);
         draw_param_row(px, 100, "ATK", v1, "DEC", v2, "DEP", v3);
-        draw_text(px, 8, 160, "(follows filter stub)", COL_MUTED, 1);
+        draw_text(px, 8, 160, "env modulates cutoff depth", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 attack  K2 decay  K3 depth", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_LFO) {
         draw_text(px, 8, 56, "LFO", COL_FG, 4);

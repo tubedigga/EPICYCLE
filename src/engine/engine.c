@@ -68,9 +68,9 @@ static void pad_defaults(EpicyclePad *p)
     p->amp_attack = 0.0f;
     p->amp_decay = 0.35f;
     p->vel_sens = 1.0f;
-    p->filter_cutoff = 1.0f;
+    p->filter_cutoff = 1.0f; /* open */
     p->filter_reso = 0.0f;
-    p->filter_type = 1; /* LPF default name; DSP still stub */
+    p->filter_type = 0; /* OFF = fully hearable until user picks a type */
     p->filt_attack = 0.0f;
     p->filt_decay = 0.35f;
     p->filt_depth = 0.0f;
@@ -78,6 +78,7 @@ static void pad_defaults(EpicyclePad *p)
     p->mod_window_length = 1.0f;
     p->mod_pitch_ratio = 1.0f;
     p->mod_level = 0.8f;
+    p->mod_filter_cutoff = 1.0f;
 
     /* Default mod matrix: LFO0 → brace start (off until enabled); LFO1 → pitch stub. */
     for (int i = 0; i < EPICYCLE_LFO_PER_PAD; i++) {
@@ -192,6 +193,7 @@ void engine_sync_mod_window(EpicycleEngine *eng, int pad)
     }
     p->mod_pitch_ratio = pitch_ratio(p->octave, p->semitone, p->fine);
     p->mod_level = p->level;
+    p->mod_filter_cutoff = p->filter_cutoff;
 }
 
 /* First EPICYCLE_SCRUB_BUDGET pads (by index) that want brace scrub may scan;
@@ -215,7 +217,7 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
     float base_start, base_len;
     resolve_window(eng, pad, &base_start, &base_len);
 
-    float d_start = 0, d_len = 0, d_pitch = 0, d_level = 0;
+    float d_start = 0, d_len = 0, d_pitch = 0, d_level = 0, d_filt = 0;
 
     float dt = (float)frames / (float)eng->sample_rate;
     float beats_adv = (eng->tempo_bpm / 60.0f) * dt;
@@ -247,7 +249,8 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
         float w = lfo_wave(l->shape, l->phase) * l->depth * r->amount;
         switch (r->dest) {
         case EPICYCLE_MOD_BRACE_START:
-            /* Brace scrub = Position slide (window offset), not Start/End width. */
+            /* Brace scrub = Position slide (window offset), not Start/End width.
+             * Manual Trim knobs set base window; LFO adds on top — keep this path. */
             if (scrub_ok)
                 d_start += w * 0.5f; /* ±0.5 of sample at full depth */
             break;
@@ -262,7 +265,7 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
             d_level += w * 0.5f;
             break;
         case EPICYCLE_MOD_FILTER:
-            /* stub — reserved for later filter cutoff */
+            d_filt += w * 0.5f;
             break;
         default:
             break;
@@ -275,6 +278,7 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
     pad->mod_window_length = len;
     pad->mod_pitch_ratio = pitch_ratio(pad->octave, pad->semitone, pad->fine + d_pitch * 100.0f);
     pad->mod_level = clampf(pad->level + d_level, 0.0f, 1.0f);
+    pad->mod_filter_cutoff = clampf(pad->filter_cutoff + d_filt, 0.0f, 1.0f);
 }
 
 static void recount_scrub(EpicycleEngine *eng)
@@ -331,7 +335,8 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->sample_rate = sample_rate ? sample_rate : 44100;
     eng->running = 1;
     eng->selected_pad = 0;
-    eng->main_sq = 1.0f;    /* until surface CC19 arrives */
+    eng->main_sq = 1.0f; /* until surface CC19 arrives */
+    eng->main_sq_target = 1.0f;
     eng->fader_gain = 1.0f; /* CC20 default full until first fader event */
     eng->master_gain = 1.0f;
     eng->kit_level = 1.0f;
@@ -520,6 +525,9 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     v->in_crossfade = 0;
     v->xfade_pos = 0;
     v->direction = 1; /* always start forward; ping-pong flips at ends */
+    v->filt_z1_l = v->filt_z2_l = 0.0f;
+    v->filt_z1_r = v->filt_z2_r = 0.0f;
+    v->filt_env = 0.0f;
 }
 
 void engine_note_off(EpicycleEngine *eng, int pad)
@@ -732,7 +740,7 @@ void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, ui
 
 static void recompute_master(EpicycleEngine *eng)
 {
-    /* Either control at 0 → true silence. */
+    /* Either control at 0 → true silence. Gain only — never restarts voices. */
     eng->master_gain = eng->main_sq * eng->fader_gain;
 }
 
@@ -740,11 +748,17 @@ void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19)
 {
     if (!eng)
         return;
-    /* sample-base HARDWARE.md: Main Volume is surface MIDI only (no ALSA
-     * mixer); map CC19 → squared taper. */
+    /* CC19 → target only. Render smooths toward it so level restores without
+     * clicks; never touches voices / windows / MIDI. */
     float t = (float)cc19 / 127.0f;
-    eng->main_sq = t * t;
-    recompute_master(eng);
+    eng->main_sq_target = t * t;
+    if (cc19 == 0)
+        eng->main_sq_target = 0.0f;
+    /* Snap to silence immediately when knob hits 0. */
+    if (cc19 == 0) {
+        eng->main_sq = 0.0f;
+        recompute_master(eng);
+    }
 }
 
 void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20)
@@ -754,6 +768,81 @@ void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20)
     /* Control slider (CC20): linear; bottom detent = exact 0. */
     eng->fader_gain = (float)cc20 / 127.0f;
     recompute_master(eng);
+}
+
+/* Chamberlin SVF — one sample in, selected mode out. z1=band, z2=low. */
+static float voice_filter_tick(float in, float *z1, float *z2, float f, float q, int type)
+{
+    float band = *z1;
+    float low = *z2;
+    low += f * band;
+    float high = in - low - q * band;
+    band += f * high;
+    /* Mild clamp against blow-ups at high reso */
+    if (band > 4.0f)
+        band = 4.0f;
+    else if (band < -4.0f)
+        band = -4.0f;
+    if (low > 4.0f)
+        low = 4.0f;
+    else if (low < -4.0f)
+        low = -4.0f;
+    *z1 = band;
+    *z2 = low;
+    switch (type) {
+    case 2:
+        return high; /* HPF */
+    case 3:
+        return band; /* BPF */
+    case 4:
+        return high + low; /* NOTCH */
+    case 1:
+    default:
+        return low; /* LPF */
+    }
+}
+
+static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr, float *L,
+                               float *R)
+{
+    int type = pad->filter_type;
+    if (type <= 0 || type > 4)
+        return; /* OFF — bypass, fully hearable */
+
+    float cut = pad->mod_filter_cutoff;
+    /* Filt env: simple rise then fall, depth scales cutoff down from open. */
+    float depth = pad->filt_depth;
+    if (depth > 0.001f) {
+        float atk = 0.001f + pad->filt_attack * 0.25f;
+        float dec = 0.01f + pad->filt_decay * 0.75f;
+        float rate = (v->filt_env < 1.0f) ? (1.0f / (atk * (float)sr + 1.0f))
+                                          : -(1.0f / (dec * (float)sr + 1.0f));
+        if (v->filt_env < 1.0f || rate < 0.0f) {
+            v->filt_env += rate;
+            if (v->filt_env > 1.0f)
+                v->filt_env = 1.0f;
+            if (v->filt_env < 0.0f)
+                v->filt_env = 0.0f;
+        }
+        float env = (v->filt_env < 1.0f) ? v->filt_env : v->filt_env; /* peak then decay */
+        /* While still attacking, env rises 0→1; after peak we decay — use env as amount. */
+        cut = clampf(cut - depth * (1.0f - env), 0.0f, 1.0f);
+    }
+
+    /* Exponential-ish cutoff: ~80 Hz .. 0.45 * Nyquist */
+    float ny = 0.45f * (float)sr;
+    float hz = 80.0f * powf(ny / 80.0f, clampf(cut, 0.0f, 1.0f));
+    float f = 2.0f * sinf((float)M_PI * hz / (float)sr);
+    if (f > 0.95f)
+        f = 0.95f;
+    if (f < 0.001f)
+        f = 0.001f;
+    float q = 0.05f + clampf(pad->filter_reso, 0.0f, 1.0f) * 0.85f;
+    if (f * q > 0.95f)
+        q = 0.95f / f;
+
+    *L = voice_filter_tick(*L, &v->filt_z1_l, &v->filt_z2_l, f, q, type);
+    *R = voice_filter_tick(*R, &v->filt_z1_r, &v->filt_z2_r, f, q, type);
 }
 
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames)
@@ -768,6 +857,9 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
     recount_scrub(eng);
     for (int p = 0; p < EPICYCLE_PAD_COUNT; p++)
         apply_modulation(eng, p, frames);
+
+    /* One-pole coeff toward main_sq_target (~5 ms) — computed once per block. */
+    float main_a = 1.0f - expf(-1.0f / (0.005f * (float)eng->sample_rate + 1.0f));
 
     for (size_t n = 0; n < frames; n++) {
         float mixL = 0, mixR = 0;
@@ -875,6 +967,9 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     v->env = (float)(rem / 64.0);
             }
 
+            /* Filter DSP (OFF = bypass). LFO→POS scrub untouched above. */
+            voice_apply_filter(v, pad, eng->sample_rate, &L, &R);
+
             float vel = v->velocity;
             if (pad->vel_sens < 0.99f)
                 vel = pad->vel_sens * v->velocity + (1.0f - pad->vel_sens);
@@ -887,6 +982,14 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             mixR += R * g * gr;
         }
 
+        /* Smooth main volume toward target — gain only, no voice restart. */
+        {
+            float tgt = eng->main_sq_target;
+            eng->main_sq += (tgt - eng->main_sq) * main_a;
+            if (tgt == 0.0f && eng->main_sq < 1e-6f)
+                eng->main_sq = 0.0f;
+            eng->master_gain = eng->main_sq * eng->fader_gain;
+        }
         float mg = eng->master_gain;
         mixL *= mg;
         mixR *= mg;
