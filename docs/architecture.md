@@ -33,14 +33,16 @@ Power on
   (CC20, linear, latched until user moves) → `master_gain` (gain only; no voice restart).
 - **surface** — Untrusted Surface MIDI parser: pads (explicit note-on; status cleared
   after pad msgs), SAMPLE (6), SHIFT (49, **momentary**), LOOP (74), K1–K3, Main CC19
-  (dump applies incl. 0), fader CC20, soft keys B1/B2 **on press**, B3 quit on release,
-  wheel (press never quits), `0x42` dump + RX drain. SysEx cancels running status;
-  AT ignored. MIT rewrite of SampleBoot / sample-base / mpc-sample-lab notes.
+  (latched until MAIN moves; dump never false-silences), fader CC20, soft keys B1/B2
+  **on press**, B3 quit on release, wheel (press never quits), `0x42` dump + RX drain.
+  SysEx cancels running status; AT ignored. MIT rewrite of SampleBoot / sample-base /
+  mpc-sample-lab notes.
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
-- **tombola** — soft 2D drum: fader morphs N-gon/circle; K2 bipolar spin; MUTE+pad
-  balls (empty start; rest at bottom until spin lifts); wall-hit queue; HitMod
-  slots start empty/off (user wires SRC/DEST/AMT left→right on K1/K2/K3).
+- **tombola** — soft 2D drum: fader morphs N-gon/circle; K1 bipolar spin (CW=CW);
+  MUTE+pad balls (empty start; rest at bottom until spin lifts); leave+impact wall
+  hits (no stuck-edge spam); HitMod slots start empty/off (user wires SRC/DEST/AMT
+  left→right on K1/K2/K3).
 - **engine** — 16 pads × brace window; division/freeform; pitch; crossfade +
   ping-pong; LOOP latch / one-shot; bounce forces one-shot when LOOP off;
   Chamberlin SVF; impact mods only if HitMod enabled; 2 LFOs + 4 mod routes.

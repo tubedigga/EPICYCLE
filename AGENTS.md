@@ -4,7 +4,7 @@
 
 **EPICYCLE** is a generative **tombola** for the Akai MPC Sample (AC50 SD autorun).
 Primary UI: 2D projected drum; coloured balls bounce; wall hits trigger pad samples.
-Fader=shape morph, MAIN=vol, K2=spin±dir; MUTE+pad balls (empty / rest at bottom);
+Fader=shape morph, MAIN=vol, K1=spin±dir (CW=CW); MUTE+pad balls (empty / rest at bottom);
 SAMPLE+pad selects. HitMod slots empty until user wires them. Freeze / reverb =
 later. MIT static C (thin C++ allowed later).
 
@@ -62,7 +62,7 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 
 | Real | Still stub / later |
 | --- | --- |
-| Tombola morph (fader) + spin (K2) + wall-hit | Freeze 2–5 s → loop |
+| Tombola morph (fader) + spin (K1) + wall-hit | Freeze 2–5 s → loop |
 | Empty start; MUTE+pad; rest→spin lift | Reverb/delay DSP (sends stubbed) |
 | HitMod multi-slot (empty default; K1/K2/K3=src/dest/amt) | Ball–ball consequence list |
 | Bounce = one-shot; pad LED flash on hit only | Phrase recorder |

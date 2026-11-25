@@ -17,19 +17,22 @@
 
 #define TB_RADIUS 1.0f
 #define TB_BALL_R 0.085f
-#define TB_HIT_COOLDOWN 0.070f
+#define TB_HIT_COOLDOWN 0.040f
 #define TB_MAX_HITS 16
-#define TB_DAMP 0.9988f
-#define TB_WALL_RESTITUTION 0.82f
-#define TB_SPIN_KICK 0.55f /* scoop without flinging past walls */
-#define TB_GRAVITY 1.25f
-#define TB_SPIN_MAX 10.0f /* responsive but not chaotic (OP-1 feel, not clone) */
-#define TB_FLOOR_FRIC 0.85f
-#define TB_REST_SPEED 0.12f
+#define TB_DAMP 0.9994f
+#define TB_WALL_RESTITUTION 0.92f /* bouncier, more ball-like (OP-1 feel ref) */
+#define TB_SPIN_KICK 0.42f /* scoop without flinging past walls */
+#define TB_GRAVITY 1.55f
+#define TB_SPIN_MAX 9.0f /* responsive but not chaotic (OP-1 feel, not clone) */
+#define TB_FLOOR_FRIC 0.78f
+#define TB_REST_SPEED 0.10f
 #define TB_CONTAIN_ITERS 4 /* multi-pass half-plane projection */
+#define TB_LEAVE_EPS 0.012f /* must clear wall by this before next impact */
 
 static EpicycleTombola g_tb;
 static float g_cooldown[EPICYCLE_PAD_COUNT];
+/* 1 while ball is touching a wall — no retrigger until leave + new impact. */
+static uint8_t g_wall_touch[EPICYCLE_PAD_COUNT];
 
 /* Distinct pad colours (0x00RRGGBB). */
 static const uint32_t BALL_RGB[EPICYCLE_PAD_COUNT] = {
@@ -114,6 +117,7 @@ void tombola_init(EpicycleTombola *tb)
         place_ball_rest(&tb->balls[i], i);
         tb->balls[i].active = 0;
         g_cooldown[i] = 0.0f;
+        g_wall_touch[i] = 0;
     }
     if (tb != &g_tb)
         g_tb = *tb;
@@ -207,7 +211,9 @@ void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1)
 {
     if (!tb)
         tb = &g_tb;
-    /* Bipolar K1: 64 ± deadband = stop. Fader never touches spin. */
+    /* Bipolar K1: 64 ± deadband = stop. Fader never touches spin.
+     * CW knob (CC↑) → CW spin on screen. World Y-up: math +angle is CCW,
+     * so CW visual uses negative spin_rad rate (Ash: dir must match knob). */
     int c = (int)k1 - 64;
     if (c > -6 && c < 6) {
         tb->spin_speed = 0.0f;
@@ -221,7 +227,8 @@ void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1)
     /* Mild ease so small moves feel smooth, not jerky. */
     float mag = fabsf(n);
     float shaped = mag * mag * (3.0f - 2.0f * mag); /* smoothstep */
-    tb->spin_speed = ((n < 0.0f) ? -shaped : shaped) * TB_SPIN_MAX;
+    float signed_n = (n < 0.0f) ? -shaped : shaped;
+    tb->spin_speed = -signed_n * TB_SPIN_MAX; /* negate: CW knob → CW spin */
 }
 
 void tombola_set_ball_count(EpicycleTombola *tb, int count)
@@ -243,6 +250,8 @@ void tombola_set_ball_count(EpicycleTombola *tb, int count)
             tb->balls[i].vx = 0;
             tb->balls[i].vy = 0;
             tb->balls[i].hit_flash = 0;
+            g_wall_touch[i] = 0;
+            g_cooldown[i] = 0.0f;
         }
     }
 }
@@ -269,9 +278,13 @@ void tombola_toggle_ball(EpicycleTombola *tb, int pad)
         tb->balls[pad].vx = 0;
         tb->balls[pad].vy = 0;
         tb->balls[pad].hit_flash = 0;
+        g_wall_touch[pad] = 0;
+        g_cooldown[pad] = 0.0f;
     } else {
         /* Rest at bottom — spin lifts; no spontaneous bounce. */
         place_ball_rest(&tb->balls[pad], pad);
+        g_wall_touch[pad] = 0;
+        g_cooldown[pad] = 0.0f;
     }
     tb->ball_target = tombola_active_count(tb);
 }
@@ -289,12 +302,16 @@ static void push_hit(EpicycleTombola *tb, int pad, float vel)
 {
     if (tb->hit_n >= TB_MAX_HITS)
         return;
+    /* Stuck-edge spam guard: only new impacts after leave (Ash). */
+    if (g_wall_touch[pad])
+        return;
     if (g_cooldown[pad] > 0.0f)
         return;
     tb->hit_pad[tb->hit_n] = pad;
     tb->hit_vel[tb->hit_n] = clampf(vel, 0.08f, 1.0f);
     tb->hit_n++;
     g_cooldown[pad] = TB_HIT_COOLDOWN;
+    g_wall_touch[pad] = 1;
     tb->balls[pad].hit_flash = 1.0f;
 }
 
@@ -323,6 +340,33 @@ static void ngon_edge(int faces, int e, float R, float *nx, float *ny, float *px
     }
     *px = x0;
     *py = y0;
+}
+
+/* Clear wall-touch once centre is clearly inside (leave before new impact). */
+static void update_wall_leave(EpicycleTombola *tb, int pad, float x, float y)
+{
+    float R = tb->radius - TB_BALL_R;
+    if (R < 0.2f)
+        R = 0.2f;
+    int faces = tb->face_count;
+    int clear = 1;
+    if (faces <= 0) {
+        float d = len2(x, y);
+        if (d > R - TB_LEAVE_EPS)
+            clear = 0;
+    } else {
+        for (int e = 0; e < faces; e++) {
+            float nx, ny, px, py;
+            ngon_edge(faces, e, R, &nx, &ny, &px, &py);
+            float dist = (x - px) * nx + (y - py) * ny;
+            if (dist > -TB_LEAVE_EPS) {
+                clear = 0;
+                break;
+            }
+        }
+    }
+    if (clear)
+        g_wall_touch[pad] = 0;
 }
 
 /* Hard project into shape — kills "orbit outside walls" (Ash). */
@@ -381,6 +425,7 @@ static void contain_local(EpicycleTombola *tb, float *x, float *y, float *vx, fl
  * Collision in the drum's local (unrotated) frame.
  * Circle: radial clamp. N-gon: multi-pass half-plane + hard contain.
  * Spin kick scoops resting balls; never leaves balls outside the walls.
+ * Hit only on new impact after leave (no stuck-edge spam).
  */
 static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float *vx, float *vy,
                          float spin_speed)
@@ -390,6 +435,7 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
         R = 0.2f;
     int faces = tb->face_count;
     int hit = 0;
+    int contacting = 0;
     float impact = 0.0f;
     float spin_abs = fabsf(spin_speed);
 
@@ -401,15 +447,26 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
             float vn = (*vx) * nx + (*vy) * ny;
             float tx = -ny;
             float ty = nx;
-            if (vn > 0.0f) {
+            contacting = 1;
+            if (vn > 0.05f) {
+                /* Elastic bounce — keep tangential; reflect normal (ball-like). */
                 *vx -= (1.0f + TB_WALL_RESTITUTION) * vn * nx;
                 *vy -= (1.0f + TB_WALL_RESTITUTION) * vn * ny;
-                impact = vn + spin_abs * 0.10f;
+                impact = vn + spin_abs * 0.08f;
                 hit = 1;
+            } else if (vn > 0.0f) {
+                /* Soft settle: kill outward normal only. */
+                *vx -= vn * nx;
+                *vy -= vn * ny;
             }
-            *vx += tx * spin_speed * TB_SPIN_KICK * R;
-            *vy += ty * spin_speed * TB_SPIN_KICK * R;
-            if (spin_abs < 0.4f && vn < TB_REST_SPEED) {
+            /* Scoop resting balls; scale down if already bouncing. */
+            float kick = TB_SPIN_KICK * R;
+            float spd = len2(*vx, *vy);
+            if (spd > 1.8f)
+                kick *= 1.8f / spd;
+            *vx += tx * spin_speed * kick;
+            *vy += ty * spin_speed * kick;
+            if (spin_abs < 0.35f && fabsf(vn) < TB_REST_SPEED) {
                 float vt = (*vx) * tx + (*vy) * ty;
                 *vx -= tx * vt * (1.0f - TB_FLOOR_FRIC);
                 *vy -= ty * vt * (1.0f - TB_FLOOR_FRIC);
@@ -427,22 +484,25 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
                 if (dist > 0.0f) {
                     float vn = (*vx) * nx + (*vy) * ny;
                     float tx = -ny, ty = nx;
-                    if (vn > 0.0f) {
+                    contacting = 1;
+                    if (vn > 0.05f) {
                         *vx -= (1.0f + TB_WALL_RESTITUTION) * vn * nx;
                         *vy -= (1.0f + TB_WALL_RESTITUTION) * vn * ny;
-                        float imp = vn + spin_abs * 0.10f;
+                        float imp = vn + spin_abs * 0.08f;
                         if (imp > impact)
                             impact = imp;
                         hit = 1;
+                    } else if (vn > 0.0f) {
+                        *vx -= vn * nx;
+                        *vy -= vn * ny;
                     }
-                    /* Scoop only on contact, scaled down if already fast. */
                     float kick = TB_SPIN_KICK * R;
                     float spd = len2(*vx, *vy);
-                    if (spd > 2.5f)
-                        kick *= 2.5f / spd;
+                    if (spd > 1.8f)
+                        kick *= 1.8f / spd;
                     *vx += tx * spin_speed * kick;
                     *vy += ty * spin_speed * kick;
-                    if (spin_abs < 0.4f && vn < TB_REST_SPEED) {
+                    if (spin_abs < 0.35f && fabsf(vn) < TB_REST_SPEED) {
                         float vt = (*vx) * tx + (*vy) * ty;
                         *vx -= tx * vt * (1.0f - TB_FLOOR_FRIC);
                         *vy -= ty * vt * (1.0f - TB_FLOOR_FRIC);
@@ -462,6 +522,13 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
 
     if (hit)
         push_hit(tb, pad, clampf(impact * 0.55f, 0.12f, 1.0f));
+    else if (!contacting)
+        update_wall_leave(tb, pad, *x, *y);
+    else if (!g_wall_touch[pad] && contacting) {
+        /* Resting against wall without a bounce impact — mark touch so
+         * cooldown-less spin kick cannot spam once vn creeps up. */
+        g_wall_touch[pad] = 1;
+    }
     return hit;
 }
 
@@ -506,9 +573,13 @@ void tombola_step(EpicycleTombola *tb, float dt)
         /* Extra settle damping when spin is parked — cooperative rest. */
         if (spin_abs < 0.25f) {
             float spd = len2(b->vx, b->vy);
-            if (spd < 0.55f) {
-                b->vx *= 0.92f;
-                b->vy *= 0.92f;
+            if (spd < 0.85f) {
+                b->vx *= 0.88f;
+                b->vy *= 0.88f;
+            }
+            if (spd < 0.18f) {
+                b->vx *= 0.70f;
+                b->vy *= 0.70f;
             }
         }
 
@@ -656,11 +727,12 @@ int tombola_selftest(void)
             return -16;
     }
     tombola_set_morph(&tb, 0.0f); /* circle */
-    tombola_set_spin_cc(&tb, 100); /* CW */
-    if (tb.spin_speed <= 0.0f)
-        return -12;
-    tombola_set_spin_cc(&tb, 20); /* CCW */
+    /* CW knob (CC=100) → CW visual = negative spin_rad rate (Y-up). */
+    tombola_set_spin_cc(&tb, 100);
     if (tb.spin_speed >= 0.0f)
+        return -12;
+    tombola_set_spin_cc(&tb, 20); /* CCW knob → positive (math CCW) */
+    if (tb.spin_speed <= 0.0f)
         return -13;
     tombola_set_spin_cc(&tb, 64); /* stop */
     if (fabsf(tb.spin_speed) > 0.01f)
@@ -682,6 +754,40 @@ int tombola_selftest(void)
     }
     if (hits_total < 1)
         return -2; /* spin should scoop and bounce */
+
+    /* Stuck-edge: ball glued to wall at rest must not retrigger. */
+    {
+        tombola_set_spin_cc(&tb, 64);
+        tombola_set_ball_count(&tb, 1);
+        tb.balls[0].x = 0.0f;
+        tb.balls[0].y = -(TB_RADIUS - TB_BALL_R); /* on floor */
+        tb.balls[0].vx = 0.0f;
+        tb.balls[0].vy = 0.0f;
+        g_wall_touch[0] = 1; /* already in contact */
+        g_cooldown[0] = 0.0f;
+        int spam = 0;
+        for (int i = 0; i < 180; i++) {
+            tombola_step(&tb, 1.0f / 60.0f);
+            spam += tb.hit_n;
+        }
+        if (spam > 0)
+            return -19; /* stuck-edge retrigger spam */
+        /* Leave wall, then a real impact must fire once. */
+        tb.balls[0].x = 0.0f;
+        tb.balls[0].y = 0.0f;
+        tb.balls[0].vx = 0.0f;
+        tb.balls[0].vy = -4.0f; /* drive into floor */
+        g_wall_touch[0] = 0;
+        int got = 0;
+        for (int i = 0; i < 60; i++) {
+            tombola_step(&tb, 1.0f / 60.0f);
+            got += tb.hit_n;
+        }
+        if (got < 1)
+            return -20; /* leave+new impact must retrigger */
+        tombola_set_ball_count(&tb, 8);
+    }
+    tombola_set_spin_cc(&tb, 100);
 
     /* Triangle morph: must stay inside half-planes (Ash: no orbit outside). */
     tombola_set_morph(&tb, 1.0f);

@@ -428,23 +428,37 @@ static int confirm_drop(uint8_t *pending, int *pending_n, uint8_t v, int need)
 static void apply_main_vol_cc(uint8_t v)
 {
     /* CC19 → gain only. Never touches pads/soft keys/Trim.
-     * Follow hardware from the 0x42 dump (including 0 = silence). Do not
-     * leave software louder than the knob (Ash: audio with knob at zero).
-     * Large single-sample jumps need one confirm (cable glitch), then apply. */
+     * Latch like fader (Ash 0.3.5: volume dropouts / never silent wrongly):
+     * record 0x42 dump, stay disengaged until user moves ≥3 from dump.
+     * Engine keeps full until engaged. Once engaged, track; large plunges
+     * (and any move to 0) need confirm to reject cable glitches. */
     if (!g_state.main_seen) {
         g_state.main_seen = 1;
         g_state.main_dump = v;
-        g_state.main_vol = v; /* including 0 */
-        g_state.main_stable = v;
-        g_state.main_engaged = 1;
+        g_state.main_vol = 127; /* UI full until engage — no false silence */
+        g_state.main_stable = 127;
+        g_state.main_engaged = 0;
         g_main_pending_n = 0;
         return;
     }
-    g_state.main_engaged = 1;
-    /* Confirm large drops only (glitch mute). Ups / small moves apply now so
-     * restoring level stays responsive without voice side effects. */
+    if (!g_state.main_engaged) {
+        int d = (int)v - (int)g_state.main_dump;
+        if (d < 0)
+            d = -d;
+        if (d < 3)
+            return;
+        /* Refuse to engage at near-silence (Ash: no wrongful mute from dump). */
+        if (v < 8)
+            return;
+        g_state.main_engaged = 1;
+        g_state.main_vol = v;
+        g_state.main_stable = v;
+        g_main_pending_n = 0;
+        return;
+    }
+    /* Confirm large drops + any zero (glitch mute). Ups / small moves apply. */
     int drop = (int)g_state.main_stable - (int)v;
-    if (drop > 16) {
+    if (drop > 16 || v == 0) {
         if (!confirm_drop(&g_main_pending, &g_main_pending_n, v, 2))
             return;
     }
@@ -1061,7 +1075,7 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 5) Volume CC isolated — does not set soft keys / SAMPLE; dump applies. */
+    /* 5) Volume CC isolated — dump latches; engage on move (Ash dropouts). */
     midi_selftest_reset();
     {
         const uint8_t seq[] = {0xb0, 19, 40, 0xb0, 19, 80, 0xb0, 16, 10};
@@ -1072,23 +1086,31 @@ int surface_midi_selftest(void)
             fails++;
         if (g_state.k1 != 10)
             fails++;
-        /* Dump applies immediately; second updates */
+        /* Dump=40; move to 80 engages and tracks */
         if (!g_state.main_engaged || g_state.main_vol != 80)
             fails++;
     }
 
-    /* 5b) Dump at 0 → silent (software must not stay above knob). */
+    /* 5b) Dump at 0 must NOT engage silence (Ash: never silent wrongly). */
     midi_selftest_reset();
     {
         const uint8_t z[] = {0xb0, 19, 0};
         midi_feed_buf(z, sizeof z);
-        if (!g_state.main_engaged || g_state.main_vol != 0)
+        if (g_state.main_engaged)
+            fails++;
+        if (g_state.main_vol != 127)
+            fails++; /* stay full until user moves */
+        /* Move from dump 0 → mid engages */
+        const uint8_t up[] = {0xb0, 19, 64};
+        midi_feed_buf(up, sizeof up);
+        if (!g_state.main_engaged || g_state.main_vol != 64)
             fails++;
     }
 
     /* 5c) Lone main-vol plunge rejected; confirmed drop accepted. */
     midi_selftest_reset();
     {
+        /* Engage first: dump 100, then move to 90. */
         const uint8_t seq[] = {0xb0, 19, 100, 0xb0, 19, 90, 0xb0, 19, 10};
         midi_feed_buf(seq, sizeof seq);
         if (!g_state.main_engaged || g_state.main_vol != 90)

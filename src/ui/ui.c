@@ -655,22 +655,27 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
 
     if (page == EPICYCLE_PAGE_TOMBOLA) {
         draw_tombola(px, tb, sel);
-        int faces = tb ? tb->face_count : 0;
-        if (faces <= 0)
-            snprintf(v1, sizeof v1, "CIRC");
-        else
-            snprintf(v1, sizeof v1, "%dF", faces);
+        /* Labels MUST match knobs (Ash): K1=spin, K2 unused, K3=balls status.
+         * Shape morph is fader-only — never label a spin knob "SHAPE". */
         {
             float sp = tb ? tb->spin_speed : 0.0f;
             if (sp > -0.05f && sp < 0.05f)
-                snprintf(v2, sizeof v2, "STOP");
+                snprintf(v1, sizeof v1, "STOP");
             else
-                snprintf(v2, sizeof v2, "%+.1f", (double)sp);
+                snprintf(v1, sizeof v1, "%+.1f", (double)sp);
         }
+        v2[0] = '\0';
         int active = tb ? tombola_active_count(tb) : 0;
         snprintf(v3, sizeof v3, "%d", active);
-        draw_param_row(px, 188, "SHAPE", v1, "SPIN", v2, "BALLS", v3);
-        draw_text(px, 8, 226, "FADER morph  MAIN vol  K1 spin  MUTE+pad  FULL=HITMOD", COL_MUTED, 1);
+        draw_param_row(px, 188, "SPIN", v1, "", v2, "BALLS", v3);
+        {
+            int faces = tb ? tb->face_count : 0;
+            if (faces <= 0)
+                snprintf(line, sizeof line, "FADER CIRC  MAIN vol  K1 spin  K2 —");
+            else
+                snprintf(line, sizeof line, "FADER %dF  MAIN vol  K1 spin  K2 —", faces);
+            draw_text(px, 8, 226, line, COL_MUTED, 1);
+        }
     } else if (page == EPICYCLE_PAGE_HITMOD) {
         draw_text(px, 8, 48, "HIT MOD", COL_FG, 2);
         draw_text(px, 120, 52, "src->dest matrix", COL_MUTED, 1);
