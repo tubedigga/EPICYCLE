@@ -8,7 +8,8 @@
  *   - knobs K1–K3: CC 16/17/18; main volume CC 19; fader CC 20 (channel 1)
  *   - wheel: CC 100 relative; wheel push ≈ note 111
  *   - SAMPLE mode button: channel 1 note 6 (SEQ=7, Pad FX=1, Knob FX=0)
- * Soft keys above the screen: notes 12/13/14 — right soft key also quits.
+ * Soft keys above the screen: notes 12/13/14 — B1 prev page, B2 next, B3 quit.
+ * Wheel push (note 111) is an edge only — never quits (Ash 0.2.5).
  * Hold SAMPLE + pad = select (app); plain pad = play. Pad LEDs show selection.
  * On open: clear leftover lights + send position-request SysEx 0x42.
  */
@@ -243,8 +244,10 @@ static void midi_feed(uint8_t b)
     }
 
     if (ch == 0 && (cmd == 0x90 || cmd == 0x80)) {
-        /* Channel 1 buttons. Wheel push = note 111; soft-right = 14.
-         * Soft-left (12) = toggle free/division; soft-mid (13) = toggle LFO scrub.
+        /* Channel 1 buttons.
+         * Soft-left (12) / soft-mid (13) = page prev/next (main).
+         * Soft-right (14) = quit edge only — main sets quit_requested after splash.
+         * Wheel push (111) = press edge; never quits.
          * SAMPLE (6) held + pad = select without play (handled in main). */
         int on = (cmd == 0x90 && m_d[1] > 0);
         if (m_d[0] == NOTE_SAMPLE) {
@@ -252,12 +255,14 @@ static void midi_feed(uint8_t b)
             light_button(g_fd, NOTE_SAMPLE, on ? 2 : 0);
             return;
         }
-        if (on && (m_d[0] == 111 || m_d[0] == 14))
-            g_state.quit_requested = 1;
+        if (on && m_d[0] == 111)
+            g_state.wheel_press = 1;
         if (on && m_d[0] == 12)
             g_state.soft_left = 1;
         if (on && m_d[0] == 13)
             g_state.soft_mid = 1;
+        if (on && m_d[0] == 14)
+            g_state.soft_right = 1;
         return;
     }
 
@@ -291,8 +296,9 @@ int surface_open(void)
     memset(&g_state, 0, sizeof g_state);
     memset(g_pad_lit, 0, sizeof g_pad_lit);
     g_selected_pad = 0;
-    g_state.main_vol = 100;
-    g_state.fader = 127; /* full until first CC20 — bottom will silence */
+    /* Both full until first CC — avoids main@100 vs fader@127 mismatch. */
+    g_state.main_vol = 127;
+    g_state.fader = 127;
     g_fd = -1;
     m_status = m_need = m_n = m_sysex = 0;
     m_voice_status = 0;

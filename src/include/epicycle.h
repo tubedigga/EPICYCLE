@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.4-loop-ui"
+#define EPICYCLE_VERSION "0.2.5-mode-pages"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -52,6 +52,21 @@ typedef enum EpicycleModDest {
     EPICYCLE_MOD_DEST_COUNT
 } EpicycleModDest;
 
+/*
+ * Sample-Mode-style pages (stock B1–B3 cycle mapping, EPICYCLE identity).
+ * Trim keeps the large waveform home; LFO is EPICYCLE-only.
+ */
+typedef enum EpicycleModePage {
+    EPICYCLE_PAGE_TRIM = 0,
+    EPICYCLE_PAGE_MIX,
+    EPICYCLE_PAGE_AMP,
+    EPICYCLE_PAGE_TUNE,
+    EPICYCLE_PAGE_FILTER,
+    EPICYCLE_PAGE_FILT_ENV,
+    EPICYCLE_PAGE_LFO,
+    EPICYCLE_PAGE_COUNT
+} EpicycleModePage;
+
 typedef struct EpicycleLfo {
     EpicycleLfoShape shape;
     float rate_hz; /* free-run Hz; ignored when sync_beats > 0 */
@@ -81,13 +96,24 @@ typedef struct EpicyclePad {
     float window_length;    /* 0..1, >0 */
     int freeform;           /* 1 = free length; 0 = division snap */
     int division_beats;     /* 1..32 when !freeform */
-    float level;            /* 0..1 */
+    float level;            /* 0..1 pad volume (Mix) */
+    float pan;              /* 0 = L, 0.5 = C, 1 = R */
     int octave;             /* -4..+4 */
-    int semitone;           /* -12..+12 */
+    int semitone;           /* -24..+24 (Tune page; engine clamps pitch) */
     float fine;             /* -100..+100 cents */
     float crossfade;        /* 0..1 of window length used for Xfade */
     int loop_enable;        /* 1 = crossfade loop; 0 = one-shot through window */
     int allow_scrub;        /* 1 = may use LFO brace scan (budgeted) */
+    /* Amp / filter page params (filter DSP still stub; values stored for UI). */
+    float amp_attack;  /* 0..1 */
+    float amp_decay;   /* 0..1 */
+    float vel_sens;    /* 0..1 */
+    float filter_cutoff;
+    float filter_reso;
+    int filter_type; /* 0 = off … */
+    float filt_attack;
+    float filt_decay;
+    float filt_depth;
     EpicycleLfo lfos[EPICYCLE_LFO_PER_PAD];
     EpicycleModRoute mods[EPICYCLE_MOD_SLOTS];
     /* Runtime modulated (engine fills each block; UI may read) */
@@ -116,11 +142,13 @@ typedef struct EpicycleEngine {
     unsigned sample_rate;
     int running;
     int selected_pad; /* UI focus 0..15 */
+    EpicycleModePage mode_page; /* Sample-Mode-style page */
     uint64_t transport_frames; /* free-run clock for sync LFOs / divisions */
     int scrub_active; /* how many pads currently LFO-scanning brace */
     float main_sq;     /* CC19 squared taper 0..1 */
     float fader_gain;  /* CC20 linear 0..1; 0 = true silence */
     float master_gain; /* main_sq * fader_gain (cached for render) */
+    float kit_level;   /* Mix SHIFT-K2 analogue: global pad trim 0..1 */
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */
@@ -132,9 +160,11 @@ typedef struct EpicycleSurfaceState {
     uint8_t main_vol;                    /* CC 19 */
     uint8_t fader;                        /* CC 20 */
     int wheel_accum;                     /* relative wheel steps since open */
-    int quit_requested;                  /* wheel push / soft-key quit */
-    int soft_left;                       /* note 12 edge */
-    int soft_mid;                        /* note 13 edge */
+    int wheel_press;                     /* encoder push edge — never quits */
+    int quit_requested;                  /* soft-right quit only (not wheel) */
+    int soft_left;                       /* note 12 edge — prev page */
+    int soft_mid;                        /* note 13 edge — next page */
+    int soft_right;                      /* note 14 edge — quit (after splash) */
     int sample_held;                     /* SAMPLE mode button (ch1 note 6) */
     int open;                            /* 1 if MIDI port bound */
 } EpicycleSurfaceState;
@@ -202,11 +232,18 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
 void engine_note_off(EpicycleEngine *eng, int pad); /* stop that pad's voice(s) */
 /* Playhead 0..1 in sample, or -1 if pad has no active voice. */
 float engine_pad_playhead(const EpicycleEngine *eng, int pad);
+/* Page-aware K1–K3 mapping (Trim brace / Mix / Tune / LFO / stubs). */
+void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
+                             uint8_t k2, uint8_t k3);
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3);
 void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* squared taper */
 void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* linear; 0 = silence */
+void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on);
+void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad); /* free ↔ 1-beat sync */
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames);
 void engine_host_demo_setup(EpicycleEngine *eng); /* load synth tones for host test */
+
+const char *epicycle_page_name(EpicycleModePage page);
 
 /* PNG (stb_image) — RGB buffer is 0x00RRGGBB, alpha already on black */
 int epicycle_png_load_rgb(const char *path, uint32_t **out_pixels, int *out_w, int *out_h);
@@ -215,6 +252,8 @@ void epicycle_png_free(uint32_t *pixels);
 /* on-device UI */
 int ui_load_splash_logo(const char *path); /* assets/boot.png; 0 = ok */
 void ui_draw_splash(const char *status_line); /* logo letterboxed on black; status optional */
+/* Bottom strip prompt only (does not cover logo body). */
+void ui_draw_splash_prompt(const char *prompt_line);
 void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                   const EpicycleSurfaceState *surf);
 
