@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.2.5-mode-pages
+VERSION    := 0.2.6-device-ux
 BUILD      := build
 DIST       := dist
 
