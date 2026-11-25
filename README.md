@@ -6,7 +6,7 @@ Per pad: sample **start / end / loop brace** (a **window** you can scroll across
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.2.8-midi-rewrite` — Untrusted Surface MIDI rewrite, Trim brace lock, latch loops, hold-to-quit B3. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
+> **Status:** `0.2.9-trim-vol-filt` — Trim pickup + width lock, CC19 silence/smooth gain, filter DSP, B1/B2 on press, momentary Shift, phantom-pad harden. Host-tested. Needs Ash card retest + `Epicycle/logs/last-session.log`.
 
 ## Update the SD card (Ash — firmware 1.4)
 

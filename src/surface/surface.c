@@ -17,9 +17,9 @@
  *   - Prefer drop junk over acting on it.
  *   - SysEx cancels running status; never restore.
  *   - AT/pressure/pitch-bend/program: consume & ignore (no snap to notes).
- *   - Soft keys need an explicit status byte (no running-status soft keys),
- *     clean note-off between presses, hold timeout to unstick; B3 quit fires
- *     on release after a minimum hold (not a lone phantom note-on).
+ *   - Soft keys need an explicit status byte (no running-status soft keys);
+ *     B1/B2 fire on press; B3 quit on release after a minimum hold; hold
+ *     timeout unsticks missed note-offs.
  *   - Pad LEDs only from real note-on/off (never AT).
  *   - Volume CC path never lights buttons or pages.
  *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys.
@@ -72,17 +72,26 @@ static uint8_t m_d[2];
 static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT];
 
 /*
- * Soft keys: track down + hold time. B1/B2 fire on release after short hold;
- * B3 quit fires on release after longer hold. Held latch times out so a missed
- * note-off cannot permanently stick paging.
+ * Soft keys: track down + hold time.
+ * B1/B2 fire immediately on press (Ash 0.2.8: release path felt laggy).
+ * B3 quit still fires on release after a longer hold (false-quit guard).
+ * Held latch times out so a missed note-off cannot permanently stick paging.
  */
 static uint8_t g_soft_down[3];
 static double g_soft_down_t[3];
 static double g_soft_last_fire_t[3];
-#define SOFT_PAGE_HOLD_S 0.025
 #define SOFT_QUIT_HOLD_S 0.120
 #define SOFT_STUCK_S 1.50
 #define SOFT_PAGE_GAP_S 0.080
+/* Shift is momentary; auto-clear if note-off was lost (Ash: sticky xfade UI). */
+static double g_shift_down_t;
+#define SHIFT_STUCK_S 3.00
+
+/* Volume latch: confirm large drops (CC fight / dump glitch). */
+static uint8_t g_main_pending;
+static int g_main_pending_n;
+static uint8_t g_fader_pending;
+static int g_fader_pending_n;
 
 static int pad_index(uint8_t note)
 {
@@ -203,9 +212,14 @@ static void soft_clear_stuck(void)
             g_soft_down_t[i] = 0;
         }
     }
+    /* Missed Shift note-off → Trim stuck on xfade/dir until next press. */
+    if (g_state.shift_held && g_shift_down_t > 0.0 && (t - g_shift_down_t) > SHIFT_STUCK_S) {
+        g_state.shift_held = 0;
+        g_shift_down_t = 0.0;
+    }
 }
 
-/* Soft key: press tracks down; action on release after min hold. */
+/* Soft key: B1/B2 fire on press; B3 quit on release after min hold. */
 static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
 {
     if (which < 0 || which > 2)
@@ -219,8 +233,21 @@ static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
     if (on) {
         if (g_soft_down[which])
             return;
+        if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
+            return;
         g_soft_down[which] = 1;
         g_soft_down_t[which] = t;
+        /* Pages: immediate on press (not release) so flips feel instant. */
+        if (which == 0 || which == 1) {
+            g_soft_last_fire_t[which] = t;
+            if (which == 0)
+                g_state.soft_left = 1;
+            else
+                g_state.soft_mid = 1;
+            /* Page change drops sticky Shift overlay. */
+            g_state.shift_held = 0;
+            g_shift_down_t = 0.0;
+        }
         return;
     }
 
@@ -231,64 +258,93 @@ static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
     g_soft_down[which] = 0;
     g_soft_down_t[which] = 0;
 
-    double need = (which == 2) ? SOFT_QUIT_HOLD_S : SOFT_PAGE_HOLD_S;
-    if (held < need || held > SOFT_STUCK_S)
+    /* B1/B2 already fired on press. */
+    if (which == 0 || which == 1)
         return;
-    if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
-        return;
-    g_soft_last_fire_t[which] = t;
 
-    if (which == 0)
-        g_state.soft_left = 1;
-    else if (which == 1)
-        g_state.soft_mid = 1;
-    else
-        g_state.soft_right = 1;
+    /* B3 quit: release after minimum hold. */
+    if (held < SOFT_QUIT_HOLD_S || held > SOFT_STUCK_S)
+        return;
+    if ((t - g_soft_last_fire_t[2]) < SOFT_PAGE_GAP_S)
+        return;
+    g_soft_last_fire_t[2] = t;
+    g_state.soft_right = 1;
+}
+
+static int confirm_drop(uint8_t *pending, int *pending_n, uint8_t v, int need)
+{
+    if (*pending_n > 0 && *pending == v) {
+        (*pending_n)++;
+        return *pending_n >= need;
+    }
+    *pending = v;
+    *pending_n = 1;
+    return 0;
 }
 
 static void apply_main_vol_cc(uint8_t v)
 {
-    /* Isolated from buttons/pages. Latch like fader until dump settles. */
+    /* CC19 → gain only. Never touches pads/soft keys/Trim.
+     * Follow hardware from the 0x42 dump (including 0 = silence). Do not
+     * leave software louder than the knob (Ash: audio with knob at zero).
+     * Large single-sample jumps need one confirm (cable glitch), then apply. */
     if (!g_state.main_seen) {
         g_state.main_seen = 1;
         g_state.main_dump = v;
-        /* Keep software loud if dump looks like a glitch zero. */
-        if (v > 8) {
-            g_state.main_vol = v;
-            g_state.main_stable = v;
-        }
-        return;
-    }
-    if (!g_state.main_engaged) {
-        int d = (int)v - (int)g_state.main_dump;
-        if (d < 0)
-            d = -d;
-        if (d < 2)
-            return;
+        g_state.main_vol = v; /* including 0 */
+        g_state.main_stable = v;
         g_state.main_engaged = 1;
-    }
-    /* Reject lone zero while clearly up (cable/dump glitch). */
-    if (v == 0 && g_state.main_stable > 8)
+        g_main_pending_n = 0;
         return;
+    }
+    g_state.main_engaged = 1;
+    /* Confirm large drops only (glitch mute). Ups / small moves apply now so
+     * restoring level stays responsive without voice side effects. */
+    int drop = (int)g_state.main_stable - (int)v;
+    if (drop > 16) {
+        if (!confirm_drop(&g_main_pending, &g_main_pending_n, v, 2))
+            return;
+    }
+    g_main_pending_n = 0;
     g_state.main_vol = v;
     g_state.main_stable = v;
 }
 
 static void apply_fader_cc(uint8_t v)
 {
-    g_state.fader = v;
+    /* Engine stays full until engaged. Dump of 0 + noise must not arm silence. */
     if (!g_state.fader_seen) {
         g_state.fader_seen = 1;
         g_state.fader_dump = v;
+        g_state.fader = v;
         return;
     }
     if (!g_state.fader_engaged) {
         int d = (int)v - (int)g_state.fader_dump;
         if (d < 0)
             d = -d;
-        if (d >= 2)
-            g_state.fader_engaged = 1;
+        if (d < 3)
+            return;
+        /* Refuse to engage at near-silence (Ash: need fader again after drop). */
+        if (v < 16)
+            return;
+        g_state.fader_engaged = 1;
+        g_state.fader = v;
+        g_fader_pending_n = 0;
+        return;
     }
+    if (v <= 8 && g_state.fader > 24) {
+        if (!confirm_drop(&g_fader_pending, &g_fader_pending_n, v, 2))
+            return;
+    } else {
+        int drop = (int)g_state.fader - (int)v;
+        if (drop > 16) {
+            if (!confirm_drop(&g_fader_pending, &g_fader_pending_n, v, 2))
+                return;
+        }
+    }
+    g_fader_pending_n = 0;
+    g_state.fader = v;
 }
 
 static void dispatch_msg(int explicit_status)
@@ -344,10 +400,26 @@ static void dispatch_msg(int explicit_status)
                 return; /* no running-status SAMPLE */
             g_state.sample_held = on ? 1 : 0;
             light_button(g_fd, NOTE_SAMPLE, on ? 2 : 0);
+            /* SAMPLE edge clears sticky Shift (momentary modifier). */
+            if (on) {
+                g_state.shift_held = 0;
+                g_shift_down_t = 0.0;
+            }
             return;
         }
         if (m_d[0] == NOTE_SHIFT) {
-            g_state.shift_held = on ? 1 : 0;
+            /* Momentary: hold = on, release = off. Never latch/toggle.
+             * Note-on needs explicit status; note-off always clears (even
+             * running-status) so a lost status cannot stick the Trim overlay. */
+            if (on) {
+                if (!explicit_status)
+                    return;
+                g_state.shift_held = 1;
+                g_shift_down_t = now_s();
+            } else {
+                g_state.shift_held = 0;
+                g_shift_down_t = 0.0;
+            }
             return;
         }
         if (m_d[0] == NOTE_LOOP) {
@@ -373,15 +445,28 @@ static void dispatch_msg(int explicit_status)
         if (idx < 0)
             return;
         if (cmd == 0x90 && m_d[1] > 0) {
+            /* Explicit status required: a lost AT status under leftover 0x99
+             * turns (nn,pp) into phantom pad note-ons (Ash: random pads). */
+            if (!explicit_status)
+                return;
+            if (m_d[1] < 2)
+                return; /* ignore near-zero velocity phantoms */
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1;
             refresh_pad_led(idx); /* LED only on real note-on */
         } else {
+            if (!explicit_status && g_state.pad_vel[idx] == 0)
+                return;
             if (g_state.pad_vel[idx] > 0)
                 g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
             refresh_pad_led(idx); /* LED only on real note-off */
         }
+        /* Kill running status so orphan AT data cannot become pad notes. */
+        m_status = 0;
+        m_need = 0;
+        m_n = 0;
+        m_fresh_status = 0;
         return;
     }
 }
@@ -477,6 +562,9 @@ int surface_open(void)
     g_state.fader_dump = 127;
     g_state.fader_engaged = 0;
     g_state.fader_seen = 0;
+    g_main_pending_n = 0;
+    g_fader_pending_n = 0;
+    g_shift_down_t = 0.0;
     g_fd = -1;
     m_status = m_need = m_n = m_sysex = m_fresh_status = 0;
     snprintf(g_info, sizeof g_info, "no Surface card");
@@ -600,6 +688,9 @@ static void midi_selftest_reset(void)
     g_state.main_vol = 127;
     g_state.main_stable = 127;
     g_state.fader = 127;
+    g_main_pending_n = 0;
+    g_fader_pending_n = 0;
+    g_shift_down_t = 0.0;
 }
 
 static void midi_feed_buf(const uint8_t *b, size_t n)
@@ -647,37 +738,32 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 3) Soft keys fire on release after hold; running-status soft key ignored. */
+    /* 3) B1/B2 fire on press; running-status soft key ignored; no double on release. */
     midi_selftest_reset();
     {
-        /* Too-short press — no fire */
-        const uint8_t shortp[] = {0x90, 12, 127, 0x80, 12, 0};
-        midi_feed_buf(shortp, sizeof shortp);
-        if (g_state.soft_left)
+        const uint8_t press[] = {0x90, 12, 127};
+        midi_feed_buf(press, sizeof press);
+        if (!g_state.soft_left)
             fails++;
-
-        /* Simulate held press: inject down, advance clock via stuck clear path
-         * by feeding with sleep — use direct state for unit timing instead:
-         * call soft path with artificial times via longer sequence not possible
-         * without sleep. Sleep briefly for real hold. */
+        g_state.soft_left = 0;
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
+        if (g_state.soft_left)
+            fails++; /* release must not re-fire */
     }
     midi_selftest_reset();
     {
         const uint8_t down[] = {0x90, 12, 127};
         midi_feed_buf(down, sizeof down);
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 40 * 1000 * 1000L};
-        nanosleep(&ts, NULL);
-        const uint8_t up[] = {0x80, 12, 0};
-        midi_feed_buf(up, sizeof up);
         if (!g_state.soft_left)
             fails++;
         g_state.soft_left = 0;
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
 
         /* Running-status continuation must NOT arm soft key */
         const uint8_t run[] = {13, 127}; /* would be soft-mid under 0x90 */
         midi_feed_buf(run, sizeof run);
-        struct timespec ts2 = {.tv_sec = 0, .tv_nsec = 40 * 1000 * 1000L};
-        nanosleep(&ts2, NULL);
         const uint8_t runoff[] = {0x80, 13, 0};
         midi_feed_buf(runoff, sizeof runoff);
         if (g_state.soft_mid)
@@ -708,7 +794,7 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 5) Volume CC isolated — does not set soft keys / SAMPLE. */
+    /* 5) Volume CC isolated — does not set soft keys / SAMPLE; dump applies. */
     midi_selftest_reset();
     {
         const uint8_t seq[] = {0xb0, 19, 40, 0xb0, 19, 80, 0xb0, 16, 10};
@@ -719,8 +805,43 @@ int surface_midi_selftest(void)
             fails++;
         if (g_state.k1 != 10)
             fails++;
-        /* First CC19 is dump; second engages */
+        /* Dump applies immediately; second updates */
         if (!g_state.main_engaged || g_state.main_vol != 80)
+            fails++;
+    }
+
+    /* 5b) Dump at 0 → silent (software must not stay above knob). */
+    midi_selftest_reset();
+    {
+        const uint8_t z[] = {0xb0, 19, 0};
+        midi_feed_buf(z, sizeof z);
+        if (!g_state.main_engaged || g_state.main_vol != 0)
+            fails++;
+    }
+
+    /* 5c) Lone main-vol plunge rejected; confirmed drop accepted. */
+    midi_selftest_reset();
+    {
+        const uint8_t seq[] = {0xb0, 19, 100, 0xb0, 19, 90, 0xb0, 19, 10};
+        midi_feed_buf(seq, sizeof seq);
+        if (!g_state.main_engaged || g_state.main_vol != 90)
+            fails++; /* single plunge ignored */
+        const uint8_t drop2[] = {0xb0, 19, 10};
+        midi_feed_buf(drop2, sizeof drop2);
+        if (g_state.main_vol != 10)
+            fails++; /* second matching drop confirms */
+    }
+
+    /* 5d) Fader dump 0 + noise must not engage silence. */
+    midi_selftest_reset();
+    {
+        const uint8_t seq[] = {0xb0, 20, 0, 0xb0, 20, 3};
+        midi_feed_buf(seq, sizeof seq);
+        if (g_state.fader_engaged)
+            fails++;
+        const uint8_t move[] = {0xb0, 20, 64};
+        midi_feed_buf(move, sizeof move);
+        if (!g_state.fader_engaged || g_state.fader != 64)
             fails++;
     }
 
@@ -730,6 +851,62 @@ int surface_midi_selftest(void)
         const uint8_t seq[] = {0xb0, 16, 40, 0xb0, 99, 50, 0xb0, 17, 80, 0xe0, 0, 64};
         midi_feed_buf(seq, sizeof seq);
         if (g_state.k1 != 40 || g_state.k2 != 80)
+            fails++;
+    }
+
+    /* 7) Running-status pad note-on ignored (phantom guard). */
+    midi_selftest_reset();
+    {
+        const uint8_t hit[] = {0x99, 37, 100};
+        midi_feed_buf(hit, sizeof hit);
+        if (!g_state.pad_down[0])
+            fails++;
+        g_state.pad_down[0] = 0;
+        /* Running-status continuation looks like pad2 note-on — must ignore */
+        const uint8_t phantom[] = {36, 90};
+        midi_feed_buf(phantom, sizeof phantom);
+        if (g_state.pad_down[1] || g_state.pad_vel[1])
+            fails++;
+        /* Status cleared after pad msg — orphan data also dropped */
+        const uint8_t orphan[] = {42, 80};
+        midi_feed_buf(orphan, sizeof orphan);
+        if (g_state.pad_down[2] || g_state.pad_vel[2])
+            fails++;
+    }
+
+    /* 8) Volume CC stream must not create pad edges. */
+    midi_selftest_reset();
+    {
+        const uint8_t seq[] = {
+            0xb0, 19, 0, 0xb0, 19, 40, 0xb0, 19, 80, 0xb0, 19, 127,
+            0xb0, 19, 0, 0xb0, 19, 0,
+        };
+        midi_feed_buf(seq, sizeof seq);
+        for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+            if (g_state.pad_down[i] || g_state.pad_up[i] || g_state.pad_vel[i])
+                fails++;
+        }
+        if (g_state.main_vol != 0)
+            fails++;
+    }
+
+    /* 9) Shift is momentary — release clears; not a toggle latch. */
+    midi_selftest_reset();
+    {
+        const uint8_t down[] = {0x90, 49, 127};
+        midi_feed_buf(down, sizeof down);
+        if (!g_state.shift_held)
+            fails++;
+        const uint8_t up[] = {0x80, 49, 0};
+        midi_feed_buf(up, sizeof up);
+        if (g_state.shift_held)
+            fails++;
+        /* Running-status Shift on ignored */
+        const uint8_t run[] = {0x90, 6, 127, 49, 127}; /* SAMPLE then orphan shift-looking */
+        midi_feed_buf(run, sizeof run);
+        /* After SAMPLE on, status is 0x90; data 49,127 would be Shift under running
+         * status — must NOT latch Shift. */
+        if (g_state.shift_held)
             fails++;
     }
 

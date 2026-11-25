@@ -59,6 +59,7 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 | Real | Still stub / later |
 | --- | --- |
 | Crossfade loop voices, WAV load, division/free | Phrase recorder |
-| Brace scroll (knobs/wheel/LFO), pitch ratio | Filter DSP, full ADSR |
+| Brace scroll (knobs/wheel/LFO), pitch ratio | Full ADSR |
+| Chamberlin SVF filter (OFF/LPF/HPF/BPF/NOTCH) | Richer filt-env shapes |
 | Mod matrix data model + basic LFO | Full matrix UI |
 | Host `--preview` non-silent check | Hardware sign-off |
