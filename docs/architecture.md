@@ -12,8 +12,8 @@ Power on
   → launcher copies binary to /run, stops ac50, runs epicycle
   → display (DRM card0 / fb0) + I2S ALSA + Surface MIDI
   → splash holds until encoder / soft key / pad
-  → Sample-Mode-style pages (B1/B2 cycle; B3 quit)
-  → audio thread ← engine_render (16 voices, crossfade loops)
+  → Tombola primary + Sample-Mode edit pages (B1/B2 cycle; B3 quit)
+  → audio thread ← engine_render (16 voices; tombola wall hits → note_on)
   → soft-right quit → clean close (encoder push never quits)
   → systemctl start ac50
 ```
@@ -38,12 +38,12 @@ Power on
   AT ignored. MIT rewrite of SampleBoot / sample-base / mpc-sample-lab notes.
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
-- **engine** — 16 pads × brace window (Start/End lock width + POS slides; LFO scrub
-  unchanged); equal-slice division/freeform; pitch; crossfade + ping-pong; LOOP
-  latch-toggle / one-shot; Chamberlin SVF filter (default OFF); 2 LFOs + 4 mod
-  routes; scrub budget = 8.
-- **ui** — splash `PRESS ANY PAD TO CONTINUE`; Trim waveform + DIV grid + FREE/DIV
-  badge; Shift overlay momentary; Mix/Filter/LFO pages.
+- **tombola** — soft 2D drum: morphing N-gon/circle, spin, 16 balls, wall-hit
+  queue; hit-mod stub (impact → pitch/filt/level; angularity hardens).
+- **engine** — 16 pads × brace window; division/freeform; pitch; crossfade +
+  ping-pong; LOOP latch / one-shot; Chamberlin SVF; impact pitch/filt/level on
+  voices; 2 LFOs + 4 mod routes; scrub budget = 8.
+- **ui** — splash; Tombola projection; Hit Mod stub; Trim waveform + edit pages.
 
 ## Loop brace / modulation
 

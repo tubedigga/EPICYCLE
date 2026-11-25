@@ -50,6 +50,7 @@ static const uint8_t BUTTON_LED_CCS[] = {
 
 enum {
     NOTE_SAMPLE = 6,
+    NOTE_FULL_LEVEL = 7, /* spare → Hit Mod page (physics matrix stub) */
     NOTE_SHIFT = 49,
     NOTE_LOOP = 74,
     NOTE_MUTE = 43,
@@ -95,9 +96,13 @@ static double g_pad_activity_t;
 static double g_shift_down_t;
 static double g_sample_down_t;
 static int g_sample_led = -1;
+static int g_mute_led = -1;
+static int g_hitmod_led = -1;
+static double g_mute_down_t;
 static int g_open_quiet; /* 1 while draining boot dump — no SAMPLE LED flash */
 #define SHIFT_STUCK_S 3.00
 #define SAMPLE_STUCK_S 8.00
+#define MUTE_STUCK_S 8.00
 
 static uint8_t g_main_pending;
 static int g_main_pending_n;
@@ -150,6 +155,16 @@ static void sample_led_set(int on)
     g_sample_led = want;
     if (!g_open_quiet)
         light_button(g_fd, NOTE_SAMPLE, (uint8_t)want);
+}
+
+static void mute_led_set(int on)
+{
+    int want = on ? 2 : 0;
+    if (want == g_mute_led)
+        return;
+    g_mute_led = want;
+    if (!g_open_quiet)
+        light_button(g_fd, NOTE_MUTE, (uint8_t)want);
 }
 
 static void clear_ch_running(void)
@@ -283,6 +298,11 @@ static void soft_clear_stuck(void)
         g_state.sample_held = 0;
         g_sample_down_t = 0.0;
         sample_led_set(0);
+    }
+    if (g_state.mute_held && g_mute_down_t > 0.0 && (t - g_mute_down_t) > MUTE_STUCK_S) {
+        g_state.mute_held = 0;
+        g_mute_down_t = 0.0;
+        mute_led_set(0);
     }
 }
 
@@ -519,6 +539,30 @@ static void dispatch_msg(int explicit_status)
             clear_ch_running();
             return;
         }
+        if (m_d[0] == NOTE_MUTE) {
+            /* Momentary MUTE — hold + pad toggles tombola ball. */
+            if (on) {
+                if (!explicit_status) {
+                    clear_ch_running();
+                    return;
+                }
+                g_state.mute_held = 1;
+                g_mute_down_t = now_s();
+            } else {
+                g_state.mute_held = 0;
+                g_mute_down_t = 0.0;
+            }
+            mute_led_set(on);
+            clear_ch_running();
+            return;
+        }
+        if (m_d[0] == NOTE_FULL_LEVEL) {
+            /* Spare button → open physics Hit Mod page (edge on press). */
+            if (on && explicit_status)
+                g_state.hitmod_btn = 1;
+            clear_ch_running();
+            return;
+        }
         if (m_d[0] == 111) {
             if (on && explicit_status) {
                 g_state.wheel_press = 1;
@@ -533,7 +577,6 @@ static void dispatch_msg(int explicit_status)
             clear_ch_running();
             return;
         }
-        (void)NOTE_MUTE;
         /* Unknown ch1 note — still clear running status (no phantom chain). */
         clear_ch_running();
         return;
@@ -677,6 +720,9 @@ int surface_open(void)
     g_shift_down_t = 0.0;
     g_sample_down_t = 0.0;
     g_sample_led = -1;
+    g_mute_down_t = 0.0;
+    g_mute_led = -1;
+    g_hitmod_led = -1;
     g_ctrl_activity_t = 0.0;
     g_pad_activity_t = 0.0;
     g_open_quiet = 0;
@@ -715,11 +761,17 @@ int surface_open(void)
         /* Absorb 0x42 dump + any LED write echoes before the app arms UI. */
         midi_drain(fd, 0.08);
         g_open_quiet = 0;
-        /* Force SAMPLE LED dark + state clear — no boot lit→unlit flash. */
+        /* Force SAMPLE/MUTE LEDs dark + state clear — no boot lit→unlit flash. */
         g_state.sample_held = 0;
         g_sample_down_t = 0.0;
         g_sample_led = -1;
         sample_led_set(0);
+        g_state.mute_held = 0;
+        g_mute_down_t = 0.0;
+        g_mute_led = -1;
+        mute_led_set(0);
+        g_hitmod_led = -1;
+        surface_set_hitmod_led(0);
         return 0;
     }
 
@@ -798,6 +850,21 @@ void surface_set_loop_led(int on)
         return;
     g_loop_led_on = want;
     light_button(g_fd, NOTE_LOOP, (uint8_t)want);
+}
+
+void surface_set_mute_led(int on)
+{
+    mute_led_set(on);
+}
+
+void surface_set_hitmod_led(int on)
+{
+    int want = on ? 2 : 0;
+    if (want == g_hitmod_led)
+        return;
+    g_hitmod_led = want;
+    if (!g_open_quiet)
+        light_button(g_fd, NOTE_FULL_LEVEL, (uint8_t)want);
 }
 
 static void midi_selftest_reset(void)
@@ -1140,6 +1207,29 @@ int surface_midi_selftest(void)
         midi_feed_buf(run, sizeof run);
         /* After Shift, status cleared — orphan 6,127 dropped; SAMPLE stays off. */
         if (g_state.sample_held)
+            fails++;
+    }
+
+    /* 15) MUTE momentary; FULL LEVEL (spare) → hitmod edge. */
+    midi_selftest_reset();
+    {
+        const uint8_t on[] = {0x90, 43, 127};
+        midi_feed_buf(on, sizeof on);
+        if (!g_state.mute_held)
+            fails++;
+        const uint8_t off[] = {0x80, 43, 0};
+        midi_feed_buf(off, sizeof off);
+        if (g_state.mute_held)
+            fails++;
+        const uint8_t fl[] = {0x90, 7, 127};
+        midi_feed_buf(fl, sizeof fl);
+        if (!g_state.hitmod_btn)
+            fails++;
+        /* Running-status MUTE ignored */
+        g_state.mute_held = 0;
+        const uint8_t run[] = {0x90, 6, 127, 43, 127};
+        midi_feed_buf(run, sizeof run);
+        if (g_state.mute_held)
             fails++;
     }
 

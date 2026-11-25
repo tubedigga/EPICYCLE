@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: MIT
  *
- * EPICYCLE loop engine — Sample-Mode-style soft-key pages for pad params
- * (Trim / Mix / Amp / Tune / Filter / Filt Env / LFO). Not a stock OS clone.
- * Hold SAMPLE + pad = select; B1/B2 cycle pages; B3 quit; encoder push never quits.
- * 0.2.11: soft keys hard-isolated; FREE Trim near-zero width (no 2% gap);
- * SAMPLE LED boot sync; filter reso 0=min..127=max; phantom pad harden.
+ * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
+ * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod stub;
+ * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
+ * 0.3.0: morph fader, spin K1, physics hit→pitch/filt stub. Freeze = phase 2.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -28,13 +27,15 @@ static void on_signal(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "EPICYCLE %s — loop engine for MPC Sample\n"
-            "usage: %s [--help] [--version] [--demo] [--midi-selftest] [--wav PATH]...\n"
-            "  --demo           synth demo tones onto pads (host / no card samples)\n"
-            "  --midi-selftest  host MIDI parser regression checks\n"
-            "  --wav PATH       load WAV into next bank slot (up to 16)\n"
+            "EPICYCLE %s — tombola for MPC Sample\n"
+            "usage: %s [--help] [--version] [--demo] [--midi-selftest] "
+            "[--tombola-selftest] [--wav PATH]...\n"
+            "  --demo             synth demo tones onto pads (host / no card samples)\n"
+            "  --midi-selftest    host MIDI parser regression checks\n"
+            "  --tombola-selftest physics containment + hit + mute ball checks\n"
+            "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: SAMPLE+pad selects; B1/B2 pages; B3 quits; encoder push never quits.\n",
+            "  On device: SAMPLE+pad select; MUTE+pad ball; FULL LEVEL=HitMod; B3 quit.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -251,6 +252,13 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
         t1 = (uint8_t)clampf_u8((int)((p->lfos[0].rate_hz - 0.05f) / 7.95f * 127.0f + 0.5f));
         t2 = (uint8_t)clampf_u8((int)(p->lfos[0].depth * 127.0f + 0.5f));
         break;
+    case EPICYCLE_PAGE_TOMBOLA:
+    case EPICYCLE_PAGE_HITMOD:
+        /* Tombola/HitMod knobs applied directly — pickup not required. */
+        t0 = g_pick_prev[0];
+        t1 = g_pick_prev[1];
+        t2 = g_pick_prev[2];
+        break;
     default:
         break;
     }
@@ -454,11 +462,35 @@ static void handle_encoder_press(EpicycleEngine *eng, EpicycleSurfaceState *st)
         return;
     st->wheel_press = 0;
     int pad = eng->selected_pad;
+    if (eng->mode_page == EPICYCLE_PAGE_TOMBOLA) {
+        /* Spare gesture: jump to Hit Mod physics matrix stub. */
+        eng->mode_page = EPICYCLE_PAGE_HITMOD;
+        surface_set_hitmod_led(1);
+        if (g_log_paths)
+            epicycle_log(g_log_paths, "page -> HITMOD (enc)");
+        return;
+    }
+    if (eng->mode_page == EPICYCLE_PAGE_HITMOD) {
+        /* Toggle enabled on current hitmod slot. */
+        EpicycleTombola *tb = tombola_state();
+        int s = tb->hitmod_edit;
+        if (s < 0)
+            s = 0;
+        if (s >= EPICYCLE_HITMOD_SLOTS)
+            s = EPICYCLE_HITMOD_SLOTS - 1;
+        tb->hitmods[s].enabled = tb->hitmods[s].enabled ? 0 : 1;
+        if (g_log_paths)
+            epicycle_log(g_log_paths, "hitmod slot %d -> %s", s + 1,
+                         tb->hitmods[s].enabled ? "ON" : "off");
+        return;
+    }
     if (eng->mode_page == EPICYCLE_PAGE_LFO) {
         engine_lfo_toggle_sync(eng, pad);
         return;
     }
-    /* Trim (and other pages): encoder push toggles freeform ↔ equal-slice DIV.
+    if (eng->mode_page != EPICYCLE_PAGE_TRIM)
+        return;
+    /* Trim: encoder push toggles freeform ↔ equal-slice DIV.
      * Never changes mode_page — pages are B1/B2 only. */
     EpicyclePad *p = &eng->pads[pad];
     if (p->freeform) {
@@ -620,6 +652,11 @@ int main(int argc, char **argv)
             puts(rc == 0 ? "midi-selftest: ok" : "midi-selftest: FAIL");
             return rc == 0 ? 0 : 1;
         }
+        if (strcmp(argv[i], "--tombola-selftest") == 0) {
+            int rc = tombola_selftest();
+            puts(rc == 0 ? "tombola-selftest: ok" : "tombola-selftest: FAIL");
+            return rc == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--demo") == 0) {
             force_demo = 1;
             continue;
@@ -646,7 +683,7 @@ int main(int argc, char **argv)
     }
 
     g_log_paths = &paths;
-    epicycle_log(&paths, "EPICYCLE %s starting (mode pages)", EPICYCLE_VERSION);
+    epicycle_log(&paths, "EPICYCLE %s starting (tombola)", EPICYCLE_VERSION);
     epicycle_log(&paths, "app_dir=%s card_root=%s data_dir=%s", paths.app_dir, paths.card_root,
                  paths.data_dir);
 
@@ -689,10 +726,39 @@ int main(int argc, char **argv)
         epicycle_log(&paths, "loaded %d sample slot(s) (freeform Trim default)", loaded);
     }
 
+    EpicycleTombola *tb = tombola_state();
+    tombola_init(tb);
+    /* Open LPF so Hit Mod filter route can darken impacts; still hearable. */
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        if (eng.pads[i].filter_type == 0) {
+            eng.pads[i].filter_type = 1; /* LPF */
+            eng.pads[i].filter_cutoff = 1.0f;
+            eng.pads[i].mod_filter_cutoff = 1.0f;
+        }
+        /* Tombola prefers one-shots on wall hits; LOOP still toggles latch. */
+        eng.pads[i].loop_enable = 0;
+    }
+
     if (preview_out) {
-        engine_note_on(&eng, 0, 0.9f);
-        engine_note_on(&eng, 2, 0.8f);
-        engine_note_on(&eng, 3, 0.8f);
+        /* Drive physics for a moment so wall hits feed the preview. */
+        for (int i = 0; i < 90; i++) {
+            tombola_step(tb, 1.0f / 60.0f);
+            int pads[EPICYCLE_PAD_COUNT];
+            float vels[EPICYCLE_PAD_COUNT];
+            int n = tombola_drain_hits(tb, pads, vels, EPICYCLE_PAD_COUNT);
+            for (int h = 0; h < n; h++) {
+                float pm, fa, lm;
+                tombola_eval_hitmod(tb, vels[h], &pm, &fa, &lm);
+                engine_note_on_impact(&eng, pads[h], vels[h], pm, fa, lm);
+            }
+            int32_t L[EPICYCLE_AUDIO_FRAMES], R[EPICYCLE_AUDIO_FRAMES];
+            engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
+        }
+        if (!engine_pad_voice_active(&eng, 0)) {
+            engine_note_on(&eng, 0, 0.9f);
+            engine_note_on(&eng, 2, 0.8f);
+            engine_note_on(&eng, 3, 0.8f);
+        }
         write_host_preview_wav(preview_out, &eng, 1.5f);
         epicycle_log(&paths, "wrote preview %s", preview_out);
         audio_close();
@@ -741,14 +807,14 @@ int main(int argc, char **argv)
     pickup_arm(surface_state(), &eng);
     surface_set_selected_pad(eng.selected_pad);
     surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
-    /* Ensure pad 1 is latched-loop and audible defaults. */
-    if (eng.pads[0].sample) {
-        eng.pads[0].loop_enable = 1;
-        if (eng.pads[0].level < 0.5f)
-            eng.pads[0].level = 1.0f;
+    if (eng.pads[0].sample && eng.pads[0].level < 0.5f) {
+        eng.pads[0].level = 1.0f;
         eng.pads[0].mod_level = eng.pads[0].level;
     }
     surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
+    tombola_set_spin_cc(tb, surface_state()->k1);
+    if (surface_state()->fader_engaged)
+        tombola_set_morph(tb, (float)surface_state()->fader / 127.0f);
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -759,6 +825,14 @@ int main(int argc, char **argv)
             g_quit_guard_ticks--;
 
         handle_encoder_press(&eng, st);
+
+        if (st->hitmod_btn) {
+            st->hitmod_btn = 0;
+            eng.mode_page = EPICYCLE_PAGE_HITMOD;
+            surface_set_hitmod_led(1);
+            pickup_arm(surf, &eng);
+            epicycle_log(&paths, "page -> HITMOD (FULL LEVEL)");
+        }
 
         if (st->loop_btn) {
             st->loop_btn = 0;
@@ -781,6 +855,12 @@ int main(int argc, char **argv)
                     surface_set_loop_led(eng.pads[i].loop_enable);
                     engine_sync_mod_window(&eng, i);
                     pickup_arm(surf, &eng);
+                } else if (surf->mute_held) {
+                    tombola_toggle_ball(tb, i);
+                    if (!tombola_ball_active(tb, i))
+                        engine_stop_pad(&eng, i);
+                    epicycle_log(&paths, "MUTE ball %d -> %s", i + 1,
+                                 tombola_ball_active(tb, i) ? "in" : "out");
                 } else if (eng.pads[i].loop_enable) {
                     /* LOOP latch: each pad press toggles that pad on/off. */
                     if (engine_pad_voice_active(&eng, i))
@@ -816,6 +896,7 @@ int main(int argc, char **argv)
         }
         if (eng.mode_page != last_page) {
             last_page = eng.mode_page;
+            surface_set_hitmod_led(eng.mode_page == EPICYCLE_PAGE_HITMOD);
             pickup_arm(surf, &eng);
         }
         if (surf->shift_held != last_shift) {
@@ -828,12 +909,43 @@ int main(int argc, char **argv)
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
+        /* On Tombola: fader = morph (master fader gain stays full). Else fader = gain. */
         if (surf->fader_engaged && surf->fader != last_fader) {
-            engine_set_fader_gain_cc(&eng, surf->fader);
             last_fader = surf->fader;
+            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
+                tombola_set_morph(tb, (float)surf->fader / 127.0f);
+                engine_set_fader_gain_cc(&eng, 127);
+            } else {
+                engine_set_fader_gain_cc(&eng, surf->fader);
+            }
         }
 
-        if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
+        if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
+            tombola_set_spin_cc(tb, surf->k1);
+        } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
+            EpicycleHitModRoute *r = &tb->hitmods[tb->hitmod_edit];
+            /* Direct knobs for stub matrix editing. */
+            static uint8_t hk1 = 255, hk2 = 255, hk3 = 255;
+            if (surf->k1 != hk1) {
+                hk1 = surf->k1;
+                int d = (int)((float)surf->k1 / 127.0f * (float)(EPICYCLE_HITMOD_DEST_COUNT - 1) +
+                              0.5f);
+                if (d < 0)
+                    d = 0;
+                if (d >= EPICYCLE_HITMOD_DEST_COUNT)
+                    d = EPICYCLE_HITMOD_DEST_COUNT - 1;
+                r->dest = (EpicycleHitModDest)d;
+                r->enabled = (r->dest != EPICYCLE_HITMOD_NONE);
+            }
+            if (surf->k2 != hk2) {
+                hk2 = surf->k2;
+                r->amount = (float)surf->k2 / 127.0f;
+            }
+            if (surf->k3 != hk3) {
+                hk3 = surf->k3;
+                r->threshold = (float)surf->k3 / 127.0f;
+            }
+        } else if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
             handle_trim_knobs(&eng, surf);
         } else {
             const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
@@ -852,6 +964,19 @@ int main(int argc, char **argv)
                     engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page, surf->k1,
                                                 surf->k2, surf->k3, mask);
                 }
+            }
+        }
+
+        /* Always step tombola (hits fire even while editing other pages). */
+        tombola_step(tb, 1.0f / 60.0f);
+        {
+            int pads[EPICYCLE_PAD_COUNT];
+            float vels[EPICYCLE_PAD_COUNT];
+            int n = tombola_drain_hits(tb, pads, vels, EPICYCLE_PAD_COUNT);
+            for (int h = 0; h < n; h++) {
+                float pm, fa, lm;
+                tombola_eval_hitmod(tb, vels[h], &pm, &fa, &lm);
+                engine_note_on_impact(&eng, pads[h], vels[h], pm, fa, lm);
             }
         }
 
@@ -914,11 +1039,26 @@ int main(int argc, char **argv)
                 if (p->level > 1.0f)
                     p->level = 1.0f;
                 p->mod_level = p->level;
+            } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
+                int s = tb->hitmod_edit + (delta > 0 ? 1 : (delta < 0 ? -1 : 0));
+                if (s < 0)
+                    s = EPICYCLE_HITMOD_SLOTS - 1;
+                if (s >= EPICYCLE_HITMOD_SLOTS)
+                    s = 0;
+                tb->hitmod_edit = s;
+            } else if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
+                /* Wheel nudges spin a little. */
+                float sp = tb->spin_speed + (float)delta * 0.15f;
+                if (sp < 0.0f)
+                    sp = 0.0f;
+                if (sp > 7.5f)
+                    sp = 7.5f;
+                tb->spin_speed = sp;
             }
         }
 
         if ((ticks % 3) == 0)
-            ui_draw_loop(&hw, &eng, surf);
+            ui_draw_loop(&hw, &eng, surf, tb);
 
         if (!audio_running()) {
             int32_t L[EPICYCLE_AUDIO_FRAMES], R[EPICYCLE_AUDIO_FRAMES];

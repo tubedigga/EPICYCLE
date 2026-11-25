@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.2.11-trim-midi-harden
+VERSION    := 0.3.0-tombola
 BUILD      := build
 DIST       := dist
 
@@ -26,6 +26,7 @@ SRCS := \
 	src/audio/audio.c \
 	src/surface/surface.c \
 	src/engine/engine.c \
+	src/tombola/tombola.c \
 	src/sample/wav.c \
 	src/ui/ui.c
 
@@ -81,6 +82,7 @@ package: $(BUILD)/$(APP)
 test-host: host
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --version
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --midi-selftest
+	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --tombola-selftest
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --preview $(BUILD)/preview.wav
 	@python3 tools/check_preview.py $(BUILD)/preview.wav
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --demo
