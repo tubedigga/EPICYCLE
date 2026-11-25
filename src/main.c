@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * EPICYCLE loop engine — load samples to pads, edit scrollable brace with
- * knobs, time-division or free-run against tempo, hear sync/polymeter.
- * Hold SAMPLE + pad = select (no sound); plain pad = play; pad up = note-off.
- * Soft-left toggles free/div; soft-mid toggles LFO brace scrub on selected pad.
+ * EPICYCLE loop engine — Sample-Mode-style soft-key pages for pad params
+ * (Trim / Mix / Amp / Tune / Filter / Filt Env / LFO). Not a stock OS clone.
+ * Hold SAMPLE + pad = select; B1/B2 cycle pages; B3 quit; encoder push never quits.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -32,7 +31,7 @@ static void usage(const char *argv0)
             "  --demo       synth demo tones onto pads (host / no card samples)\n"
             "  --wav PATH   load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: SAMPLE+pad selects; pad plays; knobs edit brace; wheel push quits.\n",
+            "  On device: SAMPLE+pad selects; B1/B2 pages; B3 quits; encoder push never quits.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -62,7 +61,6 @@ static int try_load_card_samples(EpicycleEngine *eng, const EpicyclePaths *paths
             loaded++;
         }
     }
-    /* Also try bundled demos next to the binary. */
     if (loaded == 0) {
         static const char *names[] = {"demo-a.wav", "demo-b.wav", "demo-c.wav", "demo-d.wav", NULL};
         for (int i = 0; names[i]; i++) {
@@ -77,46 +75,65 @@ static int try_load_card_samples(EpicycleEngine *eng, const EpicyclePaths *paths
     return loaded;
 }
 
+static void page_prev(EpicycleEngine *eng)
+{
+    int p = (int)eng->mode_page - 1;
+    if (p < 0)
+        p = (int)EPICYCLE_PAGE_COUNT - 1;
+    eng->mode_page = (EpicycleModePage)p;
+}
+
+static void page_next(EpicycleEngine *eng)
+{
+    int p = (int)eng->mode_page + 1;
+    if (p >= (int)EPICYCLE_PAGE_COUNT)
+        p = 0;
+    eng->mode_page = (EpicycleModePage)p;
+}
+
 static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
 {
     if (!eng || !st)
         return;
-    int pad = eng->selected_pad;
     if (st->soft_left) {
         st->soft_left = 0;
-        EpicyclePad *p = &eng->pads[pad];
-        if (p->freeform)
-            engine_set_division(eng, pad, p->division_beats > 0 ? p->division_beats : 4);
-        else
-            engine_set_division(eng, pad, 0);
+        page_prev(eng);
     }
     if (st->soft_mid) {
         st->soft_mid = 0;
-        EpicyclePad *p = &eng->pads[pad];
-        /* Toggle LFO0 brace-scroll; respect scrub budget via allow_scrub. */
-        if (!p->lfos[0].enabled) {
-            p->lfos[0].enabled = 1;
-            if (p->lfos[0].depth < 0.1f)
-                p->lfos[0].depth = 0.35f;
-            p->mods[0].lfo_index = 0;
-            p->mods[0].dest = EPICYCLE_MOD_BRACE_START;
-            p->mods[0].amount = 1.0f;
-            p->allow_scrub = 1;
-        } else {
-            p->lfos[0].enabled = 0;
-            p->lfos[0].depth = 0.0f;
-        }
+        page_next(eng);
     }
+    if (st->soft_right) {
+        st->soft_right = 0;
+        st->quit_requested = 1; /* explicit soft-key quit only */
+    }
+}
+
+static void handle_encoder_press(EpicycleEngine *eng, EpicycleSurfaceState *st)
+{
+    if (!eng || !st || !st->wheel_press)
+        return;
+    st->wheel_press = 0;
+    int pad = eng->selected_pad;
+    if (eng->mode_page == EPICYCLE_PAGE_LFO) {
+        engine_lfo_toggle_sync(eng, pad);
+        return;
+    }
+    /* Trim (and other pages): encoder push toggles freeform ↔ division. */
+    EpicyclePad *p = &eng->pads[pad];
+    if (p->freeform)
+        engine_set_division(eng, pad, p->division_beats > 0 ? p->division_beats : 4);
+    else
+        engine_set_division(eng, pad, 0);
 }
 
 static void write_host_preview_wav(const char *path, EpicycleEngine *eng, float seconds)
 {
-    /* Tiny offline bounce so CI can prove the engine makes non-silent audio. */
     size_t frames = (size_t)(eng->sample_rate * seconds);
     FILE *fp = fopen(path, "wb");
     if (!fp)
         return;
-    uint32_t data_bytes = (uint32_t)(frames * 2 * 2); /* 16-bit stereo */
+    uint32_t data_bytes = (uint32_t)(frames * 2 * 2);
     uint32_t riff = 36 + data_bytes;
     fwrite("RIFF", 1, 4, fp);
     fwrite(&riff, 4, 1, fp);
@@ -152,6 +169,60 @@ static void write_host_preview_wav(const char *path, EpicycleEngine *eng, float 
         done += n;
     }
     fclose(fp);
+}
+
+/* Wait on splash until pad / soft key / encoder press. Host skips. */
+static void splash_wait_for_input(const EpicyclePaths *paths)
+{
+#ifdef EPICYCLE_ON_DEVICE
+    epicycle_log(paths, "splash: waiting for encoder / soft key / pad");
+    ui_draw_splash_prompt("Press encoder or soft key to start");
+    for (;;) {
+        if (g_stop)
+            return;
+        surface_poll();
+        EpicycleSurfaceState *st = surface_state_mut();
+        int go = 0;
+        if (st->wheel_press) {
+            st->wheel_press = 0;
+            go = 1;
+        }
+        if (st->soft_left) {
+            st->soft_left = 0;
+            go = 1;
+        }
+        if (st->soft_mid) {
+            st->soft_mid = 0;
+            go = 1;
+        }
+        if (st->soft_right) {
+            /* Soft-right starts the app on splash; quit only after enter. */
+            st->soft_right = 0;
+            go = 1;
+        }
+        for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+            if (st->pad_down[i]) {
+                st->pad_down[i] = 0;
+                go = 1;
+            }
+            if (st->pad_up[i])
+                st->pad_up[i] = 0;
+        }
+        if (go) {
+            epicycle_log(paths, "splash: dismissed");
+            return;
+        }
+        /* Keep prompt visible; refresh occasionally in case of display glitch. */
+        static int blink;
+        if ((blink++ % 30) == 0)
+            ui_draw_splash_prompt("Press encoder or soft key to start");
+        sleep_ms(16);
+    }
+#else
+    (void)paths;
+    ui_draw_splash_prompt("Press encoder or soft key to start");
+    sleep_ms(200);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -195,7 +266,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    epicycle_log(&paths, "EPICYCLE %s starting (loop engine)", EPICYCLE_VERSION);
+    epicycle_log(&paths, "EPICYCLE %s starting (mode pages)", EPICYCLE_VERSION);
     epicycle_log(&paths, "app_dir=%s card_root=%s data_dir=%s", paths.app_dir, paths.card_root,
                  paths.data_dir);
 
@@ -233,7 +304,6 @@ int main(int argc, char **argv)
         engine_host_demo_setup(&eng);
         epicycle_log(&paths, "using synth demo bank (polymeter pads 2/3 = 3 vs 5 beats)");
     } else {
-        /* Default musical layout when WAVs present: pad0/1 synced 4-beat, 2/3 polymeter. */
         if (eng.pads[0].sample)
             engine_set_division(&eng, 0, 4);
         if (eng.pads[1].sample)
@@ -246,7 +316,6 @@ int main(int argc, char **argv)
     }
 
     if (preview_out) {
-        /* Host CI path: trigger a few pads, bounce audio, exit. */
         engine_note_on(&eng, 0, 0.9f);
         engine_note_on(&eng, 2, 0.8f);
         engine_note_on(&eng, 3, 0.8f);
@@ -272,9 +341,9 @@ int main(int argc, char **argv)
     ui_draw_splash(hw.display_ok ? "online" : "offline");
     for (int i = 0; i < display_log_count(); i++)
         epicycle_log(&paths, "display-diag: %s", display_log_line(i));
-    sleep_ms(800);
+    sleep_ms(400);
+    splash_wait_for_input(&paths);
 
-    /* Auto-fire demo pads on host so something is audible if audio exists. */
 #ifndef EPICYCLE_ON_DEVICE
     engine_note_on(&eng, 0, 0.8f);
     engine_note_on(&eng, 2, 0.7f);
@@ -286,7 +355,6 @@ int main(int argc, char **argv)
     uint8_t last_pad_vel[EPICYCLE_PAD_COUNT];
     memset(last_pad_vel, 0, sizeof last_pad_vel);
 
-    /* Apply any main-volume / fader reply from surface position SysEx 0x42. */
     surface_poll();
     engine_set_master_gain_cc(&eng, surface_state()->main_vol);
     engine_set_fader_gain_cc(&eng, surface_state()->fader);
@@ -300,16 +368,15 @@ int main(int argc, char **argv)
         const EpicycleSurfaceState *surf = surface_state();
 
         handle_soft_keys(&eng, st);
+        handle_encoder_press(&eng, st);
 
         for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
             if (st->pad_down[i]) {
                 st->pad_down[i] = 0;
                 if (surf->sample_held) {
-                    /* SAMPLE + pad: select focus only (no trigger). */
                     eng.selected_pad = i;
                     surface_set_selected_pad(i);
                 } else {
-                    /* Plain pad hit: play; selection unchanged. */
                     float vel =
                         surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
                     engine_note_on(&eng, i, vel);
@@ -317,7 +384,6 @@ int main(int argc, char **argv)
             }
             if (st->pad_up[i]) {
                 st->pad_up[i] = 0;
-                /* Release stops the voice so demo pads don't stack forever. */
                 engine_note_off(&eng, i);
             } else if (last_pad_vel[i] > 0 && surf->pad_vel[i] == 0) {
                 engine_note_off(&eng, i);
@@ -335,24 +401,52 @@ int main(int argc, char **argv)
         }
 
         if (surf->k1 != last_k1 || surf->k2 != last_k2 || surf->k3 != last_k3) {
-            engine_apply_knobs(&eng, eng.selected_pad, surf->k1, surf->k2, surf->k3);
+            engine_apply_page_knobs(&eng, eng.selected_pad, eng.mode_page, surf->k1, surf->k2,
+                                   surf->k3);
             last_k1 = surf->k1;
             last_k2 = surf->k2;
             last_k3 = surf->k3;
         }
 
-        /* Wheel without push: nudge selected pad window start (scroll brace). */
+        /* Wheel rotate: nudge focused param — on Trim, scroll brace start. */
         if (surf->wheel_accum != 0) {
-            EpicyclePad *p = &eng.pads[eng.selected_pad];
-            float d = (float)surf->wheel_accum * 0.002f;
+            int delta = surf->wheel_accum;
             st->wheel_accum = 0;
-            engine_set_window(&eng, eng.selected_pad, p->window_start + d, p->window_length);
+            if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
+                EpicyclePad *p = &eng.pads[eng.selected_pad];
+                engine_set_window(&eng, eng.selected_pad, p->window_start + (float)delta * 0.002f,
+                                 p->window_length);
+            } else if (eng.mode_page == EPICYCLE_PAGE_TUNE) {
+                EpicyclePad *p = &eng.pads[eng.selected_pad];
+                engine_set_pitch(&eng, eng.selected_pad, p->octave, p->semitone + delta, p->fine);
+            } else if (eng.mode_page == EPICYCLE_PAGE_LFO) {
+                EpicycleLfo *l = &eng.pads[eng.selected_pad].lfos[0];
+                if (l->sync_beats > 0.0f) {
+                    l->sync_beats += (float)delta * 0.25f;
+                    if (l->sync_beats < 0.25f)
+                        l->sync_beats = 0.25f;
+                    if (l->sync_beats > 8.0f)
+                        l->sync_beats = 8.0f;
+                } else {
+                    l->rate_hz += (float)delta * 0.02f;
+                    if (l->rate_hz < 0.05f)
+                        l->rate_hz = 0.05f;
+                    if (l->rate_hz > 8.0f)
+                        l->rate_hz = 8.0f;
+                }
+            } else if (eng.mode_page == EPICYCLE_PAGE_MIX) {
+                EpicyclePad *p = &eng.pads[eng.selected_pad];
+                p->level += (float)delta * 0.01f;
+                if (p->level < 0.0f)
+                    p->level = 0.0f;
+                if (p->level > 1.0f)
+                    p->level = 1.0f;
+            }
         }
 
         if ((ticks % 3) == 0)
             ui_draw_loop(&hw, &eng, surf);
 
-        /* Host without audio thread: pump engine so preview logic stays warm. */
         if (!audio_running()) {
             int32_t L[EPICYCLE_AUDIO_FRAMES], R[EPICYCLE_AUDIO_FRAMES];
             engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);

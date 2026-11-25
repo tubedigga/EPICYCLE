@@ -57,9 +57,19 @@ static void pad_defaults(EpicyclePad *p)
     p->freeform = 1;
     p->division_beats = 4;
     p->level = 0.8f;
+    p->pan = 0.5f;
     p->crossfade = 0.05f;
     p->loop_enable = 1;
     p->allow_scrub = 1;
+    p->amp_attack = 0.0f;
+    p->amp_decay = 0.35f;
+    p->vel_sens = 1.0f;
+    p->filter_cutoff = 1.0f;
+    p->filter_reso = 0.0f;
+    p->filter_type = 0;
+    p->filt_attack = 0.0f;
+    p->filt_decay = 0.35f;
+    p->filt_depth = 0.0f;
     p->mod_window_start = 0.0f;
     p->mod_window_length = 1.0f;
     p->mod_pitch_ratio = 1.0f;
@@ -85,6 +95,28 @@ static void pad_defaults(EpicyclePad *p)
     p->mods[1].lfo_index = 1;
     p->mods[1].dest = EPICYCLE_MOD_PITCH;
     p->mods[1].amount = 0.0f;
+}
+
+const char *epicycle_page_name(EpicycleModePage page)
+{
+    switch (page) {
+    case EPICYCLE_PAGE_TRIM:
+        return "TRIM";
+    case EPICYCLE_PAGE_MIX:
+        return "MIX";
+    case EPICYCLE_PAGE_AMP:
+        return "AMP";
+    case EPICYCLE_PAGE_TUNE:
+        return "TUNE";
+    case EPICYCLE_PAGE_FILTER:
+        return "FILT";
+    case EPICYCLE_PAGE_FILT_ENV:
+        return "FENV";
+    case EPICYCLE_PAGE_LFO:
+        return "LFO";
+    default:
+        return "?";
+    }
 }
 
 static float division_length_frac(const EpicycleEngine *eng, const EpicyclePad *pad)
@@ -264,6 +296,8 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->main_sq = 1.0f;    /* until surface CC19 arrives */
     eng->fader_gain = 1.0f; /* CC20 default full until first fader event */
     eng->master_gain = 1.0f;
+    eng->kit_level = 1.0f;
+    eng->mode_page = EPICYCLE_PAGE_TRIM;
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
@@ -414,27 +448,129 @@ float engine_pad_playhead(const EpicycleEngine *eng, int pad)
     return -1.0f;
 }
 
-void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3)
+void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on)
 {
-    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     EpicyclePad *p = &eng->pads[pad];
-
-    /* K1 = window start (scroll brace across sample)
-     * K2 = window length (freeform) OR unused when division-locked (length from tempo)
-     * K3 = crossfade amount (loops) / level blend
-     */
-    float start = (float)k1 / 127.0f;
-    float length = 0.02f + 0.98f * ((float)k2 / 127.0f);
-    if (p->freeform)
-        engine_set_window(eng, pad, start, length);
-    else {
-        /* Division-locked: K1 scrolls the fixed-length window; K2 maps to division 1..32. */
-        int beats = 1 + (int)((k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
-        engine_set_division(eng, pad, beats);
-        p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
+    if (on) {
+        p->lfos[0].enabled = 1;
+        if (p->lfos[0].depth < 0.05f)
+            p->lfos[0].depth = 0.35f;
+        p->mods[0].lfo_index = 0;
+        p->mods[0].dest = EPICYCLE_MOD_BRACE_START;
+        p->mods[0].amount = 1.0f;
+        p->allow_scrub = 1;
+    } else {
+        p->lfos[0].enabled = 0;
+        p->lfos[0].depth = 0.0f;
     }
-    p->crossfade = 0.01f + 0.49f * ((float)k3 / 127.0f);
+}
+
+void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicycleLfo *l = &eng->pads[pad].lfos[0];
+    if (l->sync_beats > 0.0f) {
+        l->sync_beats = 0.0f;
+        if (l->rate_hz < 0.05f)
+            l->rate_hz = 0.25f;
+    } else {
+        l->sync_beats = 1.0f; /* 1 beat cycle */
+    }
+}
+
+void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
+                             uint8_t k2, uint8_t k3)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    float t1 = (float)k1 / 127.0f;
+    float t2 = (float)k2 / 127.0f;
+    float t3 = (float)k3 / 127.0f;
+
+    switch (page) {
+    case EPICYCLE_PAGE_TRIM: {
+        /* Stock Trim: Start / End / Loop → EPICYCLE brace start / length|div / xfade. */
+        float start = t1;
+        float length = 0.02f + 0.98f * t2;
+        if (p->freeform)
+            engine_set_window(eng, pad, start, length);
+        else {
+            int beats = 1 + (int)((k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
+            engine_set_division(eng, pad, beats);
+            p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
+        }
+        p->crossfade = 0.01f + 0.49f * t3;
+        break;
+    }
+    case EPICYCLE_PAGE_MIX:
+        /* Stock Mix: Volume / (kit) / Pan. */
+        p->level = t1;
+        eng->kit_level = 0.05f + 0.95f * t2;
+        p->pan = t3;
+        break;
+    case EPICYCLE_PAGE_AMP:
+        /* Stock Amp Env: Attack / Decay / Vel Sens (stored; simple env later). */
+        p->amp_attack = t1;
+        p->amp_decay = t2;
+        p->vel_sens = t3;
+        break;
+    case EPICYCLE_PAGE_TUNE: {
+        /* Stock Tune: Semi / Fine / (Warp unused — map to octave). */
+        int semi = (int)(t1 * 48.0f + 0.5f) - 24; /* -24..+24 */
+        float fine = t2 * 180.0f - 90.0f;         /* -90..+90 */
+        int oct = (int)(t3 * 8.0f + 0.5f) - 4;    /* -4..+4 */
+        engine_set_pitch(eng, pad, oct, semi, fine);
+        break;
+    }
+    case EPICYCLE_PAGE_FILTER:
+        /* Stub filter params (DSP later). */
+        p->filter_cutoff = t1;
+        p->filter_reso = t2;
+        p->filter_type = (int)(t3 * 7.0f + 0.5f); /* 0..7 */
+        break;
+    case EPICYCLE_PAGE_FILT_ENV:
+        p->filt_attack = t1;
+        p->filt_decay = t2;
+        p->filt_depth = t3;
+        break;
+    case EPICYCLE_PAGE_LFO: {
+        /* EPICYCLE LFO editor: shape / rate / depth (enable when depth > 0). */
+        int shape = (int)(t1 * (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) + 0.5f);
+        if (shape < 0)
+            shape = 0;
+        if (shape >= EPICYCLE_LFO_SHAPE_COUNT)
+            shape = EPICYCLE_LFO_SHAPE_COUNT - 1;
+        p->lfos[0].shape = (EpicycleLfoShape)shape;
+        if (p->lfos[0].sync_beats > 0.0f) {
+            /* Sync: map K2 to musical divisions 0.25..8 beats. */
+            static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
+            int idx = (int)(t2 * 5.0f + 0.5f);
+            if (idx < 0)
+                idx = 0;
+            if (idx > 5)
+                idx = 5;
+            p->lfos[0].sync_beats = beats[idx];
+        } else {
+            p->lfos[0].rate_hz = 0.05f + 7.95f * t2; /* ~0.05–8 Hz */
+        }
+        p->lfos[0].depth = t3;
+        engine_lfo_set_enabled(eng, pad, t3 > 0.02f);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3)
+{
+    if (!eng)
+        return;
+    engine_apply_page_knobs(eng, pad, eng->mode_page, k1, k2, k3);
 }
 
 static void recompute_master(EpicycleEngine *eng)
@@ -552,9 +688,16 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     v->env = (float)(rem / 64.0);
             }
 
-            float g = pad->mod_level * v->velocity * v->env;
-            mixL += L * g;
-            mixR += R * g;
+            float vel = v->velocity;
+            if (pad->vel_sens < 0.99f)
+                vel = pad->vel_sens * v->velocity + (1.0f - pad->vel_sens);
+            float g = pad->mod_level * eng->kit_level * vel * v->env;
+            /* Equal-power-ish pan from Mix page. */
+            float pan = clampf(pad->pan, 0.0f, 1.0f);
+            float gl = cosf(pan * (float)(0.5 * M_PI));
+            float gr = sinf(pan * (float)(0.5 * M_PI));
+            mixL += L * g * gl;
+            mixR += R * g * gr;
         }
 
         float mg = eng->master_gain;

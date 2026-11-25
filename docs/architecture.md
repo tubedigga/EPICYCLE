@@ -10,10 +10,11 @@ Power on
   → 1.4: Developer Mode prompt → top-level autorun.sh → autorun/autorun.sh
      1.3: autorun.check → autorun/autorun.sh
   → launcher copies binary to /run, stops ac50, runs epicycle
-  → display (/dev/fb0) + I2S ALSA + Surface MIDI
-  → splash → loop UI (large waveform + brace / knobs)
+  → display (DRM card0 / fb0) + I2S ALSA + Surface MIDI
+  → splash holds until encoder / soft key / pad
+  → Sample-Mode-style pages (B1/B2 cycle; B3 quit)
   → audio thread ← engine_render (16 voices, crossfade loops)
-  → wheel push → clean close
+  → soft-right quit → clean close (encoder push never quits)
   → systemctl start ac50
 ```
 
@@ -31,15 +32,18 @@ Power on
   Main Volume (CC19, squared) × fader (CC20, linear) → `master_gain` (0 = silence).
 - **surface** — Control Surface raw MIDI: pads (note map + LED SysEx I=pad−1),
   SAMPLE button (ch1 note 6) for select-hold, K1–K3, Main Volume CC19, fader CC20,
-  soft keys (free/div, LFO), wheel scroll/quit, selected-pad amber LED, position
-  SysEx `0x42`. Map from sample-base `controls.h` / HARDWARE.md (MIT rewrite only).
+  soft keys B1/B2/B3 (page prev / next / quit), wheel rotate + press (press never
+  quits), selected-pad amber LED, position SysEx `0x42`. Map from sample-base
+  `controls.h` / HARDWARE.md (MIT rewrite only).
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
 - **engine** — 16 pads × scrollable brace window; division (1–32 beats) or freeform;
   pitch (oct/semi/fine); crossfade loopers; 16 voices with note-off + steal;
-  2 LFOs + 4 mod routes per pad; brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8).
-- **ui** — Ash boot logo splash; loop screen = one large waveform + brace, soft-key
-  labels, START/END/POS readouts (no pad grid / no brand chrome).
+  2 LFOs + 4 mod routes per pad; brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8);
+  page-aware K1–K3 maps.
+- **ui** — splash with bottom-strip start prompt (logo uncovered); Trim = large
+  waveform home; pages Trim/Mix/Amp/Tune/Filter/FiltEnv/LFO (Sample Mode mapping,
+  EPICYCLE identity — not a stock clone; no SEQ/Pad FX/Chop/16 Levels).
 
 ## Loop brace / modulation
 
@@ -49,8 +53,8 @@ window  |----[###########]-------------|   start + length
 LFO     |----[####·······]-------------|   start slides (scrub)
 ```
 
-Mod destinations (hooks for later UI): `BRACE_START`, `BRACE_LEN`, `PITCH`,
-`LEVEL`, `FILTER` (stub). Soft-mid toggles LFO0 → brace start on the selected pad.
+Mod destinations: `BRACE_START`, `BRACE_LEN`, `PITCH`, `LEVEL`, `FILTER` (stub).
+LFO page edits shape / rate / sync|free / depth (enables brace scrub).
 
 ## Data on card
 
