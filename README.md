@@ -6,7 +6,7 @@ Primary screen: 2D projected tombola — **Fader** morph, **MAIN** vol, **K2** s
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.3.3-free-grains` — FREE Trim near-zero Start/End for POS/LFO scrub. Host-tested. Needs Ash card boot + log paste.
+> **Status:** `0.3.4-end-unlock` — FREE Trim End unlock after narrow. Host-tested. Needs Ash card boot + log paste.
 
 ## Update the SD card (Ash — firmware 1.4)
 
