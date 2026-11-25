@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: MIT
  *
- * EPICYCLE hardware bring-up — open display / surface MIDI / ALSA, show a
- * splash + home UI that reacts to pads and knobs, quit on wheel push.
- * Launcher restores stock via systemctl start ac50. Not yet sample-tested
- * for the loop engine (that stays stubbed).
+ * EPICYCLE loop engine — load samples to pads, edit scrollable brace with
+ * knobs, time-division or free-run against tempo, hear sync/polymeter.
+ * Soft-left toggles free/div; soft-mid toggles LFO brace scrub on selected pad.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
 
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,10 +26,12 @@ static void on_signal(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "EPICYCLE %s — panel bring-up for MPC Sample\n"
-            "usage: %s [--help] [--version]\n"
-            "  MPC_APP_DIR   set by the SD launcher to the payload folder\n"
-            "  On device: push the data wheel (or right soft key) to quit.\n",
+            "EPICYCLE %s — loop engine for MPC Sample\n"
+            "usage: %s [--help] [--version] [--demo] [--wav PATH]...\n"
+            "  --demo       synth demo tones onto pads (host / no card samples)\n"
+            "  --wav PATH   load WAV into next bank slot (up to 16)\n"
+            "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
+            "  On device: pads play; knobs edit brace; wheel push quits.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -42,8 +44,122 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
+static int try_load_card_samples(EpicycleEngine *eng, const EpicyclePaths *paths)
+{
+    int loaded = 0;
+    char path[768];
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        snprintf(path, sizeof path, "%s/samples/pad%02d.wav", paths->data_dir, i + 1);
+        if (engine_load_bank_wav(eng, i, path) == 0) {
+            engine_assign_sample(eng, i, i);
+            loaded++;
+            continue;
+        }
+        snprintf(path, sizeof path, "%s/samples/%d.wav", paths->data_dir, i + 1);
+        if (engine_load_bank_wav(eng, i, path) == 0) {
+            engine_assign_sample(eng, i, i);
+            loaded++;
+        }
+    }
+    /* Also try bundled demos next to the binary. */
+    if (loaded == 0) {
+        static const char *names[] = {"demo-a.wav", "demo-b.wav", "demo-c.wav", "demo-d.wav", NULL};
+        for (int i = 0; names[i]; i++) {
+            snprintf(path, sizeof path, "%s/%s", paths->app_dir, names[i]);
+            if (engine_load_bank_wav(eng, i, path) == 0) {
+                engine_assign_sample(eng, i, i);
+                engine_assign_sample(eng, i + 4, i);
+                loaded++;
+            }
+        }
+    }
+    return loaded;
+}
+
+static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
+{
+    if (!eng || !st)
+        return;
+    int pad = eng->selected_pad;
+    if (st->soft_left) {
+        st->soft_left = 0;
+        EpicyclePad *p = &eng->pads[pad];
+        if (p->freeform)
+            engine_set_division(eng, pad, p->division_beats > 0 ? p->division_beats : 4);
+        else
+            engine_set_division(eng, pad, 0);
+    }
+    if (st->soft_mid) {
+        st->soft_mid = 0;
+        EpicyclePad *p = &eng->pads[pad];
+        /* Toggle LFO0 brace-scroll; respect scrub budget via allow_scrub. */
+        if (!p->lfos[0].enabled) {
+            p->lfos[0].enabled = 1;
+            if (p->lfos[0].depth < 0.1f)
+                p->lfos[0].depth = 0.35f;
+            p->mods[0].lfo_index = 0;
+            p->mods[0].dest = EPICYCLE_MOD_BRACE_START;
+            p->mods[0].amount = 1.0f;
+            p->allow_scrub = 1;
+        } else {
+            p->lfos[0].enabled = 0;
+            p->lfos[0].depth = 0.0f;
+        }
+    }
+}
+
+static void write_host_preview_wav(const char *path, EpicycleEngine *eng, float seconds)
+{
+    /* Tiny offline bounce so CI can prove the engine makes non-silent audio. */
+    size_t frames = (size_t)(eng->sample_rate * seconds);
+    FILE *fp = fopen(path, "wb");
+    if (!fp)
+        return;
+    uint32_t data_bytes = (uint32_t)(frames * 2 * 2); /* 16-bit stereo */
+    uint32_t riff = 36 + data_bytes;
+    fwrite("RIFF", 1, 4, fp);
+    fwrite(&riff, 4, 1, fp);
+    fwrite("WAVEfmt ", 1, 8, fp);
+    uint32_t fmt_sz = 16;
+    uint16_t audio_fmt = 1, ch = 2, bps = 16;
+    uint32_t rate = eng->sample_rate;
+    uint32_t byte_rate = rate * ch * bps / 8;
+    uint16_t block = (uint16_t)(ch * bps / 8);
+    fwrite(&fmt_sz, 4, 1, fp);
+    fwrite(&audio_fmt, 2, 1, fp);
+    fwrite(&ch, 2, 1, fp);
+    fwrite(&rate, 4, 1, fp);
+    fwrite(&byte_rate, 4, 1, fp);
+    fwrite(&block, 2, 1, fp);
+    fwrite(&bps, 2, 1, fp);
+    fwrite("data", 1, 4, fp);
+    fwrite(&data_bytes, 4, 1, fp);
+
+    int32_t L[EPICYCLE_AUDIO_FRAMES], R[EPICYCLE_AUDIO_FRAMES];
+    size_t done = 0;
+    while (done < frames) {
+        size_t n = frames - done;
+        if (n > EPICYCLE_AUDIO_FRAMES)
+            n = EPICYCLE_AUDIO_FRAMES;
+        engine_render(eng, L, R, n);
+        for (size_t i = 0; i < n; i++) {
+            int16_t sl = (int16_t)(L[i] >> 16);
+            int16_t sr = (int16_t)(R[i] >> 16);
+            fwrite(&sl, 2, 1, fp);
+            fwrite(&sr, 2, 1, fp);
+        }
+        done += n;
+    }
+    fclose(fp);
+}
+
 int main(int argc, char **argv)
 {
+    int force_demo = 0;
+    const char *wavs[EPICYCLE_PAD_COUNT];
+    int wav_n = 0;
+    const char *preview_out = NULL;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -52,6 +168,19 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--version") == 0) {
             puts(EPICYCLE_VERSION);
             return 0;
+        }
+        if (strcmp(argv[i], "--demo") == 0) {
+            force_demo = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--preview") == 0 && i + 1 < argc) {
+            preview_out = argv[++i];
+            force_demo = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc && wav_n < EPICYCLE_PAD_COUNT) {
+            wavs[wav_n++] = argv[++i];
+            continue;
         }
     }
 
@@ -65,12 +194,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    epicycle_log(&paths, "EPICYCLE %s starting (bring-up)", EPICYCLE_VERSION);
+    epicycle_log(&paths, "EPICYCLE %s starting (loop engine)", EPICYCLE_VERSION);
     epicycle_log(&paths, "app_dir=%s card_root=%s data_dir=%s", paths.app_dir, paths.card_root,
                  paths.data_dir);
 
     EpicycleEngine eng;
-    engine_init(&eng);
+    engine_init(&eng, 44100);
 
     EpicycleHwStatus hw;
     memset(&hw, 0, sizeof hw);
@@ -88,44 +217,116 @@ int main(int argc, char **argv)
     snprintf(hw.surface_info, sizeof hw.surface_info, "%s", surface_info());
     epicycle_log(&paths, "surface: %s", hw.surface_info);
 
-    ui_draw_splash(hw.display_ok ? "panel online" : "panel offline (host?)");
-    sleep_ms(700);
+    int loaded = 0;
+    for (int i = 0; i < wav_n; i++) {
+        if (engine_load_bank_wav(&eng, i, wavs[i]) == 0) {
+            engine_assign_sample(&eng, i, i);
+            loaded++;
+        }
+    }
+    if (!force_demo && loaded == 0)
+        loaded = try_load_card_samples(&eng, &paths);
+    if (force_demo || loaded == 0) {
+        engine_host_demo_setup(&eng);
+        epicycle_log(&paths, "using synth demo bank (polymeter pads 2/3 = 3 vs 5 beats)");
+    } else {
+        /* Default musical layout when WAVs present: pad0/1 synced 4-beat, 2/3 polymeter. */
+        if (eng.pads[0].sample)
+            engine_set_division(&eng, 0, 4);
+        if (eng.pads[1].sample)
+            engine_set_division(&eng, 1, 4);
+        if (eng.pads[2].sample)
+            engine_set_division(&eng, 2, 3);
+        if (eng.pads[3].sample)
+            engine_set_division(&eng, 3, 5);
+        epicycle_log(&paths, "loaded %d sample slot(s)", loaded);
+    }
 
-    /* Host/CI: stubs request quit immediately. On device, run until quit. */
+    if (preview_out) {
+        /* Host CI path: trigger a few pads, bounce audio, exit. */
+        engine_note_on(&eng, 0, 0.9f);
+        engine_note_on(&eng, 2, 0.8f);
+        engine_note_on(&eng, 3, 0.8f);
+        write_host_preview_wav(preview_out, &eng, 1.5f);
+        epicycle_log(&paths, "wrote preview %s", preview_out);
+        audio_close();
+        display_close();
+        engine_shutdown(&eng);
+        return 0;
+    }
+
+    audio_set_engine(&eng);
+
+    ui_draw_splash(hw.display_ok ? "loop engine online" : "panel offline (host?)");
+    sleep_ms(600);
+
+    /* Auto-fire demo pads on host so something is audible if audio exists. */
+#ifndef EPICYCLE_ON_DEVICE
+    engine_note_on(&eng, 0, 0.8f);
+    engine_note_on(&eng, 2, 0.7f);
+    engine_note_on(&eng, 3, 0.7f);
+#endif
+
     int ticks = 0;
-    int dirty = 1;
+    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255;
+
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
+        EpicycleSurfaceState *st = surface_state_mut();
+        const EpicycleSurfaceState *surf = surface_state();
 
-        /* Keep the silent audio callback shape warm for later engine work. */
-        int32_t L[EPICYCLE_AUDIO_FRAMES];
-        int32_t R[EPICYCLE_AUDIO_FRAMES];
-        engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
-        (void)audio_running();
+        handle_soft_keys(&eng, st);
 
-        if (dirty || (ticks % 4) == 0) {
-            ui_draw_home(&hw, surface_state());
-            dirty = 0;
+        for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+            if (st->pad_down[i]) {
+                st->pad_down[i] = 0;
+                eng.selected_pad = i;
+                float vel = surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
+                engine_note_on(&eng, i, vel);
+            }
+        }
+
+        if (surf->k1 != last_k1 || surf->k2 != last_k2 || surf->k3 != last_k3) {
+            engine_apply_knobs(&eng, eng.selected_pad, surf->k1, surf->k2, surf->k3);
+            last_k1 = surf->k1;
+            last_k2 = surf->k2;
+            last_k3 = surf->k3;
+        }
+
+        /* Wheel without push: nudge selected pad window start (scroll brace). */
+        if (surf->wheel_accum != 0) {
+            EpicyclePad *p = &eng.pads[eng.selected_pad];
+            float d = (float)surf->wheel_accum * 0.002f;
+            st->wheel_accum = 0;
+            engine_set_window(&eng, eng.selected_pad, p->window_start + d, p->window_length);
+        }
+
+        if ((ticks % 3) == 0)
+            ui_draw_loop(&hw, &eng, surf);
+
+        /* Host without audio thread: pump engine so preview logic stays warm. */
+        if (!audio_running()) {
+            int32_t L[EPICYCLE_AUDIO_FRAMES], R[EPICYCLE_AUDIO_FRAMES];
+            engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
         }
 
         sleep_ms(16);
         ticks++;
 
 #ifndef EPICYCLE_ON_DEVICE
-        /* Safety: never hang the host smoke test. */
-        if (ticks > 60)
+        if (ticks > 90)
             break;
 #endif
-        /* Redraw when pads/knobs change — cheap full refresh at ~15 Hz above. */
-        dirty = 1;
     }
 
     ui_draw_splash("quitting to stock");
     sleep_ms(250);
 
+    audio_set_engine(NULL);
     surface_close();
     audio_close();
     display_close();
+    engine_shutdown(&eng);
     epicycle_log(&paths, "EPICYCLE exiting cleanly (launcher starts ac50)");
     return 0;
 }

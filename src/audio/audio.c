@@ -1,14 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * AK4558 I2S playback via plain ALSA kernel ioctls (no alsa-lib) so the
- * aarch64 binary can stay static. Opens the "I2S" card at 44.1 kHz stereo
- * S32_LE — firmware 1.4 locks the rate via device-tree. Keeps a silent
- * stream running so the sound path is ready for later loop-engine work.
- *
- * Click-free notes (SampleBoot TECHNICAL.md / sample-base HARDWARE.md):
- * open promptly at the codec's current 44.1 rate after stock stops; close
- * with DROP so the next owner (ac50) can reclaim cleanly. Full DAPM /
- * Playback Volume ramp helpers can land in a later PR.
+ * AK4558 I2S playback via plain ALSA kernel ioctls (no alsa-lib). Opens the
+ * "I2S" card at 44.1 kHz stereo S32_LE. Realtime thread calls engine_render
+ * when an engine is bound; otherwise writes silence.
  */
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -38,6 +32,8 @@ static char g_info[64] = "audio closed";
 static pthread_t g_thread;
 static volatile int g_stop;
 static int g_thread_started;
+static EpicycleEngine *g_engine;
+static pthread_mutex_t g_eng_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void hw_mask(struct snd_pcm_hw_params *p, int n, unsigned bit)
 {
@@ -102,12 +98,28 @@ static int configure_pcm(int fd, unsigned period)
 static void *audio_thread(void *arg)
 {
     (void)arg;
-    static int32_t buf[AUDIO_PERIOD * 2];
-    memset(buf, 0, sizeof buf);
+    static int32_t interleaved[AUDIO_PERIOD * 2];
+    static int32_t L[AUDIO_PERIOD];
+    static int32_t R[AUDIO_PERIOD];
 
     while (!g_stop && g_pcm_fd >= 0) {
+        EpicycleEngine *eng = NULL;
+        pthread_mutex_lock(&g_eng_mu);
+        eng = g_engine;
+        pthread_mutex_unlock(&g_eng_mu);
+
+        if (eng)
+            engine_render(eng, L, R, AUDIO_PERIOD);
+        else
+            memset(L, 0, sizeof L), memset(R, 0, sizeof R);
+
+        for (int i = 0; i < AUDIO_PERIOD; i++) {
+            interleaved[i * 2] = L[i];
+            interleaved[i * 2 + 1] = R[i];
+        }
+
         struct snd_xferi x = {
-            .buf = buf,
+            .buf = interleaved,
             .frames = AUDIO_PERIOD,
             .result = 0,
         };
@@ -118,12 +130,18 @@ static void *audio_thread(void *arg)
                 ioctl(g_pcm_fd, SNDRV_PCM_IOCTL_PREPARE);
                 continue;
             }
-            /* Transient errors: brief pause then retry. */
             usleep(2000);
             break;
         }
     }
     return NULL;
+}
+
+void audio_set_engine(EpicycleEngine *eng)
+{
+    pthread_mutex_lock(&g_eng_mu);
+    g_engine = eng;
+    pthread_mutex_unlock(&g_eng_mu);
 }
 
 int audio_open(void)
@@ -136,7 +154,7 @@ int audio_open(void)
 
     int card = epicycle_find_alsa_card("I2S");
     if (card < 0) {
-        /* Host / CI soft-fail. */
+        /* Host / CI soft-fail — still allow host offline render via engine. */
         return -1;
     }
 
@@ -151,7 +169,6 @@ int audio_open(void)
     if (flags >= 0)
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 
-    /* Prefer 128-frame periods; fall back to 512 if the driver refuses. */
     unsigned period = AUDIO_PERIOD;
     if (configure_pcm(fd, period) != 0) {
         period = 512;
@@ -164,7 +181,7 @@ int audio_open(void)
 
     g_pcm_fd = fd;
     g_running = 1;
-    snprintf(g_info, sizeof g_info, "I2S #%d %uHz silent", card, g_rate);
+    snprintf(g_info, sizeof g_info, "I2S #%d %uHz engine", card, g_rate);
 
     if (pthread_create(&g_thread, NULL, audio_thread, NULL) == 0)
         g_thread_started = 1;
@@ -174,6 +191,7 @@ int audio_open(void)
 void audio_close(void)
 {
     g_stop = 1;
+    audio_set_engine(NULL);
     if (g_thread_started) {
         pthread_join(g_thread, NULL);
         g_thread_started = 0;
@@ -190,13 +208,6 @@ void audio_close(void)
 int audio_running(void)
 {
     return g_running;
-}
-
-int audio_write_silence(size_t frames)
-{
-    (void)frames;
-    /* Background thread owns the stream when open. */
-    return g_running ? 0 : -1;
 }
 
 unsigned audio_rate(void)

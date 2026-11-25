@@ -1,0 +1,10 @@
+EPICYCLE samples
+================
+Copy WAV files to Epicycle/samples/ on the card:
+
+  pad01.wav … pad16.wav
+  (or 1.wav … 16.wav)
+
+PCM WAV only (16/24/32-bit or float). Mono or stereo.
+If no files are found, EPICYCLE uses a built-in demo tone bank so you can
+still hear synced 4-beat loops and 3-vs-5 polymeter on pads 1–4.
