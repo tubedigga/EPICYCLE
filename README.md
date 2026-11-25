@@ -2,11 +2,11 @@
 
 **Tombola** for EPICYCLE on the [Akai MPC Sample](https://www.akaipro.com/) — generative geometric drum: balls bounce, wall hits fire pads.
 
-Primary screen: 2D projected tombola — **Fader** morph, **MAIN** vol, **K2** spin±dir, **MUTE+pad** balls (rest at bottom until spin). **SAMPLE + pad** selects; pad LED flashes on wall hit only. HitMod slots start empty. Freeze / reverb DSP are later.
+Primary screen: 2D projected tombola — **Fader** morph, **MAIN** vol, **K1** spin±dir (CW=CW), **MUTE+pad** balls (rest at bottom until spin). **SAMPLE + pad** selects; pad LED flashes on wall hit only. HitMod slots start empty. Freeze / reverb DSP are later.
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.3.4-end-unlock` — FREE Trim End unlock after narrow. Host-tested. Needs Ash card boot + log paste.
+> **Status:** `0.3.6-knob-physics` — knob labels match, CC19 latch, leave+impact hits, baller bounce, Trim. Host-tested. Needs Ash card boot + log paste.
 
 ## Update the SD card (Ash — firmware 1.4)
 
@@ -52,7 +52,7 @@ make test-host    # demo bank + non-silent preview WAV check
 ### What you should try on the device
 
 1. Splash holds; centered **PRESS ANY PAD TO CONTINUE** under logo.
-2. **Tombola** home: balls rest at bottom; spin lifts; wall hits fire samples. **Fader** = morph; **MAIN** = vol; **K2** = spin.
+2. **Tombola** home: balls rest at bottom; spin lifts; wall hits fire samples. **Fader** = morph; **MAIN** = vol; **K1** = spin (CW=CW); **K2** unused.
 3. **SAMPLE + pad** = select (LED solid); **MUTE + pad** = remove/add ball; LED flash = wall hit only.
 4. Soft keys: **B1** prev, **B2** next, **B3 QUIT**. Pages: Tombola / Trim / Mix / Amp / Tune / Filt / FEnv / LFO / HitMod.
 5. **FULL LEVEL** = Hit Mod (empty until you wire SRC/DEST/AMT). **LOOP** off = one-shot bounce.

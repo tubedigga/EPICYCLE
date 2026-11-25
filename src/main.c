@@ -3,7 +3,7 @@
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
  * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.5: bounce=pad press; hard contain; fader morph / K1 spin; smooth Trim.
+ * 0.3.6: knob labels match; CC19 latch; leave+impact hits; baller bounce; Trim.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -185,12 +185,17 @@ static float trim_frame_frac(const EpicycleEngine *eng, int pad)
 /*
  * Nudge Start/End by CC delta — width only (POS slides separately).
  * Close AND reopen must always work (Ash: End locked after 0.23–0.25).
- * Tiny-width open used to be 1-frame/tick → felt frozen, worse on long samples.
+ * Smaller per-tick steps + |dcc| cap → less jumpy (Ash 0.3.5 Trim feel).
  */
 static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
 {
     if (!dcc)
         return;
+    /* Cap MIDI jumps so a noisy pot cannot leap the brace. */
+    if (dcc > 2)
+        dcc = 2;
+    if (dcc < -2)
+        dcc = -2;
     EpicyclePad *p = &eng->pads[pad];
     float frame = trim_frame_frac(eng, pad);
     float start = p->window_start;
@@ -204,22 +209,22 @@ static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
         if (width <= frame * 16.0f) {
             step = frame * (float)dcc;
         } else {
-            float per = width * 0.22f;
-            if (per < frame * 16.0f)
-                per = frame * 16.0f;
+            float per = width * 0.10f; /* was 0.22 — less jumpy */
+            if (per < frame * 8.0f)
+                per = frame * 8.0f;
             step = per * (float)dcc;
         }
     } else {
-        /* Opening: grow by ~2.5% of sample or 22% of headroom per tick — never
-         * stall at 1-frame after a narrow (Ash End unlock). */
+        /* Opening: grow by ~1.2% of sample or 10% of headroom per tick — still
+         * unlocks after a narrow (Ash End unlock) without large jumps. */
         float headroom = end_edge ? (1.0f - start - width) : start;
         if (headroom < 0.0f)
             headroom = 0.0f;
-        float per = headroom * 0.22f;
-        if (per < 0.025f)
-            per = 0.025f;
-        if (per < frame * 64.0f)
-            per = frame * 64.0f;
+        float per = headroom * 0.10f;
+        if (per < 0.012f)
+            per = 0.012f;
+        if (per < frame * 32.0f)
+            per = frame * 32.0f;
         if (per > headroom && headroom > frame)
             per = headroom;
         step = per * (float)dcc;
@@ -782,7 +787,7 @@ int main(int argc, char **argv)
                 engine_set_window(&eng, pad, 0.25f, 0.22f); /* Ash 0.25–0.47 case */
                 if (eng.pads[pad].window_length < 0.20f)
                     rc = -20;
-                for (int n = 0; n < 40; n++)
+                for (int n = 0; n < 80; n++)
                     trim_nudge_edge(&eng, pad, 1, -1);
                 float frame = trim_frame_frac(&eng, pad);
                 if (eng.pads[pad].window_length > frame * 4.0f)
@@ -799,7 +804,7 @@ int main(int argc, char **argv)
                 /* Ash 0.23–0.25 lock: after narrow, End must reopen. */
                 engine_set_window(&eng, pad, 0.23f, 0.02f);
                 float w0 = eng.pads[pad].window_length;
-                for (int n = 0; n < 12; n++)
+                for (int n = 0; n < 24; n++)
                     trim_nudge_edge(&eng, pad, 1, +1);
                 if (eng.pads[pad].window_length < w0 + 0.05f)
                     rc = -24; /* End reopen failed */
@@ -1030,8 +1035,12 @@ int main(int argc, char **argv)
     g_quit_guard_ticks = 45; /* ~0.7s after splash before B3 quit armed */
 
     surface_poll();
-    /* CC19 follows hardware dump (0 = silence). Gain only — no voice restart. */
-    engine_set_master_gain_cc(&eng, surface_state()->main_vol);
+    /* CC19 latched until user moves MAIN (Ash: no dump silence / dropouts).
+     * Engine stays full until engaged; then gain-only, no voice restart. */
+    if (surface_state()->main_engaged)
+        engine_set_master_gain_cc(&eng, surface_state()->main_vol);
+    else
+        engine_set_master_gain_cc(&eng, 127);
     last_main = surface_state()->main_vol;
     last_fader = surface_state()->fader;
     last_shift = surface_state()->shift_held;
@@ -1143,8 +1152,8 @@ int main(int argc, char **argv)
             pickup_arm(surf, &eng);
         }
 
-        /* CC19 MAIN VOL → gain only (smoothed in engine). Never restarts voices. */
-        if (surf->main_seen && surf->main_vol != last_main) {
+        /* CC19 MAIN VOL → gain only after latch engage. Never restarts voices. */
+        if (surf->main_engaged && surf->main_vol != last_main) {
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }

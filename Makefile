@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.3.5-bounce-contain
+VERSION    := 0.3.6-knob-physics
 BUILD      := build
 DIST       := dist
 

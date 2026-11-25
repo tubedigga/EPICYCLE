@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.5-bounce-contain"
+#define EPICYCLE_VERSION "0.3.6-knob-physics"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -194,7 +194,7 @@ typedef struct EpicycleTombola {
     EpicycleTombolaBall balls[EPICYCLE_PAD_COUNT];
     float morph;      /* 0..1 fader: circle → more faces */
     float spin_rad;   /* container rotation */
-    float spin_speed; /* rad/s from K1 (signed: +CW / −CCW); fader=morph only */
+    float spin_speed; /* rad/s from K1 (CW knob → CW visual = negative rate); fader=morph */
     float radius;
     int face_count; /* 0 = circle, else 3..16 */
     int ball_target; /* last MUTE compose count 0..16 */
@@ -373,7 +373,7 @@ int surface_midi_selftest(void);
 void tombola_init(EpicycleTombola *tb);
 EpicycleTombola *tombola_state(void);
 void tombola_set_morph(EpicycleTombola *tb, float morph01);
-/* K1: bipolar spin — 0 = max CCW, 64 ≈ stop, 127 = max CW. Fader = morph only. */
+/* K1: bipolar spin — 0 = max CCW, 64 ≈ stop, 127 = max CW (CW knob = CW spin). */
 void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1);
 /* Host/preview helper: activate first N balls. Device compose = MUTE+pad only. */
 void tombola_set_ball_count(EpicycleTombola *tb, int count);
