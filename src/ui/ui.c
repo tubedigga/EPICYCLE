@@ -768,8 +768,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                     snprintf(line, sizeof line, "w=%.4f", (double)len);
                     draw_text(px, 248, 82, line, COL_MUTED, 1);
                 }
-                draw_text(px, 8, 212, "K1/K2 close to line  K3/LFO scrub", COL_MUTED, 1);
-                draw_text(px, 8, 226, "ENC fine edge  push=DIV  SHIFT xfade", COL_MUTED, 1);
+                draw_text(px, 8, 212, "K1/K2 width  K3 POS slide  LFO scrub", COL_MUTED, 1);
+                draw_text(px, 8, 226, "narrow then reopen OK  ENC fine  SHIFT", COL_MUTED, 1);
             } else {
                 snprintf(line, sizeof line, "DIV%d",
                          pad ? engine_division_quantize_slices(pad->division_beats) : 4);
