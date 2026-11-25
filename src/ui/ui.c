@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * Loop-engine UI: PNG boot splash (letterboxed on black) + pad grid,
- * selected pad waveform with brace window, knob roles, division/free + LFO scrub.
+ * Loop UI (Ash 0.2.4): one large waveform + brace for the selected pad.
+ * No 16-pad grid, no top-left brand chrome. Soft-key labels big;
+ * start / end / position readable at the bottom. Pad LEDs show selection.
  */
 #include "epicycle.h"
 
@@ -100,6 +101,7 @@ static const char *glyph(char ch)
     case '(': return "00010 00100 00100 00100 00010";
     case ')': return "01000 00100 00100 00100 01000";
     case '~': return "00000 01000 10101 00010 00000";
+    case '%': return "11001 11010 00100 01011 10011";
     default: return "11111 10001 10001 10001 11111";
     }
 }
@@ -129,18 +131,18 @@ static void draw_text(uint32_t *px, int x, int y, const char *s, uint32_t fg, in
 }
 
 enum {
-    COL_BG = 0x001A1410u,
-    COL_FG = 0x00E8DCC8u,
-    COL_MUTED = 0x009A8F82u,
+    COL_BG = 0x0014100Cu,
+    COL_FG = 0x00F0E6D8u,
+    COL_MUTED = 0x008A8074u,
     COL_ACCENT = 0x002A6F8Cu,
-    COL_PAD_OFF = 0x002A2420u,
-    COL_PAD_ON = 0x0038A090u,
-    COL_PAD_SEL = 0x00C4A060u,
     COL_OK = 0x0048A060u,
-    COL_BAD = 0x00A05040u,
-    COL_WAVE = 0x00406070u,
-    COL_BRACE = 0x00E0A050u,
+    COL_WAVE = 0x00385868u,
+    COL_WAVE_DIM = 0x00283038u,
+    COL_BRACE = 0x00E8A848u,
+    COL_BRACE_FILL = 0x00302818u,
     COL_MOD = 0x0060B090u,
+    COL_PLAY = 0x00F0F0E8u,
+    COL_SOFT = 0x00C8B898u,
 };
 
 int ui_load_splash_logo(const char *path)
@@ -189,7 +191,6 @@ void ui_draw_splash(const char *status_line)
         draw_text(px, 28, 150, "v" EPICYCLE_VERSION, COL_MUTED, 1);
     }
     if (status_line && status_line[0]) {
-        /* Short optional status in the bottom letterbox (~7 px under a 226-tall logo). */
         int y = g_logo ? (EPICYCLE_FB_H + g_logo_h) / 2 : EPICYCLE_FB_H - 12;
         if (y > EPICYCLE_FB_H - 5)
             y = EPICYCLE_FB_H - 5;
@@ -198,15 +199,30 @@ void ui_draw_splash(const char *status_line)
     display_present();
 }
 
-static void draw_waveform(uint32_t *px, const EpicyclePad *pad, int x, int y, int w, int h)
+static void draw_waveform(uint32_t *px, const EpicyclePad *pad, float playhead,
+                          int x, int y, int w, int h)
 {
-    fill_rect(px, x, y, w, h, 0x00201814u);
-    fill_rect(px, x, y + h / 2, w, 1, 0x00302824u);
+    fill_rect(px, x, y, w, h, 0x00181010u);
+    fill_rect(px, x, y + h / 2, w, 1, 0x00282020u);
 
-    if (!pad || !pad->sample || !pad->sample->data || pad->sample->frames == 0)
+    if (!pad || !pad->sample || !pad->sample->data || pad->sample->frames == 0) {
+        draw_text(px, x + 12, y + h / 2 - 8, "no sample", COL_MUTED, 2);
         return;
+    }
 
     const EpicycleSample *s = pad->sample;
+    float w0 = pad->mod_window_start;
+    float w1 = pad->mod_window_start + pad->mod_window_length;
+    if (w1 > 1.0f)
+        w1 = 1.0f;
+
+    /* Dim fill under the live brace. */
+    int bx0 = x + (int)(w0 * (float)w);
+    int bx1 = x + (int)(w1 * (float)w);
+    if (bx1 < bx0 + 2)
+        bx1 = bx0 + 2;
+    fill_rect(px, bx0, y, bx1 - bx0, h, COL_BRACE_FILL);
+
     for (int col = 0; col < w; col++) {
         size_t i0 = (size_t)col * s->frames / (size_t)w;
         size_t i1 = (size_t)(col + 1) * s->frames / (size_t)w;
@@ -222,26 +238,35 @@ static void draw_waveform(uint32_t *px, const EpicyclePad *pad, int x, int y, in
             if (a > peak)
                 peak = a;
         }
-        int amp = (int)(peak * (float)(h / 2 - 1));
+        int amp = (int)(peak * (float)(h / 2 - 2));
         if (amp < 1)
             amp = 1;
-        fill_rect(px, x + col, y + h / 2 - amp, 1, amp * 2, COL_WAVE);
+        float t = (float)col / (float)w;
+        uint32_t c = (t >= w0 && t <= w1) ? COL_WAVE : COL_WAVE_DIM;
+        fill_rect(px, x + col, y + h / 2 - amp, 1, amp * 2, c);
     }
 
-    /* Base brace (user) and modulated window (live). */
-    int bx = x + (int)(pad->window_start * (float)w);
-    int bw = (int)(pad->window_length * (float)w);
-    if (bw < 2)
-        bw = 2;
-    fill_rect(px, bx, y, 2, h, COL_BRACE);
-    fill_rect(px, bx + bw - 2, y, 2, h, COL_BRACE);
-    fill_rect(px, bx, y, bw, 2, COL_BRACE);
+    /* Brace edges + top rail (user window in brace color). */
+    int ux = x + (int)(pad->window_start * (float)w);
+    int uw = (int)(pad->window_length * (float)w);
+    if (uw < 3)
+        uw = 3;
+    fill_rect(px, ux, y, 3, h, COL_BRACE);
+    fill_rect(px, ux + uw - 3, y, 3, h, COL_BRACE);
+    fill_rect(px, ux, y, uw, 3, COL_BRACE);
+    fill_rect(px, ux, y + h - 3, uw, 3, COL_BRACE);
 
-    int mx = x + (int)(pad->mod_window_start * (float)w);
-    int mw = (int)(pad->mod_window_length * (float)w);
-    if (mw < 2)
-        mw = 2;
-    fill_rect(px, mx, y + h - 3, mw, 3, COL_MOD);
+    /* Modulated window marker along the bottom. */
+    fill_rect(px, bx0, y + h - 5, bx1 - bx0, 5, COL_MOD);
+
+    if (playhead >= 0.0f) {
+        int pxh = x + (int)(playhead * (float)w);
+        if (pxh < x)
+            pxh = x;
+        if (pxh >= x + w)
+            pxh = x + w - 1;
+        fill_rect(px, pxh, y, 2, h, COL_PLAY);
+    }
 }
 
 void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
@@ -249,76 +274,76 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
 {
     uint32_t *px = display_pixels();
     display_clear(COL_BG);
+    (void)hw;
 
-    fill_rect(px, 0, 0, EPICYCLE_FB_W, 3, COL_ACCENT);
-    draw_text(px, 8, 8, "EPICYCLE", COL_FG, 2);
-
-    char line[56];
-    if (eng)
-        snprintf(line, sizeof line, "%3.0f bpm", (double)eng->tempo_bpm);
-    else
-        snprintf(line, sizeof line, "--- bpm");
-    draw_text(px, 160, 12, line, COL_MUTED, 1);
-
-    snprintf(line, sizeof line, "%s", hw && hw->audio_ok ? "alsa" : "silent");
-    draw_text(px, 250, 12, line, hw && hw->audio_ok ? COL_OK : COL_MUTED, 1);
-
-    /* Compact 4×4 pad grid */
-    const int grid_x = 8, grid_y = 36, cell = 22, gap = 3;
     int sel = eng ? eng->selected_pad : 0;
-    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        int col = i % 4;
-        int row = i / 4;
-        int x = grid_x + col * (cell + gap);
-        int y = grid_y + row * (cell + gap);
-        int on = surf && surf->pad_vel[i] > 0;
-        uint32_t c = COL_PAD_OFF;
-        if (i == sel)
-            c = COL_PAD_SEL;
-        if (on)
-            c = COL_PAD_ON;
-        fill_rect(px, x, y, cell, cell, c);
-        if (eng && eng->pads[i].sample)
-            fill_rect(px, x + 2, y + cell - 4, cell - 4, 2, COL_ACCENT);
-    }
+    const EpicyclePad *pad =
+        (eng && sel >= 0 && sel < EPICYCLE_PAD_COUNT) ? &eng->pads[sel] : NULL;
 
-    const EpicyclePad *pad = (eng && sel >= 0 && sel < EPICYCLE_PAD_COUNT) ? &eng->pads[sel] : NULL;
+    /* Soft-key labels under the three physical keys (big, scannable). */
+    draw_text(px, 8, 4, "FREE/DIV", COL_SOFT, 2);
+    draw_text(px, 130, 4, "LFO", COL_SOFT, 2);
+    draw_text(px, 230, 4, "QUIT", COL_MUTED, 2);
 
-    /* Waveform + brace */
-    draw_waveform(px, pad, 120, 36, 192, 56);
-
+    char line[48];
+    /* Selected pad + mode + tempo — one short header, no brand chrome. */
     if (pad) {
-        snprintf(line, sizeof line, "pad %d", sel + 1);
-        draw_text(px, 120, 96, line, COL_FG, 1);
-        if (pad->sample && pad->sample->name[0])
-            draw_text(px, 170, 96, pad->sample->name, COL_MUTED, 1);
-
         if (pad->freeform)
-            snprintf(line, sizeof line, "FREE win %.2f+%.2f", (double)pad->window_start,
-                     (double)pad->window_length);
+            snprintf(line, sizeof line, "PAD %d  FREE", sel + 1);
         else
-            snprintf(line, sizeof line, "DIV %db win %.2f", pad->division_beats,
-                     (double)pad->window_start);
-        draw_text(px, 8, 148, line, COL_FG, 1);
-
-        snprintf(line, sizeof line, "xf %.2f  pitch %d:%d:%+.0f", (double)pad->crossfade,
-                 pad->octave, pad->semitone, (double)pad->fine);
-        draw_text(px, 8, 162, line, COL_MUTED, 1);
-
-        int lfo_on = pad->lfos[0].enabled && pad->lfos[0].depth > 0;
-        snprintf(line, sizeof line, "LFO %s scrub %s  matrix ok", lfo_on ? "on" : "off",
-                 pad->allow_scrub ? "yes" : "cap");
-        draw_text(px, 8, 176, line, lfo_on ? COL_MOD : COL_MUTED, 1);
+            snprintf(line, sizeof line, "PAD %d  DIV %d", sel + 1, pad->division_beats);
+    } else {
+        snprintf(line, sizeof line, "PAD %d", sel + 1);
     }
+    draw_text(px, 8, 28, line, COL_FG, 2);
 
-    /* Knob legend */
-    draw_text(px, 8, 194, "K1 start  K2 len/div  K3 xfade", COL_MUTED, 1);
-    draw_text(px, 8, 210, "softL free/div  softM LFO  wheel quit", COL_MUTED, 1);
+    if (eng)
+        snprintf(line, sizeof line, "%3.0f", (double)eng->tempo_bpm);
+    else
+        snprintf(line, sizeof line, "---");
+    draw_text(px, 248, 28, line, COL_MUTED, 2);
+    draw_text(px, 290, 32, "bpm", COL_MUTED, 1);
+
+    if (surf && surf->sample_held)
+        draw_text(px, 200, 28, "SEL", COL_BRACE, 2);
+
+    float playhead = eng ? engine_pad_playhead(eng, sel) : -1.0f;
+    /* Large waveform: nearly full width, ~half the screen. */
+    draw_waveform(px, pad, playhead, 4, 52, 312, 118);
+
+    /* Bottom readouts: start / end / position at readable size. */
+    float start = pad ? pad->window_start : 0.0f;
+    float len = pad ? pad->window_length : 0.0f;
+    float end = start + len;
+    if (end > 1.0f)
+        end = 1.0f;
+    float pos = playhead >= 0.0f ? playhead : start;
+
+    draw_text(px, 8, 178, "START", COL_MUTED, 1);
+    draw_text(px, 118, 178, "END", COL_MUTED, 1);
+    draw_text(px, 220, 178, "POS", COL_MUTED, 1);
+
+    snprintf(line, sizeof line, "%.2f", (double)start);
+    draw_text(px, 8, 190, line, COL_FG, 3);
+    snprintf(line, sizeof line, "%.2f", (double)end);
+    draw_text(px, 118, 190, line, COL_FG, 3);
+    snprintf(line, sizeof line, "%.2f", (double)pos);
+    draw_text(px, 220, 190, line, COL_BRACE, 3);
+
+    /* Knob legend + meters. */
+    draw_text(px, 8, 218, "K1 start", COL_MUTED, 1);
+    draw_text(px, 100, 218, "K2 len", COL_MUTED, 1);
+    draw_text(px, 180, 218, "K3 xfade", COL_MUTED, 1);
+    if (pad && pad->lfos[0].enabled && pad->lfos[0].depth > 0)
+        draw_text(px, 268, 218, "LFO", COL_MOD, 1);
+    else
+        draw_text(px, 268, 218, "LFO", COL_MUTED, 1);
+
     if (surf) {
-        fill_rect(px, 250, 194, (int)surf->k1 / 2, 4, COL_ACCENT);
-        fill_rect(px, 250, 202, (int)surf->k2 / 2, 4, COL_ACCENT);
-        fill_rect(px, 250, 210, (int)surf->k3 / 2, 4, COL_BRACE);
+        fill_rect(px, 8, 230, 1 + (int)surf->k1 * 80 / 127, 6, COL_ACCENT);
+        fill_rect(px, 100, 230, 1 + (int)surf->k2 * 70 / 127, 6, COL_ACCENT);
+        fill_rect(px, 180, 230, 1 + (int)surf->k3 * 70 / 127, 6, COL_BRACE);
     }
-    fill_rect(px, 0, EPICYCLE_FB_H - 3, EPICYCLE_FB_W, 3, COL_ACCENT);
+
     display_present();
 }
