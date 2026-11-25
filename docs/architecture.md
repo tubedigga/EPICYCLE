@@ -11,7 +11,7 @@ Power on
      1.3: autorun.check → autorun/autorun.sh
   → launcher copies binary to /run, stops ac50, runs epicycle
   → display (/dev/fb0) + I2S ALSA + Surface MIDI
-  → splash → loop UI (pads / waveform brace / knobs)
+  → splash → loop UI (large waveform + brace / knobs)
   → audio thread ← engine_render (16 voices, crossfade loops)
   → wheel push → clean close
   → systemctl start ac50
@@ -30,15 +30,16 @@ Power on
   realtime thread calls `engine_render` when an engine is bound; `DROP` on close.
   Main Volume (CC19, squared) × fader (CC20, linear) → `master_gain` (0 = silence).
 - **surface** — Control Surface raw MIDI: pads (note map + LED SysEx I=pad−1),
-  K1–K3, Main Volume CC19, fader CC20, soft keys (free/div, LFO), wheel scroll/quit,
-  lights off + latch reconcile, position-request SysEx `0x42`.
+  SAMPLE button (ch1 note 6) for select-hold, K1–K3, Main Volume CC19, fader CC20,
+  soft keys (free/div, LFO), wheel scroll/quit, selected-pad amber LED, position
+  SysEx `0x42`. Map from sample-base `controls.h` / HARDWARE.md (MIT rewrite only).
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
 - **engine** — 16 pads × scrollable brace window; division (1–32 beats) or freeform;
-  pitch (oct/semi/fine); crossfade loopers; 16 voices; 2 LFOs + 4 mod routes per pad;
-  brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8).
-- **ui** — Ash boot logo (320×226 letterboxed on 320×240 black) + optional status;
-  loop screen (grid, waveform, brace, knob legend).
+  pitch (oct/semi/fine); crossfade loopers; 16 voices with note-off + steal;
+  2 LFOs + 4 mod routes per pad; brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8).
+- **ui** — Ash boot logo splash; loop screen = one large waveform + brace, soft-key
+  labels, START/END/POS readouts (no pad grid / no brand chrome).
 
 ## Loop brace / modulation
 

@@ -385,9 +385,33 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
 
 void engine_note_off(EpicycleEngine *eng, int pad)
 {
-    /* Loops keep running; one-shots already decay. Gate-off reserved. */
-    (void)eng;
-    (void)pad;
+    /* Pad release stops that pad's voice(s) so demo layers don't stack forever. */
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+        if (eng->voices[i].active && eng->voices[i].pad_index == pad)
+            eng->voices[i].active = 0;
+    }
+}
+
+float engine_pad_playhead(const EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return -1.0f;
+    const EpicyclePad *p = &eng->pads[pad];
+    if (!p->sample || !p->sample->data || p->sample->frames == 0)
+        return -1.0f;
+    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+        if (!eng->voices[i].active || eng->voices[i].pad_index != pad)
+            continue;
+        double ph = eng->voices[i].phase / (double)p->sample->frames;
+        if (ph < 0.0)
+            ph = 0.0;
+        if (ph > 1.0)
+            ph = 1.0;
+        return (float)ph;
+    }
+    return -1.0f;
 }
 
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3)

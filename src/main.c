@@ -2,6 +2,7 @@
  *
  * EPICYCLE loop engine — load samples to pads, edit scrollable brace with
  * knobs, time-division or free-run against tempo, hear sync/polymeter.
+ * Hold SAMPLE + pad = select (no sound); plain pad = play; pad up = note-off.
  * Soft-left toggles free/div; soft-mid toggles LFO brace scrub on selected pad.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -31,7 +32,7 @@ static void usage(const char *argv0)
             "  --demo       synth demo tones onto pads (host / no card samples)\n"
             "  --wav PATH   load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: pads play; knobs edit brace; wheel push quits.\n",
+            "  On device: SAMPLE+pad selects; pad plays; knobs edit brace; wheel push quits.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -291,6 +292,7 @@ int main(int argc, char **argv)
     engine_set_fader_gain_cc(&eng, surface_state()->fader);
     last_main = surface_state()->main_vol;
     last_fader = surface_state()->fader;
+    surface_set_selected_pad(eng.selected_pad);
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -302,13 +304,24 @@ int main(int argc, char **argv)
         for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
             if (st->pad_down[i]) {
                 st->pad_down[i] = 0;
-                eng.selected_pad = i;
-                float vel = surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
-                engine_note_on(&eng, i, vel);
+                if (surf->sample_held) {
+                    /* SAMPLE + pad: select focus only (no trigger). */
+                    eng.selected_pad = i;
+                    surface_set_selected_pad(i);
+                } else {
+                    /* Plain pad hit: play; selection unchanged. */
+                    float vel =
+                        surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
+                    engine_note_on(&eng, i, vel);
+                }
             }
-            /* Note-off / light clear path: velocity fell to 0. */
-            if (last_pad_vel[i] > 0 && surf->pad_vel[i] == 0)
+            if (st->pad_up[i]) {
+                st->pad_up[i] = 0;
+                /* Release stops the voice so demo pads don't stack forever. */
                 engine_note_off(&eng, i);
+            } else if (last_pad_vel[i] > 0 && surf->pad_vel[i] == 0) {
+                engine_note_off(&eng, i);
+            }
             last_pad_vel[i] = surf->pad_vel[i];
         }
 

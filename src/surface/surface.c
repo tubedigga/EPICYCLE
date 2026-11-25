@@ -2,12 +2,14 @@
  *
  * Control-surface MIDI (UART3 raw MIDI / ALSA card "Surface").
  * Published map facts from SampleBoot TECHNICAL.md and sample-base HARDWARE.md
- * (do not reverse stock for these; do not vendor AGPL headers):
+ * / controls.h (do not reverse stock; do not vendor AGPL headers):
  *   - pads: channel 10, notes 37,36,42,82,40,38,46,44,48,47,45,43,49,55,51,53
  *   - pad LED SysEx I = printed pad − 1 (0..15); fader light I=16
  *   - knobs K1–K3: CC 16/17/18; main volume CC 19; fader CC 20 (channel 1)
  *   - wheel: CC 100 relative; wheel push ≈ note 111
+ *   - SAMPLE mode button: channel 1 note 6 (SEQ=7, Pad FX=1, Knob FX=0)
  * Soft keys above the screen: notes 12/13/14 — right soft key also quits.
+ * Hold SAMPLE + pad = select (app); plain pad = play. Pad LEDs show selection.
  * On open: clear leftover lights + send position-request SysEx 0x42.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -32,9 +34,13 @@ static const uint8_t PAD_NOTES[EPICYCLE_PAD_COUNT] = {
 static const uint8_t BUTTON_LED_CCS[] = {
     6, 7, 1, 0, 35, 9, 11, 75, 43, 74, 40, 36, 53, 73, 80, 81, 82};
 
+/* SAMPLE mode button — sample-base controls.h / HARDWARE.md. */
+enum { NOTE_SAMPLE = 6 };
+
 static int g_fd = -1;
 static EpicycleSurfaceState g_state;
 static char g_info[64] = "surface closed";
+static int g_selected_pad;
 
 /* MIDI parser */
 static int m_status, m_need, m_n, m_sysex;
@@ -121,14 +127,38 @@ static void light_pad(int fd, int pad /* 0..15 */, uint8_t r, uint8_t g, uint8_t
         g_pad_lit[pad] = (r | g | b) ? 1 : 0;
 }
 
-/* Clear any pad LED that is lit while pad_vel==0 (missed note-off / latch). */
+/* Button LED: channel-1 CC = button note; 0 off, 1 dim, 2 full (HARDWARE.md). */
+static void light_button(int fd, uint8_t note_cc, uint8_t level)
+{
+    if (fd < 0)
+        return;
+    uint8_t m[] = {0xb0, note_cc, level};
+    (void)midi_write_all(fd, m, sizeof m);
+}
+
+static void refresh_pad_led(int pad)
+{
+    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    if (g_state.pad_vel[pad] > 0)
+        light_pad(g_fd, pad, 40, 180, 160); /* playing */
+    else if (pad == g_selected_pad)
+        light_pad(g_fd, pad, 200, 140, 40); /* selected amber */
+    else
+        light_pad(g_fd, pad, 0, 0, 0);
+}
+
+/* Clear stuck play LEDs; keep selected-pad amber when idle. */
 static void sync_pad_lights(int fd)
 {
     if (fd < 0)
         return;
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        if (g_pad_lit[i] && g_state.pad_vel[i] == 0)
+        int want_lit = (g_state.pad_vel[i] > 0) || (i == g_selected_pad);
+        if (g_pad_lit[i] && !want_lit)
             light_pad(fd, i, 0, 0, 0);
+        else if (!g_pad_lit[i] && want_lit && g_state.pad_vel[i] == 0 && i == g_selected_pad)
+            light_pad(fd, i, 200, 140, 40);
     }
 }
 
@@ -214,8 +244,14 @@ static void midi_feed(uint8_t b)
 
     if (ch == 0 && (cmd == 0x90 || cmd == 0x80)) {
         /* Channel 1 buttons. Wheel push = note 111; soft-right = 14.
-         * Soft-left (12) = toggle free/division; soft-mid (13) = toggle LFO scrub. */
+         * Soft-left (12) = toggle free/division; soft-mid (13) = toggle LFO scrub.
+         * SAMPLE (6) held + pad = select without play (handled in main). */
         int on = (cmd == 0x90 && m_d[1] > 0);
+        if (m_d[0] == NOTE_SAMPLE) {
+            g_state.sample_held = on ? 1 : 0;
+            light_button(g_fd, NOTE_SAMPLE, on ? 2 : 0);
+            return;
+        }
         if (on && (m_d[0] == 111 || m_d[0] == 14))
             g_state.quit_requested = 1;
         if (on && m_d[0] == 12)
@@ -239,11 +275,13 @@ static void midi_feed(uint8_t b)
         if (cmd == 0x90 && m_d[1] > 0) {
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1; /* edge for note-on; app clears */
-            light_pad(g_fd, idx, 40, 180, 160);
+            refresh_pad_led(idx);
         } else {
-            /* note-off (0x80) or note-on vel 0 — clear LED + velocity */
+            /* note-off (0x80) or note-on vel 0 */
+            if (g_state.pad_vel[idx] > 0)
+                g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
-            light_pad(g_fd, idx, 0, 0, 0);
+            refresh_pad_led(idx);
         }
     }
 }
@@ -252,6 +290,7 @@ int surface_open(void)
 {
     memset(&g_state, 0, sizeof g_state);
     memset(g_pad_lit, 0, sizeof g_pad_lit);
+    g_selected_pad = 0;
     g_state.main_vol = 100;
     g_state.fader = 127; /* full until first CC20 — bottom will silence */
     g_fd = -1;
@@ -344,4 +383,16 @@ EpicycleSurfaceState *surface_state_mut(void)
 const char *surface_info(void)
 {
     return g_info;
+}
+
+void surface_set_selected_pad(int pad)
+{
+    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    if (pad == g_selected_pad)
+        return;
+    int prev = g_selected_pad;
+    g_selected_pad = pad;
+    refresh_pad_led(prev);
+    refresh_pad_led(pad);
 }

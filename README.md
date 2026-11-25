@@ -6,7 +6,7 @@ Per pad: sample **start / end / loop brace** (a **window** you can scroll across
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.2.3-display-drm` — after `ac50` stop, `/dev/fb0` is gone on 1.4; display now prefers DRM `/dev/dri/card0` dumb buffers + `DIRTYFB`. Also: pad LED latch (running-status after SysEx), fader→silence. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
+> **Status:** `0.2.4-loop-ui` — large waveform UI (no pad grid / brand chrome); hold **SAMPLE** + pad to select; pad note-off stops voices. DRM display from 0.2.3 kept. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
 
 ## Update the SD card (Ash — firmware 1.4)
 
@@ -17,7 +17,7 @@ Replace the **autorun payload only**; keep your `Epicycle/` user data.
 3. On the card root, **delete or rename** the old `autorun/` folder (and old top-level `autorun.sh` if present).
 4. Copy the new `autorun.sh` + `autorun/` onto the card root. Leave `Epicycle/` alone (projects / samples / logs stay).
 5. Reinsert → power on → Developer Mode autorun prompt → **Yes**.
-6. Expect: boot logo splash → loop UI on screen; pad N lights pad N; **Main Volume** + **fader** (bottom = silence); pads play. Paste `Epicycle/logs/last-session.log` (look for `display: drm … dirtyfb` or `display-diag:`).
+6. Expect: boot splash → large waveform UI; **SAMPLE+pad** selects; plain pad plays while held; **Main Volume** + fader. Paste `Epicycle/logs/last-session.log`.
 
 Rollback: remove the card, or rename `autorun` → `autorun-off`.
 
@@ -51,12 +51,12 @@ make test-host    # demo bank + non-silent preview WAV check
 
 ### What you should try on the device
 
-1. Boot splash (Ash logo, letterboxed on black) → loop screen — must not stay black.
-2. **Hit pads** — hear loops; **pad LED must match** the pad you hit. Demo: pads **1–2** synced 4-beat; **3–4** = 3 vs 5.
-3. **Main Volume** (CC19) and **control fader** (CC20) set loudness; fader at bottom = silence.
-4. **Select a pad**, then **K1** scroll brace, **K2** length/division, **K3** crossfade.
-5. **Left soft key** toggles free vs division; **middle soft key** toggles LFO brace scrub (~8 scrub budget).
-6. Wheel nudge scrolls; **push the wheel** (or right soft key) → quit to stock.
+1. Boot splash → **large waveform** loop screen (no 16-pad grid, no top-left EPICYCLE chrome).
+2. **Hold SAMPLE + pad** = select (no sound); amber pad LED = selection. Plain pad = play while held; release = stop.
+3. Selected pad: big brace; bottom **START / END / POS** at readable size.
+4. **K1** start/slide, **K2** length (or division when locked), **K3** crossfade.
+5. Soft keys (on-screen labels): **FREE/DIV**, **LFO**, right = quit. Wheel nudge scrolls; wheel push quits.
+6. **Main Volume** (CC19) + fader (CC20; bottom = silence). Demo: pads 1–2 synced 4-beat; 3–4 = 3 vs 5.
 
 Session log: `Epicycle/logs/last-session.log` on the card.
 

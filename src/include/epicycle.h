@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.3-display-drm"
+#define EPICYCLE_VERSION "0.2.4-loop-ui"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -127,6 +127,7 @@ typedef struct EpicycleEngine {
 typedef struct EpicycleSurfaceState {
     uint8_t pad_vel[EPICYCLE_PAD_COUNT]; /* 0 = up, else last strike velocity */
     uint8_t pad_down[EPICYCLE_PAD_COUNT]; /* edge-detect helper cleared by app */
+    uint8_t pad_up[EPICYCLE_PAD_COUNT];   /* edge on release; app clears */
     uint8_t k1, k2, k3;                  /* CC 16 / 17 / 18 */
     uint8_t main_vol;                    /* CC 19 */
     uint8_t fader;                        /* CC 20 */
@@ -134,6 +135,7 @@ typedef struct EpicycleSurfaceState {
     int quit_requested;                  /* wheel push / soft-key quit */
     int soft_left;                       /* note 12 edge */
     int soft_mid;                        /* note 13 edge */
+    int sample_held;                     /* SAMPLE mode button (ch1 note 6) */
     int open;                            /* 1 if MIDI port bound */
 } EpicycleSurfaceState;
 
@@ -179,6 +181,8 @@ int surface_poll_quit(void);
 const EpicycleSurfaceState *surface_state(void);
 EpicycleSurfaceState *surface_state_mut(void);
 const char *surface_info(void);
+/* Keep selected-pad LED amber when not struck (pad LEDs = active focus). */
+void surface_set_selected_pad(int pad /* 0..15 */);
 
 /* samples */
 void sample_free(EpicycleSample *s);
@@ -195,7 +199,9 @@ void engine_set_division(EpicycleEngine *eng, int pad, int beats); /* 0 = freefo
 void engine_set_window(EpicycleEngine *eng, int pad, float start, float length);
 void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float fine);
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
-void engine_note_off(EpicycleEngine *eng, int pad);
+void engine_note_off(EpicycleEngine *eng, int pad); /* stop that pad's voice(s) */
+/* Playhead 0..1 in sample, or -1 if pad has no active voice. */
+float engine_pad_playhead(const EpicycleEngine *eng, int pad);
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3);
 void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* squared taper */
 void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* linear; 0 = silence */
