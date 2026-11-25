@@ -746,16 +746,29 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             draw_text(px, UI_COL0, 168, "START", COL_MUTED, 2);
             draw_text(px, UI_COL1, 168, "END", COL_MUTED, 2);
             draw_text(px, UI_COL2, 168, "POS", COL_MUTED, 2);
-            snprintf(line, sizeof line, "%.2f", (double)start);
-            draw_text(px, UI_COL0, 184, line, COL_FG, 3);
-            snprintf(line, sizeof line, "%.2f", (double)end);
-            draw_text(px, UI_COL1, 184, line, COL_FG, 3);
+            /* Show more digits when brace is tiny so Ash sees grain close. */
+            if (len < 0.05f) {
+                snprintf(line, sizeof line, "%.3f", (double)start);
+                draw_text(px, UI_COL0, 184, line, COL_FG, 2);
+                snprintf(line, sizeof line, "%.3f", (double)end);
+                draw_text(px, UI_COL1, 184, line, COL_FG, 2);
+            } else {
+                snprintf(line, sizeof line, "%.2f", (double)start);
+                draw_text(px, UI_COL0, 184, line, COL_FG, 3);
+                snprintf(line, sizeof line, "%.2f", (double)end);
+                draw_text(px, UI_COL1, 184, line, COL_FG, 3);
+            }
             snprintf(line, sizeof line, "%.2f", (double)pos);
             draw_text(px, UI_COL2, 184, line, COL_BRACE, 3);
             /* Large FREE / DIVn badge — encoder push toggles (Ash discoverability). */
             if (pad && pad->freeform) {
                 draw_text(px, 214, 52, "FREE", COL_BRACE, 3);
-                draw_text(px, 8, 212, "K1/K2 frame-fine  K3 slide", COL_MUTED, 1);
+                if (len < 0.01f) {
+                    draw_text(px, 214, 78, "GRN", COL_MOD, 2);
+                    snprintf(line, sizeof line, "w=%.4f", (double)len);
+                    draw_text(px, 248, 82, line, COL_MUTED, 1);
+                }
+                draw_text(px, 8, 212, "K1/K2 close to line  K3/LFO scrub", COL_MUTED, 1);
                 draw_text(px, 8, 226, "ENC fine edge  push=DIV  SHIFT xfade", COL_MUTED, 1);
             } else {
                 snprintf(line, sizeof line, "DIV%d",
