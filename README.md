@@ -38,7 +38,7 @@ make test-host    # demo bank + non-silent preview WAV check
 
 ### What you should try on the device
 
-1. Short **EPICYCLE** splash → loop screen (pad grid + waveform brace).
+1. Boot splash (Ash logo, letterboxed on black) → loop screen (pad grid + waveform brace).
 2. **Hit pads** — hear loops. Demo bank: pads **1–2** share a 4-beat division (synced braces); pads **3–4** are **3 vs 5** beats (polymeter).
 3. **Select a pad** (hit it), then turn **K1** to scroll the brace window, **K2** for length (free) or division 1–32 (locked), **K3** for crossfade.
 4. **Left soft key** (above screen) toggles **free vs division**. **Middle soft key** toggles **LFO brace scrub** on the selected pad (first ~8 scrubbing pads only; others stay static).
