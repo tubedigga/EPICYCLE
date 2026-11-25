@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.1-tombola-fix"
+#define EPICYCLE_VERSION "0.3.2-tombola-polish"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -192,12 +192,12 @@ typedef struct EpicycleTombolaBall {
 
 typedef struct EpicycleTombola {
     EpicycleTombolaBall balls[EPICYCLE_PAD_COUNT];
-    float morph;      /* 0..1 K1: circle → more faces */
+    float morph;      /* 0..1 fader: circle → more faces */
     float spin_rad;   /* container rotation */
     float spin_speed; /* rad/s from K2 (signed: +CW / −CCW) */
     float radius;
     int face_count; /* 0 = circle, else 3..16 */
-    int ball_target; /* last K3 count request 0..16 (−1 = MUTE-only) */
+    int ball_target; /* last MUTE compose count 0..16 */
     /* Hit queue drained by main each tick */
     int hit_pad[EPICYCLE_PAD_COUNT];
     float hit_vel[EPICYCLE_PAD_COUNT];
@@ -375,7 +375,7 @@ EpicycleTombola *tombola_state(void);
 void tombola_set_morph(EpicycleTombola *tb, float morph01);
 /* K2: bipolar spin — 0 = max CCW, 64 ≈ stop, 127 = max CW. */
 void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k2);
-/* K3: activate first N balls (0..16); MUTE+pad still toggles individually. */
+/* Host/preview helper: activate first N balls. Device compose = MUTE+pad only. */
 void tombola_set_ball_count(EpicycleTombola *tb, int count);
 int tombola_active_count(const EpicycleTombola *tb);
 void tombola_toggle_ball(EpicycleTombola *tb, int pad);

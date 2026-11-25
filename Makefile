@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.3.1-tombola-fix
+VERSION    := 0.3.2-tombola-polish
 BUILD      := build
 DIST       := dist
 

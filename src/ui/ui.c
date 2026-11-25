@@ -5,9 +5,23 @@
  */
 #include "epicycle.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static float clampf_ui(float v)
+{
+    if (v < 0.0f)
+        return 0.0f;
+    if (v > 1.0f)
+        return 1.0f;
+    return v;
+}
 
 /* Cached splash logo (decoded once). */
 static uint32_t *g_logo;
@@ -353,7 +367,34 @@ static void put_px(uint32_t *px, int x, int y, uint32_t c)
     px[y * EPICYCLE_FB_W + x] = c;
 }
 
-/* Bresenham line with mild thickness for smoother polygon edges. */
+static uint32_t blend_rgb(uint32_t a, uint32_t b, float t)
+{
+    if (t <= 0.0f)
+        return a;
+    if (t >= 1.0f)
+        return b;
+    int ar = (int)((a >> 16) & 0xff), ag = (int)((a >> 8) & 0xff), ab = (int)(a & 0xff);
+    int br = (int)((b >> 16) & 0xff), bg = (int)((b >> 8) & 0xff), bb = (int)(b & 0xff);
+    int r = ar + (int)((float)(br - ar) * t);
+    int g = ag + (int)((float)(bg - ag) * t);
+    int bl = ab + (int)((float)(bb - ab) * t);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;
+}
+
+/* Soft put — blends toward colour for anti-aliased edges. */
+static void put_px_soft(uint32_t *px, int x, int y, uint32_t c, float a)
+{
+    if (x < 0 || y < 0 || x >= EPICYCLE_FB_W || y >= EPICYCLE_FB_H || a <= 0.0f)
+        return;
+    if (a >= 0.95f) {
+        put_px(px, x, y, c);
+        return;
+    }
+    uint32_t *dst = &px[y * EPICYCLE_FB_W + x];
+    *dst = blend_rgb(*dst, c, a);
+}
+
+/* Bresenham line with soft thickness for smoother polygon edges. */
 static void draw_line(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
 {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
@@ -361,8 +402,10 @@ static void draw_line(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
     int err = dx + dy;
     for (;;) {
         put_px(px, x0, y0, c);
-        put_px(px, x0 + 1, y0, c);
-        put_px(px, x0, y0 + 1, c);
+        put_px_soft(px, x0 + 1, y0, c, 0.55f);
+        put_px_soft(px, x0, y0 + 1, c, 0.55f);
+        put_px_soft(px, x0 - 1, y0, c, 0.35f);
+        put_px_soft(px, x0, y0 - 1, c, 0.35f);
         if (x0 == x1 && y0 == y1)
             break;
         int e2 = 2 * err;
@@ -397,43 +440,56 @@ static uint32_t shade_rgb(uint32_t c, float lit)
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
-/* Shaded sphere (not a flat square/disk) — NW highlight for 3D read. */
+/* Shaded sphere with soft edge — proper sqrt z, NW light, specular. */
 static void fill_sphere(uint32_t *px, int cx, int cy, int r, uint32_t base)
 {
     if (r < 1)
         r = 1;
-    int r2 = r * r;
-    float inv_r = 1.0f / (float)r;
-    for (int y = -r; y <= r; y++) {
-        for (int x = -r; x <= r; x++) {
-            int d2 = x * x + y * y;
-            if (d2 > r2)
+    float rf = (float)r;
+    float inv_r = 1.0f / rf;
+    int r_outer = r + 1;
+    for (int y = -r_outer; y <= r_outer; y++) {
+        for (int x = -r_outer; x <= r_outer; x++) {
+            float fx = (float)x + 0.5f;
+            float fy = (float)y + 0.5f;
+            float d = sqrtf(fx * fx + fy * fy);
+            if (d > rf + 1.0f)
                 continue;
-            float nx = (float)x * inv_r;
-            float ny = (float)y * inv_r;
+            float edge_a = 1.0f;
+            if (d > rf - 0.6f)
+                edge_a = clampf_ui((rf + 0.4f - d) / 1.0f); /* soft rim */
+            if (edge_a <= 0.0f)
+                continue;
+            float nx = fx * inv_r;
+            float ny = fy * inv_r;
             float nz2 = 1.0f - nx * nx - ny * ny;
-            float nz = nz2 > 0.0f ? nz2 : 0.0f; /* cheap sqrt-ish via clamp */
-            /* Approximate sqrt for z: two Newton-ish steps enough for look. */
-            if (nz > 0.0f) {
-                float z = nz;
-                z = 0.5f * (z + nz / (z > 1e-4f ? z : 1e-4f));
-                z = 0.5f * (z + nz / (z > 1e-4f ? z : 1e-4f));
-                nz = z;
-            }
+            float nz = nz2 > 0.0f ? sqrtf(nz2) : 0.0f;
             /* Light from upper-left. */
-            float lit = 0.28f + 0.72f * (0.55f * (-nx) + 0.35f * (-ny) + 0.75f * nz);
-            if (lit < 0.12f)
-                lit = 0.12f;
-            if (lit > 1.15f)
-                lit = 1.15f;
+            float lit = 0.22f + 0.78f * (0.50f * (-nx) + 0.32f * (-ny) + 0.80f * nz);
+            if (lit < 0.10f)
+                lit = 0.10f;
             /* Specular hotspot. */
-            float hx = nx + 0.35f, hy = ny + 0.4f, hz = nz - 0.9f;
-            float hs = hx * hx + hy * hy + hz * hz;
-            if (hs < 0.12f)
-                lit += (0.12f - hs) * 3.5f;
-            if (lit > 1.35f)
-                lit = 1.35f;
-            put_px(px, cx + x, cy + y, shade_rgb(base, lit));
+            float hx = -nx * 0.4f + 0.3f;
+            float hy = -ny * 0.4f + 0.45f;
+            float hz = nz - 0.75f;
+            float hn = sqrtf(hx * hx + hy * hy + hz * hz);
+            if (hn > 1e-4f) {
+                hx /= hn;
+                hy /= hn;
+                hz /= hn;
+            }
+            float spec = hx * 0.35f + hy * 0.4f + hz * 0.85f;
+            if (spec > 0.0f) {
+                float s2 = spec * spec;
+                lit += s2 * s2 * 0.55f;
+            }
+            if (lit > 1.45f)
+                lit = 1.45f;
+            uint32_t col = shade_rgb(base, lit);
+            if (edge_a >= 0.95f)
+                put_px(px, cx + x, cy + y, col);
+            else
+                put_px_soft(px, cx + x, cy + y, col, edge_a);
         }
     }
 }
@@ -443,24 +499,68 @@ static void stroke_disk(uint32_t *px, int cx, int cy, int r, uint32_t c)
 {
     if (r < 2)
         return;
-    int r2 = r * r;
-    int rin = (r - 1) * (r - 1);
-    for (int y = -r; y <= r; y++) {
-        for (int x = -r; x <= r; x++) {
-            int d = x * x + y * y;
-            if (d <= r2 && d >= rin)
-                put_px(px, cx + x, cy + y, c);
+    float rf = (float)r;
+    for (int y = -r - 1; y <= r + 1; y++) {
+        for (int x = -r - 1; x <= r + 1; x++) {
+            float d = sqrtf((float)(x * x + y * y));
+            float a = 1.0f - fabsf(d - rf);
+            if (a <= 0.0f)
+                continue;
+            if (a > 1.0f)
+                a = 1.0f;
+            put_px_soft(px, cx + x, cy + y, c, a * 0.85f);
         }
     }
 }
 
+/* Morph-smooth outline: dense sampling + corner rounding toward circle. */
+static void tombola_smooth_edge(const EpicycleTombola *tb, float t01, float *ox, float *oy)
+{
+    float R = tb->radius;
+    int faces = tb->face_count;
+    float ang = t01 * (float)(2.0 * M_PI) + tb->spin_rad;
+    if (faces <= 0) {
+        *ox = cosf(ang) * R;
+        *oy = sinf(ang) * R;
+        return;
+    }
+    /* Blend N-gon with circle for smoother morph (Ash: less lo-fi). */
+    float morph = tb->morph;
+    float blend = 0.0f;
+    if (morph < 0.04f)
+        blend = 1.0f;
+    else if (morph < 0.18f)
+        blend = 1.0f - (morph - 0.04f) / 0.14f;
+    float a_face = ang;
+    float sector = (float)(2.0 * M_PI / faces);
+    float local = fmodf(a_face + (float)M_PI / (float)faces, sector);
+    if (local < 0.0f)
+        local += sector;
+    float edge_t = local / sector;
+    int e = (int)floorf((a_face + (float)M_PI / (float)faces) / sector);
+    if (e < 0)
+        e += faces * 8;
+    e %= faces;
+    float x0, y0, x1, y1;
+    tombola_edge_point(tb, e, 0.0f, &x0, &y0);
+    tombola_edge_point(tb, e, 1.0f, &x1, &y1);
+    float px = x0 + (x1 - x0) * edge_t;
+    float py = y0 + (y1 - y0) * edge_t;
+    float cx = cosf(ang) * R;
+    float cy = sinf(ang) * R;
+    /* Mild corner round even at high morph. */
+    float round = 0.12f + 0.88f * blend;
+    *ox = px * (1.0f - round) + cx * round;
+    *oy = py * (1.0f - round) + cy * round;
+}
+
 static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
 {
-    int cx = 160, cy = 116, scale = 90;
+    int cx = 160, cy = 116, scale = 92;
     if (!tb)
         return;
 
-    /* Soft ground ellipse (3D hint) — denser fill, less blocky. */
+    /* Soft ground ellipse (3D hint). */
     for (int y = -(int)(scale * 0.55f); y <= (int)(scale * 0.6f); y++) {
         float ty = (float)y / (float)scale;
         int half = (int)((1.0f - ty * ty * 0.85f) * (float)scale);
@@ -469,46 +569,40 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         fill_rect(px, cx - half, cy + y, half * 2, 1, 0x00161612u);
     }
 
-    int faces = tb->face_count;
-    if (faces <= 0) {
-        /* Dense circle outline via short chords. */
+    /* Dense smooth outline (circle + rounded N-gon morph). */
+    {
         int prevx = 0, prevy = 0;
-        const int segs = 72;
+        const int segs = 96;
+        uint32_t edge_col = (tb->face_count <= 0) ? COL_ACCENT : COL_BRACE;
         for (int i = 0; i <= segs; i++) {
             float ox, oy;
-            tombola_edge_point(tb, 0, (float)i / (float)segs, &ox, &oy);
+            tombola_smooth_edge(tb, (float)i / (float)segs, &ox, &oy);
             int sx, sy;
             tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
             if (i > 0)
-                draw_line(px, prevx, prevy, sx, sy, COL_ACCENT);
+                draw_line(px, prevx, prevy, sx, sy, edge_col);
             prevx = sx;
             prevy = sy;
-        }
-    } else {
-        for (int e = 0; e < faces; e++) {
-            float ox0, oy0, ox1, oy1;
-            tombola_edge_point(tb, e, 0.0f, &ox0, &oy0);
-            tombola_edge_point(tb, e, 1.0f, &ox1, &oy1);
-            int x0, y0, x1, y1;
-            tombola_world_to_screen(tb, ox0, oy0, cx, cy, scale, &x0, &y0);
-            tombola_world_to_screen(tb, ox1, oy1, cx, cy, scale, &x1, &y1);
-            draw_line(px, x0, y0, x1, y1, COL_BRACE);
         }
     }
 
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
         int sx, sy;
-        tombola_world_to_screen(tb, tb->balls[i].x, tb->balls[i].y, cx, cy, scale, &sx, &sy);
         uint32_t col = tombola_ball_color(i);
         if (!tb->balls[i].active) {
-            /* MUTE'd out: faint outline slot (compose with MUTE+pad). */
-            stroke_disk(px, sx, sy, 4, shade_rgb(col, 0.28f));
+            /* MUTE'd out: faint ring slot (not clustered on floor). */
+            float ang = (float)i * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
+            float ox = cosf(ang) * 0.72f;
+            float oy = sinf(ang) * 0.72f;
+            tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
+            stroke_disk(px, sx, sy, 5, shade_rgb(col, 0.30f));
             continue;
         }
+        tombola_world_to_screen(tb, tb->balls[i].x, tb->balls[i].y, cx, cy, scale, &sx, &sy);
         /* Hit flash = brighter same pad colour (matches LED). */
         if (tb->balls[i].hit_flash > 0.15f)
-            col = shade_rgb(col, 1.35f);
-        int r = (i == sel) ? 7 : 5;
+            col = shade_rgb(col, 1.40f);
+        int r = (i == sel) ? 8 : 6;
         fill_sphere(px, sx, sy, r, col);
         if (i == sel)
             stroke_disk(px, sx, sy, r + 2, COL_BRACE);
@@ -571,7 +665,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         int active = tb ? tombola_active_count(tb) : 0;
         snprintf(v3, sizeof v3, "%d", active);
         draw_param_row(px, 188, "SHAPE", v1, "SPIN", v2, "BALLS", v3);
-        draw_text(px, 8, 226, "MUTE+pad add/rem  K2 spin  faint=out  FULL=HITMOD", COL_MUTED, 1);
+        draw_text(px, 8, 226, "FADER morph  MAIN vol  K2 spin  MUTE+pad  FULL=HITMOD", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_HITMOD) {
         draw_text(px, 8, 48, "HIT MOD", COL_FG, 2);
         draw_text(px, 120, 52, "src->dest matrix", COL_MUTED, 1);
@@ -616,11 +710,11 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             row_y += 16;
         }
         const EpicycleHitModRoute *r = tb ? &tb->hitmods[slot] : NULL;
-        snprintf(v1, sizeof v1, "%s", r ? epicycle_hitmod_dest_name(r->dest) : "OFF");
-        snprintf(v2, sizeof v2, "%d", r ? (int)(r->amount * 100.0f) : 0);
-        snprintf(v3, sizeof v3, "%s", r ? epicycle_hitmod_src_name(r->src) : "IMPA");
-        draw_param_row(px, 178, "DEST", v1, "AMT", v2, "SRC", v3);
-        draw_text(px, 8, 214, "ENC row  push=tog  K1 dest K2 amt K3 src", COL_MUTED, 1);
+        snprintf(v1, sizeof v1, "%s", r ? epicycle_hitmod_src_name(r->src) : "IMPA");
+        snprintf(v2, sizeof v2, "%s", r ? epicycle_hitmod_dest_name(r->dest) : "OFF");
+        snprintf(v3, sizeof v3, "%d", r ? (int)(r->amount * 100.0f) : 0);
+        draw_param_row(px, 178, "SRC", v1, "DEST", v2, "AMT", v3);
+        draw_text(px, 8, 214, "ENC row  push=tog  K1 src K2 dest K3 amt", COL_MUTED, 1);
         draw_text(px, 8, 226, "SHIFT+K3 thr  VOL/PITCH/CUT/SNDA/SNDB", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_TRIM) {
         float playhead = eng ? engine_pad_playhead(eng, sel) : -1.0f;
