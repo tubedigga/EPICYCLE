@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.6-device-ux"
+#define EPICYCLE_VERSION "0.2.7-midi-stability"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -265,6 +265,8 @@ const char *epicycle_page_name(EpicycleModePage page);
 const char *epicycle_filter_type_name(int type); /* OFF/LPF/HPF/BPF/NOTCH */
 /* Keep selected-pad LOOP button LED in sync (surface). */
 void surface_set_loop_led(int on);
+/* Host/CI: feed synthetic MIDI streams; 0 = ok. */
+int surface_midi_selftest(void);
 
 /* PNG (stb_image) — RGB buffer is 0x00RRGGBB, alpha already on black */
 int epicycle_png_load_rgb(const char *path, uint32_t **out_pixels, int *out_w, int *out_h);

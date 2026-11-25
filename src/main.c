@@ -3,8 +3,8 @@
  * EPICYCLE loop engine — Sample-Mode-style soft-key pages for pad params
  * (Trim / Mix / Amp / Tune / Filter / Filt Env / LFO). Not a stock OS clone.
  * Hold SAMPLE + pad = select; B1/B2 cycle pages; B3 quit; encoder push never quits.
- * Device UX 0.2.6: Trim Start/End width + POS slide; Shift xfade/ping-pong;
- * fader latch; LOOP button; pad vol/pan Mix.
+ * 0.2.7: defensive MIDI (no post-SysEx restore, AT does not become notes),
+ * Trim jump reject, soft-key cooldown, freeform default on card load.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -29,9 +29,10 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "EPICYCLE %s — loop engine for MPC Sample\n"
-            "usage: %s [--help] [--version] [--demo] [--wav PATH]...\n"
-            "  --demo       synth demo tones onto pads (host / no card samples)\n"
-            "  --wav PATH   load WAV into next bank slot (up to 16)\n"
+            "usage: %s [--help] [--version] [--demo] [--midi-selftest] [--wav PATH]...\n"
+            "  --demo           synth demo tones onto pads (host / no card samples)\n"
+            "  --midi-selftest  host MIDI parser regression checks\n"
+            "  --wav PATH       load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
             "  On device: SAMPLE+pad selects; B1/B2 pages; B3 quits; encoder push never quits.\n",
             EPICYCLE_VERSION, argv0);
@@ -94,6 +95,7 @@ static void page_next(EpicycleEngine *eng)
 }
 
 static int g_soft_guard_ticks; /* ignore soft keys briefly after pad hits */
+static int g_soft_cooldown;    /* min ticks between accepted page/quit edges */
 
 static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
 {
@@ -101,7 +103,7 @@ static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
         return;
     /* Debounce: MIDI noise / aftertouch floods were causing random page jumps
      * and false B3 quits that look like crashes. */
-    if (g_soft_guard_ticks > 0) {
+    if (g_soft_guard_ticks > 0 || g_soft_cooldown > 0) {
         st->soft_left = 0;
         st->soft_mid = 0;
         st->soft_right = 0;
@@ -110,14 +112,17 @@ static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
     if (st->soft_left) {
         st->soft_left = 0;
         page_prev(eng);
+        g_soft_cooldown = 20; /* ~320ms between page changes */
     }
     if (st->soft_mid) {
         st->soft_mid = 0;
         page_next(eng);
+        g_soft_cooldown = 20;
     }
     if (st->soft_right) {
         st->soft_right = 0;
         st->quit_requested = 1; /* explicit soft-key quit only */
+        g_soft_cooldown = 30;
     }
 }
 
@@ -254,6 +259,11 @@ int main(int argc, char **argv)
             puts(EPICYCLE_VERSION);
             return 0;
         }
+        if (strcmp(argv[i], "--midi-selftest") == 0) {
+            int rc = surface_midi_selftest();
+            puts(rc == 0 ? "midi-selftest: ok" : "midi-selftest: FAIL");
+            return rc == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--demo") == 0) {
             force_demo = 1;
             continue;
@@ -317,15 +327,9 @@ int main(int argc, char **argv)
         engine_host_demo_setup(&eng);
         epicycle_log(&paths, "using synth demo bank (polymeter pads 2/3 = 3 vs 5 beats)");
     } else {
-        if (eng.pads[0].sample)
-            engine_set_division(&eng, 0, 4);
-        if (eng.pads[1].sample)
-            engine_set_division(&eng, 1, 4);
-        if (eng.pads[2].sample)
-            engine_set_division(&eng, 2, 3);
-        if (eng.pads[3].sample)
-            engine_set_division(&eng, 3, 5);
-        epicycle_log(&paths, "loaded %d sample slot(s)", loaded);
+        /* Stay freeform so Trim Start/End work on every pad; encoder push
+         * toggles division when wanted (forced division made Start look dead). */
+        epicycle_log(&paths, "loaded %d sample slot(s) (freeform Trim default)", loaded);
     }
 
     if (preview_out) {
@@ -365,11 +369,15 @@ int main(int argc, char **argv)
 
     int ticks = 0;
     uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255;
+    /* Trim jump confirm: large CC teleports need two matching samples. */
+    uint8_t pend_k[3] = {255, 255, 255};
+    int pend_n[3] = {0, 0, 0};
     EpicycleModePage last_page = eng.mode_page;
     int last_sel = eng.selected_pad;
     uint8_t last_pad_vel[EPICYCLE_PAD_COUNT];
     memset(last_pad_vel, 0, sizeof last_pad_vel);
-    g_soft_guard_ticks = 45; /* ~0.7s after splash before soft keys armed */
+    g_soft_guard_ticks = 60; /* ~1s after splash before soft keys armed */
+    g_soft_cooldown = 0;
 
     surface_poll();
     /* Main tracks hardware; fader stays full until user moves it (latch). */
@@ -388,6 +396,8 @@ int main(int argc, char **argv)
 
         if (g_soft_guard_ticks > 0)
             g_soft_guard_ticks--;
+        if (g_soft_cooldown > 0)
+            g_soft_cooldown--;
 
         handle_soft_keys(&eng, st);
         handle_encoder_press(&eng, st);
@@ -403,7 +413,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
             if (st->pad_down[i]) {
                 st->pad_down[i] = 0;
-                g_soft_guard_ticks = 12; /* ~200ms guard against phantom soft keys */
+                g_soft_guard_ticks = 25; /* ~400ms guard against phantom soft keys */
                 if (surf->sample_held) {
                     eng.selected_pad = i;
                     surface_set_selected_pad(i);
@@ -431,12 +441,16 @@ int main(int argc, char **argv)
             last_k1 = surf->k1;
             last_k2 = surf->k2;
             last_k3 = surf->k3;
+            pend_k[0] = pend_k[1] = pend_k[2] = 255;
+            pend_n[0] = pend_n[1] = pend_n[2] = 0;
         }
         if (eng.mode_page != last_page) {
             last_page = eng.mode_page;
             last_k1 = surf->k1;
             last_k2 = surf->k2;
             last_k3 = surf->k3;
+            pend_k[0] = pend_k[1] = pend_k[2] = 255;
+            pend_n[0] = pend_n[1] = pend_n[2] = 0;
         }
 
         if (surf->main_vol != last_main) {
@@ -449,12 +463,36 @@ int main(int argc, char **argv)
 
         {
             unsigned mask = 0;
-            if (surf->k1 != last_k1)
-                mask |= 1u;
-            if (surf->k2 != last_k2)
-                mask |= 2u;
-            if (surf->k3 != last_k3)
-                mask |= 4u;
+            const uint8_t knobs[3] = {surf->k1, surf->k2, surf->k3};
+            uint8_t *lasts[3] = {&last_k1, &last_k2, &last_k3};
+            enum { KNOB_JUMP = 40 };
+            for (int ki = 0; ki < 3; ki++) {
+                uint8_t cur = knobs[ki];
+                uint8_t prev = *lasts[ki];
+                if (cur == prev) {
+                    pend_k[ki] = 255;
+                    pend_n[ki] = 0;
+                    continue;
+                }
+                int d = (int)cur - (int)prev;
+                if (d < 0)
+                    d = -d;
+                if (d >= KNOB_JUMP && eng.mode_page == EPICYCLE_PAGE_TRIM) {
+                    /* Single-sample teleport: wait for a second matching read. */
+                    if (pend_k[ki] == cur && pend_n[ki] >= 1) {
+                        mask |= (1u << ki);
+                        pend_k[ki] = 255;
+                        pend_n[ki] = 0;
+                    } else {
+                        pend_k[ki] = cur;
+                        pend_n[ki] = 1;
+                    }
+                } else {
+                    mask |= (1u << ki);
+                    pend_k[ki] = 255;
+                    pend_n[ki] = 0;
+                }
+            }
             if (mask) {
                 if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_TRIM) {
                     EpicyclePad *p = &eng.pads[eng.selected_pad];
@@ -478,9 +516,12 @@ int main(int argc, char **argv)
                     engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page, surf->k1,
                                                 surf->k2, surf->k3, mask);
                 }
-                last_k1 = surf->k1;
-                last_k2 = surf->k2;
-                last_k3 = surf->k3;
+                if (mask & 1u)
+                    last_k1 = surf->k1;
+                if (mask & 2u)
+                    last_k2 = surf->k2;
+                if (mask & 4u)
+                    last_k3 = surf->k3;
             }
         }
 

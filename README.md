@@ -6,7 +6,7 @@ Per pad: sample **start / end / loop brace** (a **window** you can scroll across
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.2.6-device-ux` — Trim Start/End width + POS slide; Shift xfade/ping-pong; fader latch; LOOP button; Mix pad vol/pan. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
+> **Status:** `0.2.7-midi-stability` — Defensive MIDI (SysEx/AT), Trim jump reject, soft-key cooldown. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
 
 ## Update the SD card (Ash — firmware 1.4)
 
