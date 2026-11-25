@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.5-mode-pages"
+#define EPICYCLE_VERSION "0.2.6-device-ux"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -103,6 +103,7 @@ typedef struct EpicyclePad {
     float fine;             /* -100..+100 cents */
     float crossfade;        /* 0..1 of window length used for Xfade */
     int loop_enable;        /* 1 = crossfade loop; 0 = one-shot through window */
+    int ping_pong;          /* 1 = reverse at brace ends; 0 = forward only */
     int allow_scrub;        /* 1 = may use LFO brace scan (budgeted) */
     /* Amp / filter page params (filter DSP still stub; values stored for UI). */
     float amp_attack;  /* 0..1 */
@@ -110,7 +111,7 @@ typedef struct EpicyclePad {
     float vel_sens;    /* 0..1 */
     float filter_cutoff;
     float filter_reso;
-    int filter_type; /* 0 = off … */
+    int filter_type; /* 0=OFF 1=LPF 2=HPF 3=BPF 4=NOTCH (DSP stub) */
     float filt_attack;
     float filt_decay;
     float filt_depth;
@@ -131,6 +132,7 @@ typedef struct EpicycleVoice {
     float env;          /* simple amp for one-shots */
     int in_crossfade;
     double xfade_pos;   /* 0..1 through crossfade */
+    int direction;      /* +1 forward, -1 reverse (ping-pong) */
 } EpicycleVoice;
 
 typedef struct EpicycleEngine {
@@ -158,7 +160,12 @@ typedef struct EpicycleSurfaceState {
     uint8_t pad_up[EPICYCLE_PAD_COUNT];   /* edge on release; app clears */
     uint8_t k1, k2, k3;                  /* CC 16 / 17 / 18 */
     uint8_t main_vol;                    /* CC 19 */
-    uint8_t fader;                        /* CC 20 */
+    uint8_t fader;                        /* CC 20 raw position */
+    int fader_seen;                      /* 1 after first CC20 (0x42 dump) */
+    int fader_engaged;                   /* 1 after user moves fader from dump */
+    uint8_t fader_dump;                   /* first CC20 value (ignored until move) */
+    int main_seen;                       /* 1 after first CC19 */
+    uint8_t main_stable;                 /* last accepted main CC (debounce) */
     int wheel_accum;                     /* relative wheel steps since open */
     int wheel_press;                     /* encoder push edge — never quits */
     int quit_requested;                  /* soft-right quit only (not wheel) */
@@ -166,6 +173,8 @@ typedef struct EpicycleSurfaceState {
     int soft_mid;                        /* note 13 edge — next page */
     int soft_right;                      /* note 14 edge — quit (after splash) */
     int sample_held;                     /* SAMPLE mode button (ch1 note 6) */
+    int loop_btn;                        /* LOOP (ch1 note 74) edge — toggle latch */
+    int shift_held;                      /* SHIFT (ch1 note 49) */
     int open;                            /* 1 if MIDI port bound */
 } EpicycleSurfaceState;
 
@@ -232,18 +241,30 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
 void engine_note_off(EpicycleEngine *eng, int pad); /* stop that pad's voice(s) */
 /* Playhead 0..1 in sample, or -1 if pad has no active voice. */
 float engine_pad_playhead(const EpicycleEngine *eng, int pad);
-/* Page-aware K1–K3 mapping (Trim brace / Mix / Tune / LFO / stubs). */
+/* Page-aware K1–K3 mapping. mask bits: 1=K1, 2=K2, 4=K3 (only touched knobs). */
 void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
                              uint8_t k2, uint8_t k3);
+void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
+                                  uint8_t k2, uint8_t k3, unsigned mask);
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3);
 void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* squared taper */
 void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* linear; 0 = silence */
 void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on);
 void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad); /* free ↔ 1-beat sync */
+void engine_toggle_loop(EpicycleEngine *eng, int pad);     /* loop latch ↔ one-shot */
+void engine_set_ping_pong(EpicycleEngine *eng, int pad, int on);
+void engine_sync_mod_window(EpicycleEngine *eng, int pad); /* copy window → mod (no LFO) */
+/* Trim: adjust left/right edges (length) or slide position; keep other edge fixed. */
+void engine_trim_set_start(EpicycleEngine *eng, int pad, float start01);
+void engine_trim_set_end(EpicycleEngine *eng, int pad, float end01);
+void engine_trim_set_position(EpicycleEngine *eng, int pad, float pos01);
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames);
 void engine_host_demo_setup(EpicycleEngine *eng); /* load synth tones for host test */
 
 const char *epicycle_page_name(EpicycleModePage page);
+const char *epicycle_filter_type_name(int type); /* OFF/LPF/HPF/BPF/NOTCH */
+/* Keep selected-pad LOOP button LED in sync (surface). */
+void surface_set_loop_led(int on);
 
 /* PNG (stb_image) — RGB buffer is 0x00RRGGBB, alpha already on black */
 int epicycle_png_load_rgb(const char *path, uint32_t **out_pixels, int *out_w, int *out_h);
