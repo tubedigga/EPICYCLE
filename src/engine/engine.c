@@ -261,6 +261,7 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->sample_rate = sample_rate ? sample_rate : 44100;
     eng->running = 1;
     eng->selected_pad = 0;
+    eng->master_gain = 1.0f; /* until surface CC19 arrives (position SysEx 0x42) */
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
@@ -410,6 +411,16 @@ void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, ui
     p->crossfade = 0.01f + 0.49f * ((float)k3 / 127.0f);
 }
 
+void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19)
+{
+    if (!eng)
+        return;
+    /* sample-base HARDWARE.md: Main Volume is surface MIDI only (no ALSA
+     * mixer); map CC19 → software output gain with a squared taper. */
+    float t = (float)cc19 / 127.0f;
+    eng->master_gain = t * t;
+}
+
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames)
 {
     for (size_t i = 0; i < frames; i++) {
@@ -504,6 +515,9 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             mixR += R * g;
         }
 
+        float mg = eng->master_gain;
+        mixL *= mg;
+        mixR *= mg;
         /* Soft clip to S32 */
         mixL = tanhf(mixL * 0.8f);
         mixR = tanhf(mixR * 0.8f);

@@ -257,8 +257,17 @@ int main(int argc, char **argv)
 
     audio_set_engine(&eng);
 
-    ui_draw_splash(hw.display_ok ? "loop engine online" : "panel offline (host?)");
-    sleep_ms(600);
+    {
+        char logo_path[640];
+        snprintf(logo_path, sizeof logo_path, "%s/assets/boot.png", paths.app_dir);
+        if (ui_load_splash_logo(logo_path) != 0)
+            epicycle_log(&paths, "splash logo missing (%s) — text fallback", logo_path);
+        else
+            epicycle_log(&paths, "splash logo loaded %s", logo_path);
+    }
+
+    ui_draw_splash(hw.display_ok ? "online" : "offline");
+    sleep_ms(800);
 
     /* Auto-fire demo pads on host so something is audible if audio exists. */
 #ifndef EPICYCLE_ON_DEVICE
@@ -268,7 +277,12 @@ int main(int argc, char **argv)
 #endif
 
     int ticks = 0;
-    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255;
+    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255;
+
+    /* Apply any main-volume reply from surface position SysEx 0x42. */
+    surface_poll();
+    engine_set_master_gain_cc(&eng, surface_state()->main_vol);
+    last_main = surface_state()->main_vol;
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -284,6 +298,11 @@ int main(int argc, char **argv)
                 float vel = surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
                 engine_note_on(&eng, i, vel);
             }
+        }
+
+        if (surf->main_vol != last_main) {
+            engine_set_master_gain_cc(&eng, surf->main_vol);
+            last_main = surf->main_vol;
         }
 
         if (surf->k1 != last_k1 || surf->k2 != last_k2 || surf->k3 != last_k3) {
@@ -319,7 +338,7 @@ int main(int argc, char **argv)
 #endif
     }
 
-    ui_draw_splash("quitting to stock");
+    ui_draw_splash("quit");
     sleep_ms(250);
 
     audio_set_engine(NULL);

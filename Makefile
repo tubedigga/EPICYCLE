@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.2.0-loop
+VERSION    := 0.2.2-panel-fix
 BUILD      := build
 DIST       := dist
 
@@ -10,9 +10,12 @@ CROSS      ?= aarch64-linux-gnu-
 CC_CROSS   := $(CROSS)gcc
 CC_HOST    := gcc
 
-CFLAGS_COMMON := -std=c11 -Wall -Wextra -Wpedantic -O2 -Isrc/include -pthread
+INCLUDES      := -Isrc/include -Ithird_party/stb
+CFLAGS_COMMON := -std=c11 -Wall -Wextra -Wpedantic -O2 $(INCLUDES) -pthread
 CFLAGS_CROSS  := $(CFLAGS_COMMON) -static -DEPICYCLE_ON_DEVICE
 CFLAGS_HOST   := $(CFLAGS_COMMON)
+# stb_image is third-party; drop -Wpedantic for that TU only.
+CFLAGS_PNG    := -std=c11 -Wall -Wextra -O2 $(INCLUDES) -pthread
 LDFLAGS_COMMON := -pthread -lm
 
 SRCS := \
@@ -26,11 +29,13 @@ SRCS := \
 	src/sample/wav.c \
 	src/ui/ui.c
 
-.PHONY: all host package clean test-host help
+PNG_SRC := src/image/png.c
 
-all: $(BUILD)/$(APP)
+.PHONY: all host package clean test-host help assets
 
-host: $(BUILD)/$(APP)-host
+all: $(BUILD)/$(APP) assets
+
+host: $(BUILD)/$(APP)-host assets
 
 help:
 	@echo "make / make all   — aarch64 static binary → $(BUILD)/$(APP)"
@@ -39,12 +44,24 @@ help:
 	@echo "make test-host    — demo bank + offline preview WAV"
 	@echo "make clean"
 
-$(BUILD)/$(APP): $(SRCS) | $(BUILD)
-	$(CC_CROSS) $(CFLAGS_CROSS) -o $@ $(SRCS) $(LDFLAGS_COMMON)
+assets: $(BUILD)/assets/boot.png
+
+$(BUILD)/assets/boot.png: assets/boot.png | $(BUILD)
+	mkdir -p $(BUILD)/assets
+	cp assets/boot.png $@
+
+$(BUILD)/png.o: $(PNG_SRC) | $(BUILD)
+	$(CC_CROSS) $(CFLAGS_PNG) -static -DEPICYCLE_ON_DEVICE -c $(PNG_SRC) -o $@
+
+$(BUILD)/png-host.o: $(PNG_SRC) | $(BUILD)
+	$(CC_HOST) $(CFLAGS_PNG) -c $(PNG_SRC) -o $@
+
+$(BUILD)/$(APP): $(SRCS) $(BUILD)/png.o | $(BUILD)
+	$(CC_CROSS) $(CFLAGS_CROSS) -o $@ $(SRCS) $(BUILD)/png.o $(LDFLAGS_COMMON)
 	@echo "built $@"
 
-$(BUILD)/$(APP)-host: $(SRCS) | $(BUILD)
-	$(CC_HOST) $(CFLAGS_HOST) -o $@ $(SRCS) $(LDFLAGS_COMMON)
+$(BUILD)/$(APP)-host: $(SRCS) $(BUILD)/png-host.o | $(BUILD)
+	$(CC_HOST) $(CFLAGS_HOST) -o $@ $(SRCS) $(BUILD)/png-host.o $(LDFLAGS_COMMON)
 	@echo "built $@"
 
 $(BUILD):
@@ -57,6 +74,7 @@ package: $(BUILD)/$(APP)
 		--program $(BUILD)/$(APP) \
 		--outdir $(DIST) \
 		--top-autorun install/top-autorun.sh \
+		--assets assets \
 		--extra install/recovery-hint.txt \
 		--extra install/samples-hint.txt
 

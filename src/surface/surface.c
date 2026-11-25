@@ -4,6 +4,7 @@
  * Published map facts from SampleBoot TECHNICAL.md and sample-base HARDWARE.md
  * (do not reverse stock for these; do not vendor AGPL headers):
  *   - pads: channel 10, notes 37,36,42,82,40,38,46,44,48,47,45,43,49,55,51,53
+ *   - pad LED SysEx I = printed pad − 1 (0..15); fader light I=16
  *   - knobs K1–K3: CC 16/17/18; main volume CC 19; fader CC 20 (channel 1)
  *   - wheel: CC 100 relative; wheel push ≈ note 111
  * Soft keys above the screen: notes 12/13/14 — right soft key also quits.
@@ -79,6 +80,7 @@ static void surface_lights_off(int fd)
 {
     uint8_t buf[512];
     size_t n = 0;
+    /* Pads 0..15 + fader light I=16 (sample-base HARDWARE.md). */
     for (int i = 0; i <= 16; i++) {
         const uint8_t m[] = {0xf0, 0x47, 0x7f, 0x5c, 0x65, 0x00, 0x04,
                              (uint8_t)i, 0, 0, 0, 0xf7};
@@ -109,9 +111,9 @@ static void light_pad(int fd, int pad /* 0..15 */, uint8_t r, uint8_t g, uint8_t
 {
     if (fd < 0 || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
-    /* Pad index in SysEx is 1..16. */
+    /* sample-base HARDWARE.md: I = printed pad number − 1 (0..15). */
     uint8_t m[] = {0xf0, 0x47, 0x7f, 0x5c, 0x65, 0x00, 0x04,
-                   (uint8_t)(pad + 1), (uint8_t)(r >> 1), (uint8_t)(g >> 1),
+                   (uint8_t)pad, (uint8_t)(r >> 1), (uint8_t)(g >> 1),
                    (uint8_t)(b >> 1), 0xf7};
     (void)midi_write_all(fd, m, sizeof m);
 }

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.0-loop"
+#define EPICYCLE_VERSION "0.2.2-panel-fix"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -118,6 +118,7 @@ typedef struct EpicycleEngine {
     int selected_pad; /* UI focus 0..15 */
     uint64_t transport_frames; /* free-run clock for sync LFOs / divisions */
     int scrub_active; /* how many pads currently LFO-scanning brace */
+    float master_gain; /* 0..1 software main volume (surface CC19, squared) */
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */
@@ -192,11 +193,17 @@ void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float 
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
 void engine_note_off(EpicycleEngine *eng, int pad);
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3);
+void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* squared taper */
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames);
 void engine_host_demo_setup(EpicycleEngine *eng); /* load synth tones for host test */
 
+/* PNG (stb_image) — RGB buffer is 0x00RRGGBB, alpha already on black */
+int epicycle_png_load_rgb(const char *path, uint32_t **out_pixels, int *out_w, int *out_h);
+void epicycle_png_free(uint32_t *pixels);
+
 /* on-device UI */
-void ui_draw_splash(const char *status_line);
+int ui_load_splash_logo(const char *path); /* assets/boot.png; 0 = ok */
+void ui_draw_splash(const char *status_line); /* logo letterboxed on black; status optional */
 void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                   const EpicycleSurfaceState *surf);
 

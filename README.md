@@ -6,7 +6,20 @@ Per pad: sample **start / end / loop brace** (a **window** you can scroll across
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** first playable loop engine on top of panel bring-up. Host-tested (offline preview WAV). **Not yet signed off on Ash’s unit** until a card boot pastes `Epicycle/logs/last-session.log`.
+> **Status:** `0.2.2-panel-fix` — blank-screen + pad-LED off-by-one + main-volume wiring for firmware 1.4. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
+
+## Update the SD card (Ash — firmware 1.4)
+
+Replace the **autorun payload only**; keep your `Epicycle/` user data.
+
+1. Power off / remove the microSD.
+2. On a computer, unzip the new `EPICYCLE-*.zip`.
+3. On the card root, **delete or rename** the old `autorun/` folder (and old top-level `autorun.sh` if present).
+4. Copy the new `autorun.sh` + `autorun/` onto the card root. Leave `Epicycle/` alone (projects / samples / logs stay).
+5. Reinsert → power on → Developer Mode autorun prompt → **Yes**.
+6. Expect: boot logo splash → loop UI on screen; pad N lights pad N; **Main Volume** knob sets EPICYCLE level; pads play. Paste `Epicycle/logs/last-session.log` (look for `display: … write-bgrx` and `stride=`).
+
+Rollback: remove the card, or rename `autorun` → `autorun-off`.
 
 ## Requirements
 
@@ -38,11 +51,12 @@ make test-host    # demo bank + non-silent preview WAV check
 
 ### What you should try on the device
 
-1. Short **EPICYCLE** splash → loop screen (pad grid + waveform brace).
-2. **Hit pads** — hear loops. Demo bank: pads **1–2** share a 4-beat division (synced braces); pads **3–4** are **3 vs 5** beats (polymeter).
-3. **Select a pad** (hit it), then turn **K1** to scroll the brace window, **K2** for length (free) or division 1–32 (locked), **K3** for crossfade.
-4. **Left soft key** (above screen) toggles **free vs division**. **Middle soft key** toggles **LFO brace scrub** on the selected pad (first ~8 scrubbing pads only; others stay static).
-5. Data wheel nudge scrolls the window; **push the wheel** (or right soft key) → quit to stock.
+1. Boot splash (Ash logo, letterboxed on black) → loop screen — must not stay black.
+2. **Hit pads** — hear loops; **pad LED must match** the pad you hit. Demo: pads **1–2** synced 4-beat; **3–4** = 3 vs 5.
+3. **Main Volume** hardware knob must change EPICYCLE loudness (software gain from CC19).
+4. **Select a pad**, then **K1** scroll brace, **K2** length/division, **K3** crossfade.
+5. **Left soft key** toggles free vs division; **middle soft key** toggles LFO brace scrub (~8 scrub budget).
+6. Wheel nudge scrolls; **push the wheel** (or right soft key) → quit to stock.
 
 Session log: `Epicycle/logs/last-session.log` on the card.
 
