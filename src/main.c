@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: MIT
  *
- * EPICYCLE bring-up scaffold — boots far enough to resolve paths, open stubs,
- * draw a splash, and exit restoring stock when run under the SD launcher.
- * Not hardware-tested.
+ * EPICYCLE hardware bring-up — open display / surface MIDI / ALSA, show a
+ * splash + home UI that reacts to pads and knobs, quit on wheel push.
+ * Launcher restores stock via systemctl start ac50. Not yet sample-tested
+ * for the loop engine (that stays stubbed).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -25,10 +26,20 @@ static void on_signal(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "EPICYCLE %s — bring-up scaffold (not hardware-tested)\n"
+            "EPICYCLE %s — panel bring-up for MPC Sample\n"
             "usage: %s [--help] [--version]\n"
-            "  MPC_APP_DIR   set by the SD launcher to the payload folder\n",
+            "  MPC_APP_DIR   set by the SD launcher to the payload folder\n"
+            "  On device: push the data wheel (or right soft key) to quit.\n",
             EPICYCLE_VERSION, argv0);
+}
+
+static void sleep_ms(int ms)
+{
+    struct timespec ts = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (long)(ms % 1000) * 1000000L,
+    };
+    nanosleep(&ts, NULL);
 }
 
 int main(int argc, char **argv)
@@ -54,37 +65,67 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    epicycle_log(&paths, "EPICYCLE %s starting (scaffold)", EPICYCLE_VERSION);
+    epicycle_log(&paths, "EPICYCLE %s starting (bring-up)", EPICYCLE_VERSION);
     epicycle_log(&paths, "app_dir=%s card_root=%s data_dir=%s", paths.app_dir, paths.card_root,
                  paths.data_dir);
 
     EpicycleEngine eng;
     engine_init(&eng);
 
-    if (display_open() != 0)
-        epicycle_log(&paths, "display: open failed (continuing)");
-    if (audio_open() != 0)
-        epicycle_log(&paths, "audio: open failed (continuing)");
-    if (surface_open() != 0)
-        epicycle_log(&paths, "surface: open failed (continuing)");
+    EpicycleHwStatus hw;
+    memset(&hw, 0, sizeof hw);
 
-    ui_draw_splash("bring-up scaffold");
+    hw.display_ok = display_open() == 0;
+    snprintf(hw.display_info, sizeof hw.display_info, "%s", display_info());
+    epicycle_log(&paths, "display: %s", hw.display_info);
 
-    /* Host/CI: stubs request quit immediately. On device, wait for signal/quit. */
+    hw.audio_ok = audio_open() == 0;
+    hw.audio_rate = audio_rate();
+    snprintf(hw.audio_info, sizeof hw.audio_info, "%s", audio_info());
+    epicycle_log(&paths, "audio: %s", hw.audio_info);
+
+    hw.surface_ok = surface_open() == 0;
+    snprintf(hw.surface_info, sizeof hw.surface_info, "%s", surface_info());
+    epicycle_log(&paths, "surface: %s", hw.surface_info);
+
+    ui_draw_splash(hw.display_ok ? "panel online" : "panel offline (host?)");
+    sleep_ms(700);
+
+    /* Host/CI: stubs request quit immediately. On device, run until quit. */
     int ticks = 0;
-    while (!g_stop && !surface_poll_quit() && ticks < 30) {
+    int dirty = 1;
+    while (!g_stop && !surface_poll_quit()) {
+        surface_poll();
+
+        /* Keep the silent audio callback shape warm for later engine work. */
         int32_t L[EPICYCLE_AUDIO_FRAMES];
         int32_t R[EPICYCLE_AUDIO_FRAMES];
         engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
         (void)audio_running();
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L};
-        nanosleep(&ts, NULL);
+
+        if (dirty || (ticks % 4) == 0) {
+            ui_draw_home(&hw, surface_state());
+            dirty = 0;
+        }
+
+        sleep_ms(16);
         ticks++;
+
+#ifndef EPICYCLE_ON_DEVICE
+        /* Safety: never hang the host smoke test. */
+        if (ticks > 60)
+            break;
+#endif
+        /* Redraw when pads/knobs change — cheap full refresh at ~15 Hz above. */
+        dirty = 1;
     }
+
+    ui_draw_splash("quitting to stock");
+    sleep_ms(250);
 
     surface_close();
     audio_close();
     display_close();
-    epicycle_log(&paths, "EPICYCLE exiting cleanly");
+    epicycle_log(&paths, "EPICYCLE exiting cleanly (launcher starts ac50)");
     return 0;
 }
