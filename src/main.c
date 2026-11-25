@@ -3,8 +3,8 @@
  * EPICYCLE loop engine — Sample-Mode-style soft-key pages for pad params
  * (Trim / Mix / Amp / Tune / Filter / Filt Env / LFO). Not a stock OS clone.
  * Hold SAMPLE + pad = select; B1/B2 cycle pages; B3 quit; encoder push never quits.
- * 0.2.9: POS slides locked width only; volume drop latch; B1/B2 page on press;
- * Trim shows FREE/DIV large (encoder toggles).
+ * 0.2.10: equal-slice DIV grid; LOOP latch = pad toggle; knobs/encoder never page;
+ * Trim POS/Start/End pickup + width lock hardened.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -200,12 +200,25 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
         } else if (p->freeform) {
             t0 = (uint8_t)clampf_u8((int)(start * 127.0f + 0.5f));
             t1 = (uint8_t)clampf_u8((int)(end * 127.0f + 0.5f));
-            t2 = (uint8_t)clampf_u8((int)(start * 127.0f + 0.5f));
+            /* POS target = brace start — same numeric range as Start, but a
+             * separate pot; pickup arms independently so Start ≠ POS jump. */
+            t2 = t0;
         } else {
-            t0 = (uint8_t)clampf_u8((int)(start * 127.0f + 0.5f));
-            t1 = (uint8_t)clampf_u8((int)((p->division_beats - 1) * 127.0f /
-                                          (float)(EPICYCLE_MAX_DIVISION - 1) +
-                                      0.5f));
+            /* DIV: K1/K3 = slice index; K2 = N among 1/2/4/8/16/32. */
+            int n = engine_division_quantize_slices(p->division_beats);
+            int idx = engine_division_slice_index(p);
+            t0 = (uint8_t)clampf_u8(n <= 1 ? 0 : (idx * 127) / (n - 1));
+            {
+                static const int steps[] = {1, 2, 4, 8, 16, 32};
+                int si = 0;
+                for (int i = 0; i < 6; i++) {
+                    if (steps[i] == n) {
+                        si = i;
+                        break;
+                    }
+                }
+                t1 = (uint8_t)clampf_u8((si * 127) / 5);
+            }
             t2 = t0;
         }
         break;
@@ -296,9 +309,9 @@ static unsigned pickup_mask(const uint8_t cur[3], unsigned ignore_bits)
     return mask;
 }
 
-static void trim_refresh_se_targets(EpicycleEngine *eng)
+static void trim_refresh_free_targets(EpicycleEngine *eng)
 {
-    /* After POS slide, Start/End targets follow the brace — require re-cross. */
+    /* After POS slide in FREE: Start/End follow brace — require re-cross. */
     EpicyclePad *p = &eng->pads[eng->selected_pad];
     float start = p->window_start;
     float end = start + p->window_length;
@@ -310,11 +323,39 @@ static void trim_refresh_se_targets(EpicycleEngine *eng)
     g_pick_on[1] = 0;
 }
 
+static void trim_refresh_div_pos_targets(EpicycleEngine *eng)
+{
+    /* After slice slide: refresh K1/K3 slice targets only — never touch K2 (N). */
+    EpicyclePad *p = &eng->pads[eng->selected_pad];
+    int n = engine_division_quantize_slices(p->division_beats);
+    int idx = engine_division_slice_index(p);
+    uint8_t t = (uint8_t)clampf_u8(n <= 1 ? 0 : (idx * 127) / (n - 1));
+    g_pick_target[0] = t;
+    g_pick_target[2] = t;
+    g_pick_on[0] = 0;
+    /* Keep K2 (division N) pickup armed state; only disarm if N changed elsewhere. */
+}
+
+static void trim_set_div_slice_from_cc(EpicycleEngine *eng, int pad, uint8_t cc)
+{
+    EpicyclePad *p = &eng->pads[pad];
+    int n = engine_division_quantize_slices(p->division_beats);
+    int idx = n <= 1 ? 0 : (int)(((int)cc * n) / 128);
+    if (idx >= n)
+        idx = n - 1;
+    engine_division_set_slice_index(eng, pad, idx);
+    g_trim_lock_len = eng->pads[pad].window_length;
+}
+
 static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *surf)
 {
     const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
+    EpicyclePad *p = &eng->pads[eng->selected_pad];
     int pos_exclusive = (g_trim_pos_idle < 20);
-    unsigned ignore = pos_exclusive ? 3u : 0u; /* ignore Start/End while POS active */
+    /* FREE: ignore Start/End while POS active. DIV: ignore K2(N) while sliding. */
+    unsigned ignore = 0;
+    if (pos_exclusive)
+        ignore = p->freeform ? 3u : 2u;
     unsigned mask = pickup_mask(cur, ignore);
 
     if (!mask) {
@@ -323,19 +364,23 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
         return;
     }
 
-    /* Same-frame POS wins: never resize while sliding. */
+    /* Same-frame POS wins: never resize / change N while sliding. */
     if (mask & 4u)
         mask &= ~3u;
 
-    EpicyclePad *p = &eng->pads[eng->selected_pad];
     if (surf->shift_held) {
         if (mask & 1u)
             p->crossfade = 0.01f + 0.49f * ((float)surf->k1 / 127.0f);
         if (mask & 2u)
             engine_set_ping_pong(eng, eng->selected_pad, surf->k2 >= 64);
         if (mask & 4u) {
-            trim_apply_pos(eng, eng->selected_pad, (float)surf->k3 / 127.0f);
-            trim_refresh_se_targets(eng);
+            if (p->freeform) {
+                trim_apply_pos(eng, eng->selected_pad, (float)surf->k3 / 127.0f);
+                trim_refresh_free_targets(eng);
+            } else {
+                trim_set_div_slice_from_cc(eng, eng->selected_pad, surf->k3);
+                trim_refresh_div_pos_targets(eng);
+            }
             g_pick_target[2] =
                 (uint8_t)clampf_u8((int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
             g_trim_pos_idle = 0;
@@ -354,6 +399,7 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
                       0.5f));
             g_pick_target[2] = (uint8_t)clampf_u8(
                 (int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
+            g_pick_on[1] = 0;
             g_pick_on[2] = 0; /* POS must re-cross after width change */
             g_trim_pos_idle = 1000;
         }
@@ -363,27 +409,35 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
             g_pick_target[0] = (uint8_t)clampf_u8(
                 (int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
             g_pick_target[2] = g_pick_target[0];
+            g_pick_on[0] = 0;
             g_pick_on[2] = 0;
             g_trim_pos_idle = 1000;
         }
     } else {
         if (mask & 2u) {
-            int beats = 1 + (int)((surf->k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
-            engine_set_division(eng, eng->selected_pad, beats);
+            int n = engine_division_from_cc(surf->k2);
+            engine_set_division(eng, eng->selected_pad, n);
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
+            trim_refresh_div_pos_targets(eng);
+            g_pick_on[1] = 1; /* stay tracking N while pot moves */
             g_trim_pos_idle = 1000;
         }
         if (mask & 1u) {
-            trim_apply_pos(eng, eng->selected_pad, (float)surf->k1 / 127.0f);
-            trim_refresh_se_targets(eng);
+            trim_set_div_slice_from_cc(eng, eng->selected_pad, surf->k1);
+            trim_refresh_div_pos_targets(eng);
             g_trim_pos_idle = 0;
         }
     }
     if (mask & 4u) {
-        trim_apply_pos(eng, eng->selected_pad, (float)surf->k3 / 127.0f);
-        trim_refresh_se_targets(eng);
-        g_pick_target[2] =
-            (uint8_t)clampf_u8((int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
+        if (p->freeform) {
+            trim_apply_pos(eng, eng->selected_pad, (float)surf->k3 / 127.0f);
+            trim_refresh_free_targets(eng);
+            g_pick_target[2] =
+                (uint8_t)clampf_u8((int)(eng->pads[eng->selected_pad].window_start * 127.0f + 0.5f));
+        } else {
+            trim_set_div_slice_from_cc(eng, eng->selected_pad, surf->k3);
+            trim_refresh_div_pos_targets(eng);
+        }
         g_trim_pos_idle = 0;
     }
 }
@@ -398,22 +452,25 @@ static void handle_encoder_press(EpicycleEngine *eng, EpicycleSurfaceState *st)
         engine_lfo_toggle_sync(eng, pad);
         return;
     }
-    /* Trim (and other pages): encoder push toggles freeform ↔ division. */
+    /* Trim (and other pages): encoder push toggles freeform ↔ equal-slice DIV.
+     * Never changes mode_page — pages are B1/B2 only. */
     EpicyclePad *p = &eng->pads[pad];
-    if (p->freeform)
-        engine_set_division(eng, pad, p->division_beats > 0 ? p->division_beats : 4);
-    else
+    if (p->freeform) {
+        int n = p->division_beats > 0 ? p->division_beats : 4;
+        n = engine_division_step(n, 0); /* snap to nearest musical N */
+        engine_set_division(eng, pad, n);
+    } else {
         engine_set_division(eng, pad, 0);
-    g_trim_lock_len = eng->pads[pad].window_length;
-    /* Re-arm pickup targets for new free/div mapping. */
-    if (st) {
-        /* st still has current knobs; targets refresh on next arm via page. */
-        pickup_targets_from_pad(eng, eng->mode_page, st->shift_held);
-        g_pick_on[0] = g_pick_on[1] = g_pick_on[2] = 0;
     }
-    if (g_log_paths)
-        epicycle_log(g_log_paths, "trim mode -> %s",
-                     eng->pads[pad].freeform ? "FREE" : "DIV");
+    g_trim_lock_len = eng->pads[pad].window_length;
+    pickup_targets_from_pad(eng, eng->mode_page, st->shift_held);
+    g_pick_on[0] = g_pick_on[1] = g_pick_on[2] = 0;
+    if (g_log_paths) {
+        if (eng->pads[pad].freeform)
+            epicycle_log(g_log_paths, "trim mode -> FREE");
+        else
+            epicycle_log(g_log_paths, "trim mode -> DIV%d", eng->pads[pad].division_beats);
+    }
 }
 
 static void write_host_preview_wav(const char *path, EpicycleEngine *eng, float seconds)
@@ -598,7 +655,7 @@ int main(int argc, char **argv)
         loaded = try_load_card_samples(&eng, &paths);
     if (force_demo || loaded == 0) {
         engine_host_demo_setup(&eng);
-        epicycle_log(&paths, "using synth demo bank (polymeter pads 2/3 = 3 vs 5 beats)");
+        epicycle_log(&paths, "using synth demo bank (DIV4/DIV8/DIV16 equal-slice pads)");
     } else {
         /* Stay freeform so Trim Start/End work on every pad; encoder push
          * toggles division when wanted (forced division made Start look dead). */
@@ -646,8 +703,6 @@ int main(int argc, char **argv)
     int last_shift = -1;
     EpicycleModePage last_page = eng.mode_page;
     int last_sel = eng.selected_pad;
-    uint8_t last_pad_vel[EPICYCLE_PAD_COUNT];
-    memset(last_pad_vel, 0, sizeof last_pad_vel);
     g_quit_guard_ticks = 45; /* ~0.7s after splash before B3 quit armed */
 
     surface_poll();
@@ -684,7 +739,7 @@ int main(int argc, char **argv)
             engine_toggle_loop(&eng, eng.selected_pad);
             surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
             epicycle_log(&paths, "LOOP pad %d -> %s", eng.selected_pad + 1,
-                         eng.pads[eng.selected_pad].loop_enable ? "latch" : "one-shot");
+                         eng.pads[eng.selected_pad].loop_enable ? "latch-toggle" : "one-shot");
         }
 
         for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
@@ -696,19 +751,26 @@ int main(int argc, char **argv)
                     surface_set_selected_pad(i);
                     surface_set_loop_led(eng.pads[i].loop_enable);
                     engine_sync_mod_window(&eng, i);
+                } else if (eng.pads[i].loop_enable) {
+                    /* LOOP latch: each pad press toggles that pad on/off. */
+                    if (engine_pad_voice_active(&eng, i))
+                        engine_stop_pad(&eng, i);
+                    else {
+                        float vel =
+                            surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
+                        engine_note_on(&eng, i, vel);
+                    }
                 } else {
+                    /* One-shot: press starts; plays through window (release ignored). */
                     float vel =
                         surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
                     engine_note_on(&eng, i, vel);
                 }
             }
-            if (st->pad_up[i]) {
+            /* Pad release never stops audio — latch toggles on press; one-shot
+             * runs to the end of the brace in the renderer. */
+            if (st->pad_up[i])
                 st->pad_up[i] = 0;
-                engine_note_off(&eng, i);
-            } else if (last_pad_vel[i] > 0 && surf->pad_vel[i] == 0) {
-                engine_note_off(&eng, i);
-            }
-            last_pad_vel[i] = surf->pad_vel[i];
         }
 
         if (eng.selected_pad != last_sel) {
@@ -757,24 +819,35 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Wheel: Trim = slide POS; Tune = semi; etc. */
+        /* Wheel: Trim FREE = slide POS; Trim DIV = change N (never pages). */
         if (surf->wheel_accum != 0) {
             int delta = surf->wheel_accum;
             st->wheel_accum = 0;
             if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
+                EpicyclePad *p = &eng.pads[eng.selected_pad];
                 if (surf->shift_held) {
-                    EpicyclePad *p = &eng.pads[eng.selected_pad];
                     p->crossfade += (float)delta * 0.01f;
                     if (p->crossfade < 0.01f)
                         p->crossfade = 0.01f;
                     if (p->crossfade > 0.5f)
                         p->crossfade = 0.5f;
-                } else {
+                } else if (p->freeform) {
                     trim_apply_pos(&eng, eng.selected_pad,
-                                   eng.pads[eng.selected_pad].window_start +
-                                       (float)delta * 0.002f);
-                    trim_refresh_se_targets(&eng);
+                                   p->window_start + (float)delta * 0.002f);
+                    trim_refresh_free_targets(&eng);
                     g_trim_pos_idle = 0;
+                } else {
+                    /* Encoder rotates N among 1/2/4/8/16/32 — never changes page. */
+                    int step = delta > 0 ? 1 : (delta < 0 ? -1 : 0);
+                    if (step != 0) {
+                        int n = engine_division_step(p->division_beats, step);
+                        engine_set_division(&eng, eng.selected_pad, n);
+                        g_trim_lock_len = eng.pads[eng.selected_pad].window_length;
+                        pickup_targets_from_pad(&eng, eng.mode_page, surf->shift_held);
+                        g_pick_on[1] = 0;
+                        if (g_log_paths)
+                            epicycle_log(&paths, "DIV -> %d", n);
+                    }
                 }
             } else if (eng.mode_page == EPICYCLE_PAGE_TUNE) {
                 EpicyclePad *p = &eng.pads[eng.selected_pad];

@@ -6,7 +6,7 @@ Per pad: sample **start / end / loop brace** (a **window** you can scroll across
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.2.9-trim-vol-filt` — Trim pickup + width lock, CC19 silence/smooth gain, filter DSP, B1/B2 on press, momentary Shift, phantom-pad harden. Host-tested. Needs Ash card retest + `Epicycle/logs/last-session.log`.
+> **Status:** `0.2.10-div-latch` — equal-slice DIV grid + waveform lines, LOOP pad toggle / one-shot on press, knobs/encoder never page (B1/B2 only), Trim pickup harden. Host-tested. Needs Ash card retest + `Epicycle/logs/last-session.log`.
 
 ## Update the SD card (Ash — firmware 1.4)
 
@@ -52,10 +52,10 @@ make test-host    # demo bank + non-silent preview WAV check
 ### What you should try on the device
 
 1. Splash holds; centered **PRESS ANY PAD TO CONTINUE** under logo.
-2. **Hold SAMPLE + pad** = select; plain pad = play while held; release = stop.
-3. Soft keys: **B1** prev page, **B2** next, **B3 QUIT**. Pages: Trim / Mix / Amp / Tune / Filt / FEnv / LFO.
-4. **Trim:** K1/K2 = Start/End width; K3 = POS slide. **SHIFT:** K1 xfade, K2 FORWARD/PINGPONG. Encoder = free↔div.
-5. **LOOP** button = per-pad latch ↔ one-shot. **Mix:** pad vol + pan (SHIFT+K3 = kit).
+2. **Hold SAMPLE + pad** = select; plain pad = play (see LOOP mode).
+3. Soft keys: **B1** prev page, **B2** next, **B3 QUIT**. Pages: Trim / Mix / Amp / Tune / Filt / FEnv / LFO. Knobs/encoder never change pages.
+4. **Trim FREE:** K1/K2 = Start/End width; K3 = POS slide. **DIV:** equal-slice grid (N=1/2/4/8/16/32); K2=N; K1/K3 pick slice; encoder wheel steps N; push = free↔div. Grid drawn on waveform.
+5. **LOOP** button = latch-toggle ↔ one-shot mode. Latch: pad press toggles loop on/off. One-shot: press plays through brace. **Mix:** pad vol + pan (SHIFT+K3 = kit).
 6. Fader stays full until you move it; Main Volume tracks the knob.
 
 Session log: `Epicycle/logs/last-session.log` on the card.
@@ -102,7 +102,7 @@ install/                 templates shipped into the package
 | Piece | This release | Still later |
 | --- | --- | --- |
 | Loop brace window | Scrollable start + length; knobs + wheel | Full ADSR one-shots |
-| Division / free | 1–32 beats vs freeform vs tempo | Scene snapshots |
+| Division / free | Equal-slice grid (sample/N) vs freeform | Scene snapshots |
 | Crossfade loops | Per-pad amount (K3) | Streaming long beds from SD |
 | Pitch | Octave / semi / fine (API + UI readout) | Dedicated pitch knobs page |
 | LFO / mod matrix | 2 LFOs × 4 routes per pad; brace scrub budgeted to 8 | Full matrix UI, filter DSP |

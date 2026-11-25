@@ -274,6 +274,21 @@ static void draw_waveform(uint32_t *px, const EpicyclePad *pad, float playhead, 
         fill_rect(px, x + col, y + h / 2 - amp, 1, amp * 2, c);
     }
 
+    /* Equal-slice grid lines when in DIV mode (Ash discoverability). */
+    if (!pad->freeform) {
+        int n = pad->division_beats < 1 ? 1 : pad->division_beats;
+        if (n > EPICYCLE_MAX_DIVISION)
+            n = EPICYCLE_MAX_DIVISION;
+        /* Cap drawn lines so DIV32 stays readable on 320px. */
+        int draw_n = n;
+        if (draw_n > 32)
+            draw_n = 32;
+        for (int i = 1; i < draw_n; i++) {
+            int gx = x + (int)(((float)i / (float)n) * (float)w);
+            fill_rect(px, gx, y, 1, h, 0x00384838u);
+        }
+    }
+
     int ux = x + (int)(pad->window_start * (float)w);
     int uw = (int)(pad->window_length * (float)w);
     if (uw < 3)
@@ -407,12 +422,13 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             if (pad && pad->freeform) {
                 draw_text(px, 214, 52, "FREE", COL_BRACE, 3);
                 draw_text(px, 8, 212, "K1/K2 width  K3 slide", COL_MUTED, 1);
+                draw_text(px, 8, 226, "ENC push -> DIV  hold SHIFT xfade", COL_MUTED, 1);
             } else {
                 snprintf(line, sizeof line, "DIV%d", pad ? pad->division_beats : 4);
                 draw_text(px, 200, 52, line, COL_MOD, 3);
-                draw_text(px, 8, 212, "K2 beats  K3 slide", COL_MUTED, 1);
+                draw_text(px, 8, 212, "K2=N slices  K1/K3 pick slice", COL_MUTED, 1);
+                draw_text(px, 8, 226, "ENC wheel=N  push=FREE  B1/B2 page", COL_MUTED, 1);
             }
-            draw_text(px, 8, 226, "ENC free/div  hold SHIFT xfade/dir", COL_MUTED, 1);
         }
     } else if (page == EPICYCLE_PAGE_MIX) {
         draw_text(px, 8, 56, "MIX", COL_FG, 4);

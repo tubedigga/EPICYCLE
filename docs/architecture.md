@@ -39,10 +39,11 @@ Power on
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
 - **engine** — 16 pads × brace window (Start/End lock width + POS slides; LFO scrub
-  unchanged); division/freeform; pitch; crossfade + ping-pong; LOOP latch; Chamberlin
-  SVF filter (default OFF); 2 LFOs + 4 mod routes; scrub budget = 8.
-- **ui** — splash `PRESS ANY PAD TO CONTINUE`; Trim waveform + large FREE/DIV badge;
-  Shift overlay momentary; Mix/Filter/LFO pages.
+  unchanged); equal-slice division/freeform; pitch; crossfade + ping-pong; LOOP
+  latch-toggle / one-shot; Chamberlin SVF filter (default OFF); 2 LFOs + 4 mod
+  routes; scrub budget = 8.
+- **ui** — splash `PRESS ANY PAD TO CONTINUE`; Trim waveform + DIV grid + FREE/DIV
+  badge; Shift overlay momentary; Mix/Filter/LFO pages.
 
 ## Loop brace / modulation
 
@@ -50,10 +51,15 @@ Power on
 sample  |==============================|
 window  |----[###########]-------------|   start + length
 LFO     |----[####·······]-------------|   start slides (scrub)
+DIV N   |[#][#][#][#]…                 |   equal slices; brace = one slice
 ```
+
+Division mode uses an equal-slice grid (length = 1/N), not tempo-mapped beat
+frames. Latch mode: pad press toggles loop on/off; one-shot plays through on press.
 
 Mod destinations: `BRACE_START`, `BRACE_LEN`, `PITCH`, `LEVEL`, `FILTER` (stub).
 LFO page edits shape / rate / sync|free / depth (enables brace scrub).
+Pages cycle only via soft keys B1/B2 — knobs/encoder never change `mode_page`.
 
 ## Data on card
 
