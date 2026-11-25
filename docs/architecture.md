@@ -1,4 +1,4 @@
-# Architecture (panel bring-up)
+# Architecture (loop engine)
 
 EPICYCLE runs as a userspace app started from microSD autorun after stock
 `ac50.service` comes up. It does not replace the kernel or flash firmware.
@@ -11,7 +11,8 @@ Power on
      1.3: autorun.check → autorun/autorun.sh
   → launcher copies binary to /run, stops ac50, runs epicycle
   → display (/dev/fb0) + I2S ALSA + Surface MIDI
-  → splash → home UI (pads / knobs)
+  → splash → loop UI (pads / waveform brace / knobs)
+  → audio thread ← engine_render (16 voices, crossfade loops)
   → wheel push → clean close
   → systemctl start ac50
 ```
@@ -23,11 +24,25 @@ Power on
 - **display** — software 320×240 `0x00RRGGBB` buffer; present via mmap/write to
   `/dev/fb0` using `FBIOGET_*` stride and bpp (RGB565 or 32-bit).
 - **audio** — I2S card PCM via kernel ioctls (no alsa-lib): S32_LE stereo 44.1 kHz,
-  silent keep-alive thread, `DROP` on close.
-- **surface** — Control Surface raw MIDI: published pad/knob/wheel map, lights off,
-  position-request SysEx, quit on wheel push / right soft key.
-- **engine** — 16 pads with start/end/loop fields; silent render callback shape.
-- **ui** — brand splash + home (status, pad grid, knob bars, quit hint).
+  realtime thread calls `engine_render` when an engine is bound; `DROP` on close.
+- **surface** — Control Surface raw MIDI: pads, K1–K3, soft keys (free/div, LFO),
+  wheel scroll/quit, lights off, position-request SysEx.
+- **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
+- **engine** — 16 pads × scrollable brace window; division (1–32 beats) or freeform;
+  pitch (oct/semi/fine); crossfade loopers; 16 voices; 2 LFOs + 4 mod routes per pad;
+  brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8).
+- **ui** — brand splash + loop screen (grid, waveform, brace, knob legend).
+
+## Loop brace / modulation
+
+```text
+sample  |==============================|
+window  |----[###########]-------------|   start + length
+LFO     |----[####·······]-------------|   start slides (scrub)
+```
+
+Mod destinations (hooks for later UI): `BRACE_START`, `BRACE_LEN`, `PITCH`,
+`LEVEL`, `FILTER` (stub). Soft-mid toggles LFO0 → brace start on the selected pad.
 
 ## Data on card
 
@@ -40,4 +55,5 @@ Power on
     epicycle/epicycle        # binary + hints
   Epicycle/
     projects/ samples/ kits/ logs/ settings.json
+    samples/pad01.wav …      # optional; else synth demo bank
 ```

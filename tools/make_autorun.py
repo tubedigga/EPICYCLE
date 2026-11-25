@@ -221,6 +221,11 @@ def main() -> None:
         "EPICYCLE user data lives here. Safe to keep when replacing autorun/.\n",
         encoding="utf-8",
     )
+    (data / "samples" / "README.txt").write_text(
+        "Drop pad01.wav … pad16.wav (or 1.wav …) here. PCM WAV only.\n"
+        "If empty, EPICYCLE uses a built-in demo tone bank.\n",
+        encoding="utf-8",
+    )
 
     zip_name = f"EPICYCLE-{args.version}.zip"
     zpath = out / zip_name

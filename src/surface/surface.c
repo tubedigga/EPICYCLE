@@ -181,10 +181,15 @@ static void midi_feed(uint8_t b)
     }
 
     if (ch == 0 && (cmd == 0x90 || cmd == 0x80)) {
-        /* Channel 1 buttons. Wheel push = note 111; soft-right = 14. */
+        /* Channel 1 buttons. Wheel push = note 111; soft-right = 14.
+         * Soft-left (12) = toggle free/division; soft-mid (13) = toggle LFO scrub. */
         int on = (cmd == 0x90 && m_d[1] > 0);
         if (on && (m_d[0] == 111 || m_d[0] == 14))
             g_state.quit_requested = 1;
+        if (on && m_d[0] == 12)
+            g_state.soft_left = 1;
+        if (on && m_d[0] == 13)
+            g_state.soft_mid = 1;
         return;
     }
 
@@ -201,6 +206,7 @@ static void midi_feed(uint8_t b)
         }
         if (cmd == 0x90 && m_d[1] > 0) {
             g_state.pad_vel[idx] = m_d[1];
+            g_state.pad_down[idx] = 1; /* edge for note-on; app clears */
             light_pad(g_fd, idx, 40, 180, 160);
         } else {
             g_state.pad_vel[idx] = 0;
@@ -288,6 +294,11 @@ int surface_poll_quit(void)
 }
 
 const EpicycleSurfaceState *surface_state(void)
+{
+    return &g_state;
+}
+
+EpicycleSurfaceState *surface_state_mut(void)
 {
     return &g_state;
 }

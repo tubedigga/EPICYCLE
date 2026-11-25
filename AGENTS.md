@@ -3,8 +3,8 @@
 ## Product
 
 **EPICYCLE** is an experimental freeform looping playground for the Akai MPC Sample.
-Per-pad start / end / loop brace, knobs + LFOs, time-division or freeform regions,
-crossfade loops, phrase recorder. This repo is MIT static C (thin C++ allowed later).
+Per-pad scrollable loop brace (window), knobs + LFOs, time-division or freeform regions,
+crossfade loops, phrase recorder (later). This repo is MIT static C (thin C++ allowed later).
 
 ## Hard rules
 
@@ -19,8 +19,9 @@ crossfade loops, phrase recorder. This repo is MIT static C (thin C++ allowed la
 
 | Path | Role |
 | --- | --- |
-| `src/` | App: DRM/fb display, ALSA I2S (ioctl), surface MIDI, loop engine stubs, UI |
+| `src/` | App: DRM/fb, ALSA I2S (ioctl), surface MIDI, loop engine, WAV, UI |
 | `tools/make_autorun.py` | Pack `autorun/` (+ top `autorun.sh`), compute 1.3 `autorun.check`, zip |
+| `tools/check_preview.py` | Host preview WAV must be non-silent |
 | `install/` | Templates and recovery helpers copied into the package |
 | `docs/` | Design notes that belong in-repo (keep Project store docs as source of vision) |
 
@@ -30,10 +31,19 @@ crossfade loops, phrase recorder. This repo is MIT static C (thin C++ allowed la
 make                # aarch64 static binary → build/epicycle
 make host           # native smoke for CI / desktop
 make package        # dist/EPICYCLE-*.zip SD payload
+make test-host      # --preview WAV + peak check + --demo
 ```
 
-Cross compiler: `aarch64-linux-gnu-gcc` (or set `CROSS=`). Links with `-pthread`
-(audio keep-alive thread). No alsa-lib — kernel ioctls only so static builds stay simple.
+Cross compiler: `aarch64-linux-gnu-gcc` (or set `CROSS=`). Links with `-pthread -lm`.
+No alsa-lib — kernel ioctls only so static builds stay simple.
+
+## Loop / mod model (v0)
+
+- Brace = **window** (`window_start` + `window_length`); knobs/LFO slide start across the sample.
+- Time-locked: length = N beats × tempo × sample rate (no warp). Freeform: length from K2.
+- Per pad: up to **2 LFOs** and **4 mod routes** (`EpicycleModDest`: brace start/len, pitch, level, filter stub).
+- Aggressive **brace scrub** limited to first **8** pads that request it (`EPICYCLE_SCRUB_BUDGET`); others may still use pitch/level LFO.
+- Full modulation-matrix UI can come later — keep the structs/routes wired.
 
 ## Boot / recovery patterns (SampleBoot OS-AUTHORS)
 
@@ -41,12 +51,12 @@ Cross compiler: `aarch64-linux-gnu-gcc` (or set `CROSS=`). Links with `-pthread`
 - Resolve **card root from `/proc/mounts`** (longest mount prefix).
 - OS under `autorun/epicycle/`; user data under `<card>/Epicycle/`.
 - On exit: restore stock with `systemctl start ac50` (launcher trap / start script).
-- Optional SampleBoot assets: `sampleboot.txt`, `sampleboot.png` (320×240).
 
-## Stub vs real (bring-up)
+## Stub vs real (loop engine)
 
-| Real | Still stub |
+| Real | Still stub / later |
 | --- | --- |
-| `/dev/fb0` present with stride/bpp | Loop engine / samples |
-| Surface MIDI pads/knobs/wheel quit | Full LED scenes, every button |
-| I2S silent stream open/close | Click-free volume ramp, capture |
+| Crossfade loop voices, WAV load, division/free | Phrase recorder |
+| Brace scroll (knobs/wheel/LFO), pitch ratio | Filter DSP, full ADSR |
+| Mod matrix data model + basic LFO | Full matrix UI |
+| Host `--preview` non-silent check | Hardware sign-off |
