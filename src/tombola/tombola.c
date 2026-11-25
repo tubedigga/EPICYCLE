@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT
  *
  * Soft 2D tombola: morphing N-gon / circle drum, coloured balls, wall-hit
- * triggers. Fader=shape morph, K2=bipolar spin; MUTE+pad toggles balls.
- * Empty start — balls rest at bottom until spin lifts them. HitMod slots
- * start empty/off (no default pitch/filt). Freeze/capture is phase 2.
+ * triggers. Fader=shape morph ONLY; K1=bipolar spin; MUTE+pad toggles balls.
+ * Balls are hard-contained (no orbit outside walls). Empty start — rest at
+ * bottom until spin lifts. HitMod slots empty/off. Freeze = phase 2.
+ * Feel reference: OP-1 tombola (aleatoric bounce→trig) — not a clone.
  */
 #include "epicycle.h"
 
@@ -16,15 +17,16 @@
 
 #define TB_RADIUS 1.0f
 #define TB_BALL_R 0.085f
-#define TB_HIT_COOLDOWN 0.055f
+#define TB_HIT_COOLDOWN 0.070f
 #define TB_MAX_HITS 16
-#define TB_DAMP 0.9985f
-#define TB_WALL_RESTITUTION 0.78f
-#define TB_SPIN_KICK 0.85f
-#define TB_GRAVITY 1.35f
-#define TB_SPIN_MAX 14.0f
-#define TB_FLOOR_FRIC 0.82f
+#define TB_DAMP 0.9988f
+#define TB_WALL_RESTITUTION 0.82f
+#define TB_SPIN_KICK 0.55f /* scoop without flinging past walls */
+#define TB_GRAVITY 1.25f
+#define TB_SPIN_MAX 10.0f /* responsive but not chaotic (OP-1 feel, not clone) */
+#define TB_FLOOR_FRIC 0.85f
 #define TB_REST_SPEED 0.12f
+#define TB_CONTAIN_ITERS 4 /* multi-pass half-plane projection */
 
 static EpicycleTombola g_tb;
 static float g_cooldown[EPICYCLE_PAD_COUNT];
@@ -61,18 +63,22 @@ static void place_ball_rest(EpicycleTombolaBall *b, int pad)
     b->hit_flash = 0.0f;
 }
 
-/* Face count from morph: 0 → circle; else 3..16 (circle → more faces). */
+/*
+ * Face count from morph: 0 → circle; else 3..16 (circle → more faces).
+ * Wider bands per face so fader noise does not flicker shape (Ash: no
+ * unwanted shrink/expand). Only the fader drives morph — never auto.
+ */
 int tombola_face_count(float morph01)
 {
     float m = clampf(morph01, 0.0f, 1.0f);
-    if (m < 0.04f)
+    if (m < 0.06f)
         return 0; /* circle */
-    /* Map remaining range to 3..16 faces. */
-    int n = 3 + (int)((m - 0.04f) / 0.96f * 13.99f);
+    /* Map remaining range to 3..12 faces (smoother steps than 3..16). */
+    int n = 3 + (int)((m - 0.06f) / 0.94f * 9.99f);
     if (n < 3)
         n = 3;
-    if (n > 16)
-        n = 16;
+    if (n > 12)
+        n = 12;
     return n;
 }
 
@@ -88,8 +94,8 @@ void tombola_init(EpicycleTombola *tb)
     if (!tb)
         tb = &g_tb;
     memset(tb, 0, sizeof *tb);
-    tb->morph = 0.28f; /* start with a few faces visible */
-    tb->spin_speed = 0.0f; /* idle until K2; empty drum */
+    tb->morph = 0.28f; /* start with a few faces visible — fader only changes this */
+    tb->spin_speed = 0.0f; /* idle until K1; empty drum */
     tb->radius = TB_RADIUS;
     tb->face_count = tombola_face_count(tb->morph);
     tb->ball_target = 0;
@@ -197,22 +203,25 @@ void tombola_set_morph(EpicycleTombola *tb, float morph01)
     tb->face_count = tombola_face_count(tb->morph);
 }
 
-void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k2)
+void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k1)
 {
     if (!tb)
         tb = &g_tb;
-    /* Bipolar: 64 ± wide deadband = stop (Ash: spin must not jump alone). */
-    int c = (int)k2 - 64;
-    if (c > -8 && c < 8) {
+    /* Bipolar K1: 64 ± deadband = stop. Fader never touches spin. */
+    int c = (int)k1 - 64;
+    if (c > -6 && c < 6) {
         tb->spin_speed = 0.0f;
         return;
     }
-    float n = (float)c / 56.0f; /* map outside deadband → ±1 */
+    float n = (float)c / 58.0f; /* map outside deadband → ±1 */
     if (n < -1.0f)
         n = -1.0f;
     if (n > 1.0f)
         n = 1.0f;
-    tb->spin_speed = n * TB_SPIN_MAX;
+    /* Mild ease so small moves feel smooth, not jerky. */
+    float mag = fabsf(n);
+    float shaped = mag * mag * (3.0f - 2.0f * mag); /* smoothstep */
+    tb->spin_speed = ((n < 0.0f) ? -shaped : shaped) * TB_SPIN_MAX;
 }
 
 void tombola_set_ball_count(EpicycleTombola *tb, int count)
@@ -289,10 +298,89 @@ static void push_hit(EpicycleTombola *tb, int pad, float vel)
     tb->balls[pad].hit_flash = 1.0f;
 }
 
+/* Outward unit normal + a point on edge e of the local N-gon (circumradius R). */
+static void ngon_edge(int faces, int e, float R, float *nx, float *ny, float *px, float *py)
+{
+    float a0 = (float)e * (float)(2.0 * M_PI / faces) - (float)M_PI / (float)faces;
+    float a1 = (float)(e + 1) * (float)(2.0 * M_PI / faces) - (float)M_PI / (float)faces;
+    float x0 = cosf(a0) * R, y0 = sinf(a0) * R;
+    float x1 = cosf(a1) * R, y1 = sinf(a1) * R;
+    float ex = x1 - x0, ey = y1 - y0;
+    float el = len2(ex, ey);
+    if (el < 1e-6f) {
+        *nx = cosf(0.5f * (a0 + a1));
+        *ny = sinf(0.5f * (a0 + a1));
+        *px = x0;
+        *py = y0;
+        return;
+    }
+    *nx = ey / el;
+    *ny = -ex / el;
+    float midx = 0.5f * (x0 + x1), midy = 0.5f * (y0 + y1);
+    if (midx * (*nx) + midy * (*ny) < 0.0f) {
+        *nx = -*nx;
+        *ny = -*ny;
+    }
+    *px = x0;
+    *py = y0;
+}
+
+/* Hard project into shape — kills "orbit outside walls" (Ash). */
+static void contain_local(EpicycleTombola *tb, float *x, float *y, float *vx, float *vy)
+{
+    float R = tb->radius - TB_BALL_R;
+    if (R < 0.2f)
+        R = 0.2f;
+    int faces = tb->face_count;
+
+    if (faces <= 0) {
+        float d = len2(*x, *y);
+        if (d > R && d > 1e-5f) {
+            float s = R / d;
+            *x *= s;
+            *y *= s;
+            float nx = *x / R, ny = *y / R;
+            float vn = (*vx) * nx + (*vy) * ny;
+            if (vn > 0.0f) {
+                *vx -= vn * nx;
+                *vy -= vn * ny;
+            }
+        }
+        return;
+    }
+
+    for (int iter = 0; iter < TB_CONTAIN_ITERS; iter++) {
+        int outside = 0;
+        for (int e = 0; e < faces; e++) {
+            float nx, ny, px, py;
+            ngon_edge(faces, e, R, &nx, &ny, &px, &py);
+            float dist = (*x - px) * nx + (*y - py) * ny;
+            if (dist > 0.0f) {
+                *x -= nx * dist;
+                *y -= ny * dist;
+                float vn = (*vx) * nx + (*vy) * ny;
+                if (vn > 0.0f) {
+                    *vx -= vn * nx;
+                    *vy -= vn * ny;
+                }
+                outside = 1;
+            }
+        }
+        if (!outside)
+            break;
+    }
+    /* Final circumradius safety (should rarely fire after half-planes). */
+    float d = len2(*x, *y);
+    if (d > R && d > 1e-5f) {
+        *x *= R / d;
+        *y *= R / d;
+    }
+}
+
 /*
  * Collision in the drum's local (unrotated) frame.
- * Circle: radial clamp. N-gon: push inside each half-plane, reflect.
- * Spin kick scoops resting balls; soft restitution keeps feel cooperative.
+ * Circle: radial clamp. N-gon: multi-pass half-plane + hard contain.
+ * Spin kick scoops resting balls; never leaves balls outside the walls.
  */
 static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float *vx, float *vy,
                          float spin_speed)
@@ -316,13 +404,11 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
             if (vn > 0.0f) {
                 *vx -= (1.0f + TB_WALL_RESTITUTION) * vn * nx;
                 *vy -= (1.0f + TB_WALL_RESTITUTION) * vn * ny;
-                impact = vn + spin_abs * 0.12f;
+                impact = vn + spin_abs * 0.10f;
                 hit = 1;
             }
-            /* Tangential scoop from spinning wall (lifts resting balls). */
             *vx += tx * spin_speed * TB_SPIN_KICK * R;
             *vy += ty * spin_speed * TB_SPIN_KICK * R;
-            /* Floor friction when nearly resting against wall. */
             if (spin_abs < 0.4f && vn < TB_REST_SPEED) {
                 float vt = (*vx) * tx + (*vy) * ty;
                 *vx -= tx * vt * (1.0f - TB_FLOOR_FRIC);
@@ -332,49 +418,47 @@ static int collide_local(EpicycleTombola *tb, int pad, float *x, float *y, float
             *y = ny * R;
         }
     } else {
-        for (int e = 0; e < faces; e++) {
-            float a0 = (float)e * (float)(2.0 * M_PI / faces) - (float)M_PI / (float)faces;
-            float a1 = (float)(e + 1) * (float)(2.0 * M_PI / faces) - (float)M_PI / (float)faces;
-            float x0 = cosf(a0) * R, y0 = sinf(a0) * R;
-            float x1 = cosf(a1) * R, y1 = sinf(a1) * R;
-            float ex = x1 - x0, ey = y1 - y0;
-            float el = len2(ex, ey);
-            if (el < 1e-6f)
-                continue;
-            float nx = ey / el;
-            float ny = -ex / el;
-            float midx = 0.5f * (x0 + x1), midy = 0.5f * (y0 + y1);
-            if (midx * nx + midy * ny < 0.0f) {
-                nx = -nx;
-                ny = -ny;
-            }
-            float dist = (*x - x0) * nx + (*y - y0) * ny;
-            if (dist > 0.0f) {
-                float vn = (*vx) * nx + (*vy) * ny;
-                float tx = -ny, ty = nx;
-                if (vn > 0.0f) {
-                    *vx -= (1.0f + TB_WALL_RESTITUTION) * vn * nx;
-                    *vy -= (1.0f + TB_WALL_RESTITUTION) * vn * ny;
-                    impact = vn + spin_abs * 0.12f;
-                    hit = 1;
+        for (int iter = 0; iter < TB_CONTAIN_ITERS; iter++) {
+            int any = 0;
+            for (int e = 0; e < faces; e++) {
+                float nx, ny, px, py;
+                ngon_edge(faces, e, R, &nx, &ny, &px, &py);
+                float dist = (*x - px) * nx + (*y - py) * ny;
+                if (dist > 0.0f) {
+                    float vn = (*vx) * nx + (*vy) * ny;
+                    float tx = -ny, ty = nx;
+                    if (vn > 0.0f) {
+                        *vx -= (1.0f + TB_WALL_RESTITUTION) * vn * nx;
+                        *vy -= (1.0f + TB_WALL_RESTITUTION) * vn * ny;
+                        float imp = vn + spin_abs * 0.10f;
+                        if (imp > impact)
+                            impact = imp;
+                        hit = 1;
+                    }
+                    /* Scoop only on contact, scaled down if already fast. */
+                    float kick = TB_SPIN_KICK * R;
+                    float spd = len2(*vx, *vy);
+                    if (spd > 2.5f)
+                        kick *= 2.5f / spd;
+                    *vx += tx * spin_speed * kick;
+                    *vy += ty * spin_speed * kick;
+                    if (spin_abs < 0.4f && vn < TB_REST_SPEED) {
+                        float vt = (*vx) * tx + (*vy) * ty;
+                        *vx -= tx * vt * (1.0f - TB_FLOOR_FRIC);
+                        *vy -= ty * vt * (1.0f - TB_FLOOR_FRIC);
+                    }
+                    *x -= nx * dist;
+                    *y -= ny * dist;
+                    any = 1;
                 }
-                *vx += tx * spin_speed * TB_SPIN_KICK * R;
-                *vy += ty * spin_speed * TB_SPIN_KICK * R;
-                if (spin_abs < 0.4f && vn < TB_REST_SPEED) {
-                    float vt = (*vx) * tx + (*vy) * ty;
-                    *vx -= tx * vt * (1.0f - TB_FLOOR_FRIC);
-                    *vy -= ty * vt * (1.0f - TB_FLOOR_FRIC);
-                }
-                *x -= nx * dist;
-                *y -= ny * dist;
             }
-        }
-        float d = len2(*x, *y);
-        if (d > R * 1.05f && d > 1e-5f) {
-            *x *= R / d;
-            *y *= R / d;
+            if (!any)
+                break;
         }
     }
+
+    /* Always hard-contain — Ash: balls must not orbit outside. */
+    contain_local(tb, x, y, vx, vy);
 
     if (hit)
         push_hit(tb, pad, clampf(impact * 0.55f, 0.12f, 1.0f));
@@ -476,6 +560,27 @@ void tombola_step(EpicycleTombola *tb, float dt)
             }
         }
     }
+
+    /*
+     * Re-contain after ball–ball push (Ash: separation was flinging balls
+     * past walls into an outside orbit). Rotate into local, clamp, rotate out.
+     */
+    c = cosf(tb->spin_rad);
+    s = sinf(tb->spin_rad);
+    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
+        EpicycleTombolaBall *b = &tb->balls[i];
+        if (!b->active)
+            continue;
+        float lx = b->x * c + b->y * s;
+        float ly = -b->x * s + b->y * c;
+        float lvx = b->vx * c + b->vy * s;
+        float lvy = -b->vx * s + b->vy * c;
+        contain_local(tb, &lx, &ly, &lvx, &lvy);
+        b->x = lx * c - ly * s;
+        b->y = lx * s + ly * c;
+        b->vx = lvx * c - lvy * s;
+        b->vy = lvx * s + lvy * c;
+    }
 }
 
 int tombola_drain_hits(EpicycleTombola *tb, int *pads_out, float *vels_out, int max_n)
@@ -570,18 +675,34 @@ int tombola_selftest(void)
             if (!tb.balls[b].active)
                 continue;
             float d = len2(tb.balls[b].x, tb.balls[b].y);
-            if (d > tb.radius + 0.25f)
+            /* Tight contain: centre of ball must stay inside circumradius. */
+            if (d > tb.radius - TB_BALL_R + 0.02f)
                 return -1; /* escaped */
         }
     }
     if (hits_total < 1)
         return -2; /* spin should scoop and bounce */
 
+    /* Triangle morph: must stay inside half-planes (Ash: no orbit outside). */
     tombola_set_morph(&tb, 1.0f);
     if (tb.face_count < 3)
         return -3;
-    for (int i = 0; i < 120; i++)
+    for (int i = 0; i < 240; i++) {
         tombola_step(&tb, 1.0f / 60.0f);
+        float R = tb.radius - TB_BALL_R;
+        int faces = tb.face_count;
+        for (int b = 0; b < EPICYCLE_PAD_COUNT; b++) {
+            if (!tb.balls[b].active)
+                continue;
+            for (int e = 0; e < faces; e++) {
+                float nx, ny, px, py;
+                ngon_edge(faces, e, R, &nx, &ny, &px, &py);
+                float dist = (tb.balls[b].x - px) * nx + (tb.balls[b].y - py) * ny;
+                if (dist > 0.04f)
+                    return -18; /* outside a wall */
+            }
+        }
+    }
 
     tombola_toggle_ball(&tb, 3);
     if (tombola_ball_active(&tb, 3))
