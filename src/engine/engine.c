@@ -657,6 +657,15 @@ void engine_toggle_loop(EpicycleEngine *eng, int pad)
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     eng->pads[pad].loop_enable = eng->pads[pad].loop_enable ? 0 : 1;
+    /* LOOP off: force every live voice for this pad to one-shot (no stuck wrap). */
+    if (!eng->pads[pad].loop_enable) {
+        for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+            if (eng->voices[i].active && eng->voices[i].pad_index == pad) {
+                eng->voices[i].force_oneshot = 1;
+                eng->voices[i].in_crossfade = 0;
+            }
+        }
+    }
 }
 
 void engine_set_ping_pong(EpicycleEngine *eng, int pad, int on)
@@ -789,18 +798,20 @@ void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float p
         }
     }
 
+    /*
+     * Wall hit = same voice path as pad press (Ash: bounce was near-silent).
+     * Old path cleared gate → ADSR skipped sustain and died in ~15 ms.
+     * Keep gate high so one-shot plays through the brace like a pad hit;
+     * force_oneshot still blocks brace wrap when LOOP is off.
+     */
     engine_note_on(eng, pad, velocity);
     for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
         if (eng->voices[i].active && eng->voices[i].pad_index == pad) {
             eng->voices[i].impact_pitch = clampf(pitch_mul, 0.25f, 4.0f);
             eng->voices[i].impact_filt = clampf(filt_add, -0.9f, 0.9f);
             eng->voices[i].impact_level = clampf(level_mul, 0.05f, 2.0f);
-            /* Reaffirm: LOOP off → hard one-shot (no brace wrap). */
             eng->voices[i].force_oneshot = p->loop_enable ? 0 : 1;
-            if (!p->loop_enable) {
-                /* Impact one-shots are envelope-driven: no long sustain hold. */
-                eng->voices[i].gate = 0;
-            }
+            /* gate stays 1 — identical to pad press until brace end / LOOP off. */
             break;
         }
     }

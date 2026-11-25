@@ -394,7 +394,7 @@ static void put_px_soft(uint32_t *px, int x, int y, uint32_t c, float a)
     *dst = blend_rgb(*dst, c, a);
 }
 
-/* Bresenham line with soft thickness for smoother polygon edges. */
+/* Bresenham line with soft 2px AA thickness (cleaner walls on 320×240). */
 static void draw_line(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
 {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
@@ -402,10 +402,12 @@ static void draw_line(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
     int err = dx + dy;
     for (;;) {
         put_px(px, x0, y0, c);
-        put_px_soft(px, x0 + 1, y0, c, 0.55f);
-        put_px_soft(px, x0, y0 + 1, c, 0.55f);
-        put_px_soft(px, x0 - 1, y0, c, 0.35f);
-        put_px_soft(px, x0, y0 - 1, c, 0.35f);
+        put_px_soft(px, x0 + 1, y0, c, 0.65f);
+        put_px_soft(px, x0, y0 + 1, c, 0.65f);
+        put_px_soft(px, x0 - 1, y0, c, 0.45f);
+        put_px_soft(px, x0, y0 - 1, c, 0.45f);
+        put_px_soft(px, x0 + 1, y0 + 1, c, 0.28f);
+        put_px_soft(px, x0 - 1, y0 - 1, c, 0.22f);
         if (x0 == x1 && y0 == y1)
             break;
         int e2 = 2 * err;
@@ -513,7 +515,11 @@ static void stroke_disk(uint32_t *px, int cx, int cy, int r, uint32_t c)
     }
 }
 
-/* Morph-smooth outline: dense sampling + corner rounding toward circle. */
+/*
+ * Outline matches physics walls closely (Ash: balls must look contained).
+ * Mild corner round only near circle morph — avoid drawing a bigger cage
+ * than the collider (that made balls look like they escaped).
+ */
 static void tombola_smooth_edge(const EpicycleTombola *tb, float t01, float *ox, float *oy)
 {
     float R = tb->radius;
@@ -524,13 +530,12 @@ static void tombola_smooth_edge(const EpicycleTombola *tb, float t01, float *ox,
         *oy = sinf(ang) * R;
         return;
     }
-    /* Blend N-gon with circle for smoother morph (Ash: less lo-fi). */
     float morph = tb->morph;
     float blend = 0.0f;
     if (morph < 0.04f)
         blend = 1.0f;
-    else if (morph < 0.18f)
-        blend = 1.0f - (morph - 0.04f) / 0.14f;
+    else if (morph < 0.12f)
+        blend = 1.0f - (morph - 0.04f) / 0.08f;
     float a_face = ang;
     float sector = (float)(2.0 * M_PI / faces);
     float local = fmodf(a_face + (float)M_PI / (float)faces, sector);
@@ -548,8 +553,8 @@ static void tombola_smooth_edge(const EpicycleTombola *tb, float t01, float *ox,
     float py = y0 + (y1 - y0) * edge_t;
     float cx = cosf(ang) * R;
     float cy = sinf(ang) * R;
-    /* Mild corner round even at high morph. */
-    float round = 0.12f + 0.88f * blend;
+    /* Keep round subtle so outline ≈ collision hull. */
+    float round = 0.04f + 0.96f * blend;
     *ox = px * (1.0f - round) + cx * round;
     *oy = py * (1.0f - round) + cy * round;
 }
@@ -569,10 +574,10 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         fill_rect(px, cx - half, cy + y, half * 2, 1, 0x00161612u);
     }
 
-    /* Dense smooth outline (circle + rounded N-gon morph). */
+    /* Dense AA outline — matches collider; 128 segs for cleaner arcs. */
     {
         int prevx = 0, prevy = 0;
-        const int segs = 96;
+        const int segs = 128;
         uint32_t edge_col = (tb->face_count <= 0) ? COL_ACCENT : COL_BRACE;
         for (int i = 0; i <= segs; i++) {
             float ox, oy;
@@ -665,7 +670,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         int active = tb ? tombola_active_count(tb) : 0;
         snprintf(v3, sizeof v3, "%d", active);
         draw_param_row(px, 188, "SHAPE", v1, "SPIN", v2, "BALLS", v3);
-        draw_text(px, 8, 226, "FADER morph  MAIN vol  K2 spin  MUTE+pad  FULL=HITMOD", COL_MUTED, 1);
+        draw_text(px, 8, 226, "FADER morph  MAIN vol  K1 spin  MUTE+pad  FULL=HITMOD", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_HITMOD) {
         draw_text(px, 8, 48, "HIT MOD", COL_FG, 2);
         draw_text(px, 120, 52, "src->dest matrix", COL_MUTED, 1);

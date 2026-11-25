@@ -3,7 +3,7 @@
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
  * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.4: FREE Trim End unlock after narrow; Start/End always resize; POS slides.
+ * 0.3.5: bounce=pad press; hard contain; fader morph / K1 spin; smooth Trim.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -35,7 +35,7 @@ static void usage(const char *argv0)
             "  --tombola-selftest physics containment + hit + mute ball checks\n"
             "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: FADER morph, MAIN vol, K2 spin; MUTE+pad balls; FULL=HitMod; B3 quit.\n",
+            "  On device: FADER morph, MAIN vol, K1 spin; MUTE+pad balls; FULL=HitMod; B3 quit.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -499,22 +499,18 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
     }
 
     if (p->freeform) {
-        /* Start/End = region length only; always expand/shrink (Ash). */
+        /*
+         * Start/End = region length only. Smooth relative tracking after pickup
+         * (Ash: abs snap on engage felt jumpy). Never jump brace to pot position.
+         */
         if (mask & 1u) {
             if (!g_trim_rel[0]) {
-                trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
                 g_trim_rel[0] = 1;
-                g_trim_edge_cc[0] = surf->k1;
+                g_trim_edge_cc[0] = surf->k1; /* arm only — no abs jump */
             } else {
                 int d = (int)surf->k1 - (int)g_trim_edge_cc[0];
                 g_trim_edge_cc[0] = surf->k1;
-                /* Close snap only — never block reopen. */
-                float abs01 = (float)surf->k1 / 127.0f;
-                float end = eng->pads[eng->selected_pad].window_start +
-                            eng->pads[eng->selected_pad].window_length;
-                if (d > 0 && abs01 >= end - 0.02f)
-                    trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
-                else
+                if (d)
                     trim_nudge_edge(eng, eng->selected_pad, 0, d);
             }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
@@ -525,18 +521,12 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
         }
         if (mask & 2u) {
             if (!g_trim_rel[1]) {
-                trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
                 g_trim_rel[1] = 1;
-                g_trim_edge_cc[1] = surf->k2;
+                g_trim_edge_cc[1] = surf->k2; /* arm only — no abs jump */
             } else {
                 int d = (int)surf->k2 - (int)g_trim_edge_cc[1];
                 g_trim_edge_cc[1] = surf->k2;
-                float abs01 = (float)surf->k2 / 127.0f;
-                float st = eng->pads[eng->selected_pad].window_start;
-                /* Closing snap to grain only; opening always uses nudge (unlock). */
-                if (d < 0 && abs01 <= st + 0.02f)
-                    trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
-                else
+                if (d)
                     trim_nudge_edge(eng, eng->selected_pad, 1, d);
             }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
@@ -820,7 +810,80 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--tombola-selftest") == 0) {
             int rc = tombola_selftest();
+            /* Bounce audio: wall hit must peak like pad press (Ash silent bounce). */
+            if (rc == 0) {
+                EpicycleEngine eng;
+                engine_init(&eng, 44100);
+                engine_host_demo_setup(&eng);
+                for (int p = 0; p < EPICYCLE_PAD_COUNT; p++)
+                    eng.pads[p].loop_enable = 0;
+                eng.main_sq = eng.main_sq_target = 1.0f;
+                eng.fader_gain = 1.0f;
+                eng.master_gain = 1.0f;
+                EpicycleTombola *tb = tombola_state();
+                tombola_init(tb);
+                tombola_set_ball_count(tb, 8);
+                tombola_set_spin_cc(tb, 110);
+                tombola_set_morph(tb, 0.0f);
+                int32_t L[EPICYCLE_AUDIO_FRAMES], R[EPICYCLE_AUDIO_FRAMES];
+                int hits = 0;
+                int32_t peak_hit = 0;
+                for (int t = 0; t < 180; t++) {
+                    tombola_step(tb, 1.0f / 60.0f);
+                    int pads[EPICYCLE_PAD_COUNT];
+                    float vels[EPICYCLE_PAD_COUNT];
+                    int n = tombola_drain_hits(tb, pads, vels, EPICYCLE_PAD_COUNT);
+                    for (int h = 0; h < n; h++) {
+                        engine_note_on_impact(&eng, pads[h], vels[h], 1.0f, 0.0f, 1.0f);
+                        hits++;
+                    }
+                    engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
+                    for (size_t s = 0; s < EPICYCLE_AUDIO_FRAMES; s++) {
+                        int32_t a = L[s] < 0 ? -L[s] : L[s];
+                        if (a > peak_hit)
+                            peak_hit = a;
+                    }
+                }
+                /* Pad-press reference peak. */
+                engine_stop_pad(&eng, 0);
+                engine_note_on(&eng, 0, 0.8f);
+                int32_t peak_pad = 0;
+                for (int t = 0; t < 40; t++) {
+                    engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
+                    for (size_t s = 0; s < EPICYCLE_AUDIO_FRAMES; s++) {
+                        int32_t a = L[s] < 0 ? -L[s] : L[s];
+                        if (a > peak_pad)
+                            peak_pad = a;
+                    }
+                }
+                if (hits < 1)
+                    rc = -30;
+                else if (peak_pad < 1000)
+                    rc = -31;
+                else if (peak_hit * 4 < peak_pad) /* bounce must be in ballpark of pad */
+                    rc = -32;
+                /* LOOP off: after one-shot window, voice must end (no stuck repeat). */
+                {
+                    engine_stop_pad(&eng, 1);
+                    eng.pads[1].loop_enable = 0;
+                    eng.pads[1].freeform = 1;
+                    eng.pads[1].lfos[0].enabled = 0;
+                    eng.pads[1].lfos[0].depth = 0.0f;
+                    eng.pads[1].amp_release = 0.05f; /* snappy for test */
+                    eng.pads[1].window_start = 0.0f;
+                    eng.pads[1].window_length = 0.01f; /* short brace */
+                    engine_sync_mod_window(&eng, 1);
+                    engine_note_on_impact(&eng, 1, 0.9f, 1.0f, 0.0f, 1.0f);
+                    for (int t = 0; t < 400; t++)
+                        engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
+                    if (engine_pad_voice_active(&eng, 1))
+                        rc = -33; /* stuck repeating */
+                }
+                engine_shutdown(&eng);
+            }
             puts(rc == 0 ? "tombola-selftest: ok" : "tombola-selftest: FAIL");
+            if (rc != 0)
+                fprintf(stderr, "tombola-selftest rc=%d\n", rc);
             return rc == 0 ? 0 : 1;
         }
         if (strcmp(argv[i], "--demo") == 0) {
@@ -1085,58 +1148,64 @@ int main(int argc, char **argv)
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
-        /* Tombola: fader = morph (master stays on MAIN knob — Ash: fader down ≠ silence).
-         * Other pages: fader = master gain. */
+        /* Tombola: fader = morph ONLY (MAIN = volume). Debounce ±1 to avoid
+         * face flicker / shrink-expand from CC noise. Other pages: fader = gain. */
         if (surf->fader_engaged && surf->fader != last_fader) {
-            last_fader = surf->fader;
+            int fd = (int)surf->fader - (int)last_fader;
+            if (fd < 0)
+                fd = -fd;
             if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                tombola_set_morph(tb, (float)surf->fader / 127.0f);
+                if (fd >= 2) {
+                    last_fader = surf->fader;
+                    tombola_set_morph(tb, (float)surf->fader / 127.0f);
+                }
                 engine_set_fader_gain_cc(&eng, 127);
             } else {
+                last_fader = surf->fader;
                 engine_set_fader_gain_cc(&eng, surf->fader);
             }
         }
 
         if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-            /* Keep fader gain full while on Tombola (morph only). */
+            /* Keep fader gain full while on Tombola (morph only — never volume). */
             engine_set_fader_gain_cc(&eng, 127);
-            /* K2 spin engage latch: ignore dump + pot noise until user moves ≥3. */
-            static uint8_t tk2 = 255;
-            static uint8_t tk2_dump = 255;
-            static int tk2_on;
-            static uint8_t tk2_pend = 255;
-            static int tk2_pend_n;
-            if (tk2_dump == 255) {
-                tk2_dump = surf->k2;
-                tk2 = surf->k2;
+            /* K1 spin only. K2 unused on Tombola (Ash: no double morph). */
+            static uint8_t tk1 = 255;
+            static uint8_t tk1_dump = 255;
+            static int tk1_on;
+            static uint8_t tk1_pend = 255;
+            static int tk1_pend_n;
+            if (tk1_dump == 255) {
+                tk1_dump = surf->k1;
+                tk1 = surf->k1;
             }
-            if (!tk2_on) {
-                int d = (int)surf->k2 - (int)tk2_dump;
+            if (!tk1_on) {
+                int d = (int)surf->k1 - (int)tk1_dump;
                 if (d < 0)
                     d = -d;
                 if (d >= 3)
-                    tk2_on = 1;
+                    tk1_on = 1;
             }
-            if (tk2_on && surf->k2 != tk2) {
-                /* Confirm spin CC twice — reject single-sample jumps (Ash). */
-                if (surf->k2 == tk2_pend) {
-                    tk2_pend_n++;
+            if (tk1_on && surf->k1 != tk1) {
+                /* Confirm spin CC twice — reject single-sample jumps. */
+                if (surf->k1 == tk1_pend) {
+                    tk1_pend_n++;
                 } else {
-                    tk2_pend = surf->k2;
-                    tk2_pend_n = 1;
+                    tk1_pend = surf->k1;
+                    tk1_pend_n = 1;
                 }
-                if (tk2_pend_n >= 2) {
-                    int d = (int)surf->k2 - (int)tk2;
+                if (tk1_pend_n >= 2) {
+                    int d = (int)surf->k1 - (int)tk1;
                     if (d < 0)
                         d = -d;
                     if (d >= 2) {
-                        tk2 = surf->k2;
-                        tombola_set_spin_cc(tb, surf->k2);
+                        tk1 = surf->k1;
+                        tombola_set_spin_cc(tb, surf->k1);
                     }
-                    tk2_pend_n = 0;
+                    tk1_pend_n = 0;
                 }
             }
-            /* Ball count: MUTE+pad only (no K3 — Ash: sticky 1→16 jumps). */
+            /* Ball count: MUTE+pad only. Morph: fader only (no auto shrink). */
         } else if (eng.mode_page == EPICYCLE_PAGE_AMP) {
             const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
             unsigned mask = pickup_mask(cur, 0);
