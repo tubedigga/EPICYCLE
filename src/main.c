@@ -3,8 +3,8 @@
  * EPICYCLE loop engine — Sample-Mode-style soft-key pages for pad params
  * (Trim / Mix / Amp / Tune / Filter / Filt Env / LFO). Not a stock OS clone.
  * Hold SAMPLE + pad = select; B1/B2 cycle pages; B3 quit; encoder push never quits.
- * 0.2.7: defensive MIDI (no post-SysEx restore, AT does not become notes),
- * Trim jump reject, soft-key cooldown, freeform default on card load.
+ * 0.2.8: untrusted MIDI rewrite; Trim brace lock (Start/End width, POS slides);
+ * soft keys on clean release; latch loops survive note-off; volume CC isolated.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -94,35 +94,144 @@ static void page_next(EpicycleEngine *eng)
     eng->mode_page = (EpicycleModePage)p;
 }
 
-static int g_soft_guard_ticks; /* ignore soft keys briefly after pad hits */
-static int g_soft_cooldown;    /* min ticks between accepted page/quit edges */
+/* After pad hits: briefly ignore B3 quit only (pages stay responsive). */
+static int g_quit_guard_ticks;
+static const EpicyclePaths *g_log_paths;
 
 static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
 {
     if (!eng || !st)
         return;
-    /* Debounce: MIDI noise / aftertouch floods were causing random page jumps
-     * and false B3 quits that look like crashes. */
-    if (g_soft_guard_ticks > 0 || g_soft_cooldown > 0) {
-        st->soft_left = 0;
-        st->soft_mid = 0;
-        st->soft_right = 0;
-        return;
-    }
+    /* Surface already requires clean note-off + hold. App only guards quit
+     * after pads so paging is not laggy/stuck (0.2.7 over-debounce). */
     if (st->soft_left) {
         st->soft_left = 0;
         page_prev(eng);
-        g_soft_cooldown = 20; /* ~320ms between page changes */
+        if (g_log_paths)
+            epicycle_log(g_log_paths, "page -> %s", epicycle_page_name(eng->mode_page));
     }
     if (st->soft_mid) {
         st->soft_mid = 0;
         page_next(eng);
-        g_soft_cooldown = 20;
+        if (g_log_paths)
+            epicycle_log(g_log_paths, "page -> %s", epicycle_page_name(eng->mode_page));
     }
     if (st->soft_right) {
         st->soft_right = 0;
-        st->quit_requested = 1; /* explicit soft-key quit only */
-        g_soft_cooldown = 30;
+        if (g_quit_guard_ticks > 0) {
+            if (g_log_paths)
+                epicycle_log(g_log_paths, "soft-B3 ignored (quit guard)");
+            return;
+        }
+        st->quit_requested = 1;
+        if (g_log_paths)
+            epicycle_log(g_log_paths, "quit: soft-B3 release");
+    }
+}
+
+/*
+ * Trim brace lock: K1 Start + K2 End set region width and lock length where
+ * left; K3 POS slides that locked brace (no teleport/resize). Absolute pots
+ * use pickup (≥2 from park) so parked knobs cannot jump params.
+ */
+static float g_trim_lock_len = -1.0f;
+static uint8_t g_knob_park[3];
+static uint8_t g_knob_applied[3];
+static uint8_t g_knob_engaged[3];
+static int g_trim_pos_active; /* recently moved POS — raise Start/End threshold */
+
+static void trim_reset_pickup(const EpicycleSurfaceState *surf, EpicycleEngine *eng)
+{
+    g_knob_park[0] = surf->k1;
+    g_knob_park[1] = surf->k2;
+    g_knob_park[2] = surf->k3;
+    g_knob_applied[0] = surf->k1;
+    g_knob_applied[1] = surf->k2;
+    g_knob_applied[2] = surf->k3;
+    g_knob_engaged[0] = g_knob_engaged[1] = g_knob_engaged[2] = 0;
+    g_trim_pos_active = 0;
+    if (eng) {
+        EpicyclePad *p = &eng->pads[eng->selected_pad];
+        g_trim_lock_len = p->window_length;
+    }
+}
+
+static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *surf)
+{
+    const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
+    unsigned mask = 0;
+    for (int ki = 0; ki < 3; ki++) {
+        int thr = 2;
+        /* While POS is active, ignore small Start/End noise from parked pots. */
+        if (g_trim_pos_active && ki < 2)
+            thr = 5;
+        if (!g_knob_engaged[ki]) {
+            int d = (int)cur[ki] - (int)g_knob_park[ki];
+            if (d < 0)
+                d = -d;
+            if (d < thr)
+                continue;
+            g_knob_engaged[ki] = 1;
+            g_knob_applied[ki] = cur[ki];
+            mask |= (1u << ki);
+            continue;
+        }
+        if (cur[ki] == g_knob_applied[ki])
+            continue;
+        g_knob_applied[ki] = cur[ki];
+        mask |= (1u << ki);
+    }
+    if (!mask)
+        return;
+
+    EpicyclePad *p = &eng->pads[eng->selected_pad];
+    if (surf->shift_held) {
+        if (mask & 1u)
+            p->crossfade = 0.01f + 0.49f * ((float)surf->k1 / 127.0f);
+        if (mask & 2u)
+            engine_set_ping_pong(eng, eng->selected_pad, surf->k2 >= 64);
+        if (mask & 4u) {
+            engine_trim_set_position(eng, eng->selected_pad, (float)surf->k3 / 127.0f);
+            g_trim_pos_active = 1;
+        }
+        return;
+    }
+
+    if (p->freeform) {
+        if (mask & 1u) {
+            engine_trim_set_start(eng, eng->selected_pad, (float)surf->k1 / 127.0f);
+            g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
+            g_trim_pos_active = 0;
+        }
+        if (mask & 2u) {
+            engine_trim_set_end(eng, eng->selected_pad, (float)surf->k2 / 127.0f);
+            g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
+            g_trim_pos_active = 0;
+        }
+    } else {
+        if (mask & 1u) {
+            engine_trim_set_position(eng, eng->selected_pad, (float)surf->k1 / 127.0f);
+            g_trim_pos_active = 1;
+        }
+        if (mask & 2u) {
+            int beats = 1 + (int)((surf->k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
+            engine_set_division(eng, eng->selected_pad, beats);
+            g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
+        }
+    }
+    if (mask & 4u) {
+        /* POS: slide locked brace — never resize. */
+        if (g_trim_lock_len > 0.02f)
+            eng->pads[eng->selected_pad].window_length = g_trim_lock_len;
+        engine_trim_set_position(eng, eng->selected_pad, (float)surf->k3 / 127.0f);
+        /* Re-lock after clamp at sample edges. */
+        g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
+        g_trim_pos_active = 1;
+        /* Re-park Start/End so residual absolute values cannot teleport width. */
+        g_knob_park[0] = surf->k1;
+        g_knob_park[1] = surf->k2;
+        g_knob_engaged[0] = 0;
+        g_knob_engaged[1] = 0;
     }
 }
 
@@ -289,6 +398,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    g_log_paths = &paths;
     epicycle_log(&paths, "EPICYCLE %s starting (mode pages)", EPICYCLE_VERSION);
     epicycle_log(&paths, "app_dir=%s card_root=%s data_dir=%s", paths.app_dir, paths.card_root,
                  paths.data_dir);
@@ -369,24 +479,29 @@ int main(int argc, char **argv)
 
     int ticks = 0;
     uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255;
-    /* Trim jump confirm: large CC teleports need two matching samples. */
-    uint8_t pend_k[3] = {255, 255, 255};
-    int pend_n[3] = {0, 0, 0};
     EpicycleModePage last_page = eng.mode_page;
     int last_sel = eng.selected_pad;
     uint8_t last_pad_vel[EPICYCLE_PAD_COUNT];
     memset(last_pad_vel, 0, sizeof last_pad_vel);
-    g_soft_guard_ticks = 60; /* ~1s after splash before soft keys armed */
-    g_soft_cooldown = 0;
+    g_quit_guard_ticks = 45; /* ~0.7s after splash before B3 quit armed */
 
     surface_poll();
-    /* Main tracks hardware; fader stays full until user moves it (latch). */
+    /* Main stays full until user moves CC19 from 0x42 dump; fader same. */
     engine_set_master_gain_cc(&eng, surface_state()->main_vol);
     last_main = surface_state()->main_vol;
     last_k1 = surface_state()->k1;
     last_k2 = surface_state()->k2;
     last_k3 = surface_state()->k3;
+    trim_reset_pickup(surface_state(), &eng);
     surface_set_selected_pad(eng.selected_pad);
+    surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
+    /* Ensure pad 1 is latched-loop and audible defaults. */
+    if (eng.pads[0].sample) {
+        eng.pads[0].loop_enable = 1;
+        if (eng.pads[0].level < 0.5f)
+            eng.pads[0].level = 1.0f;
+        eng.pads[0].mod_level = eng.pads[0].level;
+    }
     surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
 
     while (!g_stop && !surface_poll_quit()) {
@@ -394,10 +509,8 @@ int main(int argc, char **argv)
         EpicycleSurfaceState *st = surface_state_mut();
         const EpicycleSurfaceState *surf = surface_state();
 
-        if (g_soft_guard_ticks > 0)
-            g_soft_guard_ticks--;
-        if (g_soft_cooldown > 0)
-            g_soft_cooldown--;
+        if (g_quit_guard_ticks > 0)
+            g_quit_guard_ticks--;
 
         handle_soft_keys(&eng, st);
         handle_encoder_press(&eng, st);
@@ -413,7 +526,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
             if (st->pad_down[i]) {
                 st->pad_down[i] = 0;
-                g_soft_guard_ticks = 25; /* ~400ms guard against phantom soft keys */
+                g_quit_guard_ticks = 18; /* ~300ms: block false B3 only */
                 if (surf->sample_held) {
                     eng.selected_pad = i;
                     surface_set_selected_pad(i);
@@ -437,73 +550,42 @@ int main(int argc, char **argv)
         if (eng.selected_pad != last_sel) {
             last_sel = eng.selected_pad;
             surface_set_loop_led(eng.pads[last_sel].loop_enable);
-            /* Absorb parked pot positions so pad change doesn't jump params. */
+            trim_reset_pickup(surf, &eng);
             last_k1 = surf->k1;
             last_k2 = surf->k2;
             last_k3 = surf->k3;
-            pend_k[0] = pend_k[1] = pend_k[2] = 255;
-            pend_n[0] = pend_n[1] = pend_n[2] = 0;
         }
         if (eng.mode_page != last_page) {
             last_page = eng.mode_page;
+            trim_reset_pickup(surf, &eng);
             last_k1 = surf->k1;
             last_k2 = surf->k2;
             last_k3 = surf->k3;
-            pend_k[0] = pend_k[1] = pend_k[2] = 255;
-            pend_n[0] = pend_n[1] = pend_n[2] = 0;
         }
 
-        if (surf->main_vol != last_main) {
+        /* Volume: only after main_engaged (surface isolates dump). */
+        if (surf->main_engaged && surf->main_vol != last_main) {
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
-        /* Fader: ignore 0x42 dump + spurious CC until user moves from dump. */
         if (surf->fader_engaged)
             engine_set_fader_gain_cc(&eng, surf->fader);
 
-        {
+        if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
+            handle_trim_knobs(&eng, surf);
+            last_k1 = surf->k1;
+            last_k2 = surf->k2;
+            last_k3 = surf->k3;
+        } else {
             unsigned mask = 0;
-            const uint8_t knobs[3] = {surf->k1, surf->k2, surf->k3};
-            uint8_t *lasts[3] = {&last_k1, &last_k2, &last_k3};
-            enum { KNOB_JUMP = 40 };
-            for (int ki = 0; ki < 3; ki++) {
-                uint8_t cur = knobs[ki];
-                uint8_t prev = *lasts[ki];
-                if (cur == prev) {
-                    pend_k[ki] = 255;
-                    pend_n[ki] = 0;
-                    continue;
-                }
-                int d = (int)cur - (int)prev;
-                if (d < 0)
-                    d = -d;
-                if (d >= KNOB_JUMP && eng.mode_page == EPICYCLE_PAGE_TRIM) {
-                    /* Single-sample teleport: wait for a second matching read. */
-                    if (pend_k[ki] == cur && pend_n[ki] >= 1) {
-                        mask |= (1u << ki);
-                        pend_k[ki] = 255;
-                        pend_n[ki] = 0;
-                    } else {
-                        pend_k[ki] = cur;
-                        pend_n[ki] = 1;
-                    }
-                } else {
-                    mask |= (1u << ki);
-                    pend_k[ki] = 255;
-                    pend_n[ki] = 0;
-                }
-            }
+            if (surf->k1 != last_k1)
+                mask |= 1u;
+            if (surf->k2 != last_k2)
+                mask |= 2u;
+            if (surf->k3 != last_k3)
+                mask |= 4u;
             if (mask) {
-                if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_TRIM) {
-                    EpicyclePad *p = &eng.pads[eng.selected_pad];
-                    if (mask & 1u)
-                        p->crossfade = 0.01f + 0.49f * ((float)surf->k1 / 127.0f);
-                    if (mask & 2u)
-                        engine_set_ping_pong(&eng, eng.selected_pad, surf->k2 >= 64);
-                    if (mask & 4u)
-                        engine_trim_set_position(&eng, eng.selected_pad,
-                                                 (float)surf->k3 / 127.0f);
-                } else if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_MIX) {
+                if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_MIX) {
                     if (mask & 4u)
                         eng.kit_level = 0.05f + 0.95f * ((float)surf->k3 / 127.0f);
                     if (mask & 1u)
@@ -539,8 +621,12 @@ int main(int argc, char **argv)
                         p->crossfade = 0.5f;
                 } else {
                     EpicyclePad *p = &eng.pads[eng.selected_pad];
+                    if (g_trim_lock_len > 0.02f)
+                        p->window_length = g_trim_lock_len;
                     engine_trim_set_position(&eng, eng.selected_pad,
                                              p->window_start + (float)delta * 0.002f);
+                    g_trim_lock_len = eng.pads[eng.selected_pad].window_length;
+                    g_trim_pos_active = 1;
                 }
             } else if (eng.mode_page == EPICYCLE_PAGE_TUNE) {
                 EpicyclePad *p = &eng.pads[eng.selected_pad];

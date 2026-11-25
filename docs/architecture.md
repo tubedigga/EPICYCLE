@@ -31,16 +31,18 @@ Power on
   realtime thread calls `engine_render` when an engine is bound; `DROP` on close.
   Main Volume (CC19, squared) × fader (CC20, linear, **latched** until user moves)
   → `master_gain`.
-- **surface** — Control Surface raw MIDI: pads (note map + LED SysEx I=pad−1),
-  SAMPLE (6) select-hold, SHIFT (49), LOOP (74), K1–K3, Main CC19, fader CC20,
-  soft keys B1/B2/B3, wheel (press never quits), selected-pad amber LED, position
-  SysEx `0x42`. Poly AT must not steal note running-status. Map from sample-base
-  HARDWARE.md / controls.h note numbers (MIT rewrite only).
+- **surface** — Untrusted Surface MIDI parser: pads (note map + LED SysEx I=pad−1),
+  SAMPLE (6) select-hold, SHIFT (49), LOOP (74), K1–K3, Main CC19 (latched like
+  fader), fader CC20, soft keys B1/B2/B3 (release after hold; B3 quit longer),
+  wheel (press never quits), selected-pad amber LED, `0x42` dump + RX drain on
+  open. SysEx cancels running status (no restore); AT ignored; soft keys need
+  explicit status; pad LEDs only on real note-on/off. Map from SampleBoot /
+  sample-base HARDWARE.md / mpc-sample-lab notes (MIT rewrite only).
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
-- **engine** — 16 pads × brace window (Start/End width + Position slide); division
-  or freeform; pitch; forward crossfade loops + ping-pong; LOOP latch/one-shot;
-  2 LFOs + 4 mod routes; LFO scrub targets Position; scrub budget = 8.
+- **engine** — 16 pads × brace window (Start/End lock width + POS slides locked
+  length); division or freeform; pitch; forward crossfade loops + ping-pong;
+  LOOP latch survives note-off (one-shot stops); 2 LFOs + 4 mod routes; scrub budget = 8.
 - **ui** — splash centered `PRESS ANY PAD TO CONTINUE`; Trim waveform + Shift
   overlay (xfade / FORWARD|PINGPONG); Mix pad vol/pan; filter type names;
   pages Trim/Mix/Amp/Tune/Filter/FiltEnv/LFO.

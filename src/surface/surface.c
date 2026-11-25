@@ -1,27 +1,28 @@
 /* SPDX-License-Identifier: MIT
  *
  * Control-surface MIDI (UART3 raw MIDI / ALSA card "Surface").
- * Published map facts from SampleBoot TECHNICAL.md and sample-base HARDWARE.md
- * / controls.h (do not reverse stock; do not vendor AGPL headers):
- *   - pads: channel 10, notes 37,36,42,82,40,38,46,44,48,47,45,43,49,55,51,53
- *   - pad LED SysEx I = printed pad − 1 (0..15); fader light I=16
- *   - knobs K1–K3: CC 16/17/18; main volume CC 19; fader CC 20 (channel 1)
- *   - wheel: CC 100 relative; wheel push ≈ note 111
- *   - SAMPLE=6, SHIFT=49, LOOP=74, MUTE=43 (Pad Play)
- * Soft keys above the screen: notes 12/13/14 — B1 prev page, B2 next, B3 quit.
- * Wheel push (note 111) is an edge only — never quits.
  *
- * Defensive MIDI (0.2.7, Ash device regressions on 0.2.6):
- *   - SysEx cancels running status; do NOT restore it (orphan data is dropped).
- *   - Poly/channel aftertouch keeps its own running status and is ignored for
- *     play/params — never snap back to note status mid-AT flood (that turned
- *     (pad_note, pressure) pairs into phantom note-ons).
- *   - Soft keys require an explicit note status byte (not orphan data) and
- *     rising-edge with note-off between presses.
- *   - Unknown channel/status messages ignored.
- * Fader: record 0x42 dump but do not engage until the user moves it.
- * Hold SAMPLE + pad = select (app); plain pad = play. Pad LEDs show selection.
- * On open: clear leftover lights + send position-request SysEx 0x42.
+ * Protocol facts (SampleBoot TECHNICAL.md, sample-base HARDWARE.md, community
+ * mpc-sample-lab control-surface-protocol — MIT rewrite, no AGPL vendoring):
+ *   - MCU emits 3-byte messages with status (no running status from hardware);
+ *     still parse running status for fragmented ALSA reads / AT floods.
+ *   - pads ch10: notes 37,36,42,82,40,38,46,44,48,47,45,43,49,55,51,53
+ *     strike 99 nn vv → poly AT A9 nn pp → release 89 nn 00
+ *   - pad LED SysEx I = printed pad − 1 (0..15); fader light I=16
+ *   - Main vol CC19; K1–K3 CC16/17/18; fader CC20; wheel CC100 relative
+ *   - SAMPLE=6, SHIFT=49, LOOP=74, MUTE=43; soft B1/B2/B3 = 12/13/14
+ *   - 0x42 position request → dump CC19,16,17,18,20 + CC100=0
+ *
+ * Untrusted-stream rules (0.2.8 rewrite after 0.2.7 still false-quit / phantoms):
+ *   - Prefer drop junk over acting on it.
+ *   - SysEx cancels running status; never restore.
+ *   - AT/pressure/pitch-bend/program: consume & ignore (no snap to notes).
+ *   - Soft keys need an explicit status byte (no running-status soft keys),
+ *     clean note-off between presses, hold timeout to unstick; B3 quit fires
+ *     on release after a minimum hold (not a lone phantom note-on).
+ *   - Pad LEDs only from real note-on/off (never AT).
+ *   - Volume CC path never lights buttons or pages.
+ *   - On open: lights off, 0x42, drain RX so dump cannot arm soft keys.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -38,19 +39,21 @@
 #define EPICYCLE_SND_DIR "/dev/snd"
 #endif
 
-/* Printed pad 1..16 → channel-10 note (public measurement, HARDWARE.md). */
+/* Printed pad 1..16 → channel-10 note (public measurement). */
 static const uint8_t PAD_NOTES[EPICYCLE_PAD_COUNT] = {
     37, 36, 42, 82, 40, 38, 46, 44, 48, 47, 45, 43, 49, 55, 51, 53};
 
 static const uint8_t BUTTON_LED_CCS[] = {
     6, 7, 1, 0, 35, 9, 11, 75, 43, 74, 40, 36, 53, 73, 80, 81, 82};
 
-/* Buttons — sample-base controls.h / HARDWARE.md (MIT rewrite of note numbers). */
 enum {
     NOTE_SAMPLE = 6,
     NOTE_SHIFT = 49,
     NOTE_LOOP = 74,
     NOTE_MUTE = 43,
+    NOTE_SOFT0 = 12,
+    NOTE_SOFT1 = 13,
+    NOTE_SOFT2 = 14,
 };
 
 static int g_fd = -1;
@@ -59,16 +62,27 @@ static char g_info[64] = "surface closed";
 static int g_selected_pad;
 static int g_loop_led_on = -1;
 
-/* MIDI parser */
-static int m_status; /* current running status (0 = none) */
-static int m_need;   /* data bytes still needed */
-static int m_n;      /* data bytes collected */
-static int m_sysex;  /* inside SysEx */
+/* MIDI parser — untrusted byte stream */
+static int m_status;        /* running status or 0 */
+static int m_need;          /* data bytes expected */
+static int m_n;             /* data bytes collected */
+static int m_sysex;         /* inside SysEx (drop payload) */
+static int m_fresh_status;  /* 1 if status byte opened this message */
 static uint8_t m_d[2];
-static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT]; /* 1 if we last sent a non-black pad LED */
+static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT];
 
-/* Soft-key held latch: require note-off before another edge. */
-static uint8_t g_soft_held[3]; /* indices 0=left/12, 1=mid/13, 2=right/14 */
+/*
+ * Soft keys: track down + hold time. B1/B2 fire on release after short hold;
+ * B3 quit fires on release after longer hold. Held latch times out so a missed
+ * note-off cannot permanently stick paging.
+ */
+static uint8_t g_soft_down[3];
+static double g_soft_down_t[3];
+static double g_soft_last_fire_t[3];
+#define SOFT_PAGE_HOLD_S 0.025
+#define SOFT_QUIT_HOLD_S 0.120
+#define SOFT_STUCK_S 1.50
+#define SOFT_PAGE_GAP_S 0.080
 
 static int pad_index(uint8_t note)
 {
@@ -110,7 +124,6 @@ static void surface_lights_off(int fd)
 {
     uint8_t buf[512];
     size_t n = 0;
-    /* Pads 0..15 + fader light I=16 (sample-base HARDWARE.md). */
     for (int i = 0; i <= 16; i++) {
         const uint8_t m[] = {0xf0, 0x47, 0x7f, 0x5c, 0x65, 0x00, 0x04,
                              (uint8_t)i, 0, 0, 0, 0xf7};
@@ -141,7 +154,6 @@ static void light_pad(int fd, int pad /* 0..15 */, uint8_t r, uint8_t g, uint8_t
 {
     if (fd < 0 || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
-    /* sample-base HARDWARE.md: I = printed pad number − 1 (0..15). */
     uint8_t m[] = {0xf0, 0x47, 0x7f, 0x5c, 0x65, 0x00, 0x04,
                    (uint8_t)pad, (uint8_t)(r >> 1), (uint8_t)(g >> 1),
                    (uint8_t)(b >> 1), 0xf7};
@@ -149,7 +161,6 @@ static void light_pad(int fd, int pad /* 0..15 */, uint8_t r, uint8_t g, uint8_t
         g_pad_lit[pad] = (r | g | b) ? 1 : 0;
 }
 
-/* Button LED: channel-1 CC = button note; 0 off, 1 dim, 2 full (HARDWARE.md). */
 static void light_button(int fd, uint8_t note_cc, uint8_t level)
 {
     if (fd < 0)
@@ -163,14 +174,13 @@ static void refresh_pad_led(int pad)
     if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     if (g_state.pad_vel[pad] > 0)
-        light_pad(g_fd, pad, 40, 180, 160); /* playing */
+        light_pad(g_fd, pad, 40, 180, 160);
     else if (pad == g_selected_pad)
-        light_pad(g_fd, pad, 200, 140, 40); /* selected amber */
+        light_pad(g_fd, pad, 200, 140, 40);
     else
         light_pad(g_fd, pad, 0, 0, 0);
 }
 
-/* Clear stuck play LEDs; keep selected-pad amber when idle. */
 static void sync_pad_lights(int fd)
 {
     if (fd < 0)
@@ -184,90 +194,112 @@ static void sync_pad_lights(int fd)
     }
 }
 
-static void soft_key_edge(int which /* 0,1,2 */, int on)
+static void soft_clear_stuck(void)
 {
-    if (which < 0 || which > 2)
-        return;
-    if (on) {
-        if (g_soft_held[which])
-            return; /* still held / repeat noise */
-        g_soft_held[which] = 1;
-        if (which == 0)
-            g_state.soft_left = 1;
-        else if (which == 1)
-            g_state.soft_mid = 1;
-        else
-            g_state.soft_right = 1;
-    } else {
-        g_soft_held[which] = 0;
+    double t = now_s();
+    for (int i = 0; i < 3; i++) {
+        if (g_soft_down[i] && (t - g_soft_down_t[i]) > SOFT_STUCK_S) {
+            g_soft_down[i] = 0;
+            g_soft_down_t[i] = 0;
+        }
     }
 }
 
-static void midi_feed(uint8_t b)
+/* Soft key: press tracks down; action on release after min hold. */
+static void soft_key_msg(int which /* 0,1,2 */, int on, int explicit_status)
 {
-    if (b >= 0xf8)
-        return; /* realtime — ignore */
+    if (which < 0 || which > 2)
+        return;
+    /* Soft keys never accept running-status continuations — orphans after
+     * SysEx / AT often look like (12|13|14, vel) under restored 0x90. */
+    if (!explicit_status)
+        return;
 
-    if (b & 0x80) {
-        if (b == 0xf0) {
-            m_sysex = 1;
-            /* MIDI spec: SysEx cancels running status. Do not restore later —
-             * orphan dump bytes after 0x42/LED SysEx were becoming soft keys
-             * (notes 12–14) and phantom pads when we restored note status. */
-            m_status = 0;
-            m_n = 0;
-            m_need = 0;
+    double t = now_s();
+    if (on) {
+        if (g_soft_down[which])
             return;
-        }
-        if (b == 0xf7) {
-            m_sysex = 0;
-            m_status = 0;
-            m_n = 0;
-            m_need = 0;
-            return;
-        }
-        m_sysex = 0;
-        if (b < 0xf0) {
-            int cmd = b & 0xf0;
-            m_status = b;
-            /* Program change / channel pressure: 1 data byte; else 2. */
-            m_need = (cmd == 0xc0 || cmd == 0xd0) ? 1 : 2;
-            m_n = 0;
-        } else {
-            /* System common (not SysEx): cancel running status. */
-            m_status = 0;
-            m_n = 0;
-            m_need = 0;
-        }
+        g_soft_down[which] = 1;
+        g_soft_down_t[which] = t;
         return;
     }
 
-    if (m_sysex)
-        return; /* ignore SysEx payload */
-
-    /* Bare data with no running status: drop (defensive). */
-    if (!m_status)
+    /* note-off */
+    if (!g_soft_down[which])
         return;
+    double held = t - g_soft_down_t[which];
+    g_soft_down[which] = 0;
+    g_soft_down_t[which] = 0;
 
-    m_d[m_n++] = b;
-    if (m_n < m_need)
+    double need = (which == 2) ? SOFT_QUIT_HOLD_S : SOFT_PAGE_HOLD_S;
+    if (held < need || held > SOFT_STUCK_S)
         return;
-    m_n = 0;
+    if ((t - g_soft_last_fire_t[which]) < SOFT_PAGE_GAP_S)
+        return;
+    g_soft_last_fire_t[which] = t;
 
+    if (which == 0)
+        g_state.soft_left = 1;
+    else if (which == 1)
+        g_state.soft_mid = 1;
+    else
+        g_state.soft_right = 1;
+}
+
+static void apply_main_vol_cc(uint8_t v)
+{
+    /* Isolated from buttons/pages. Latch like fader until dump settles. */
+    if (!g_state.main_seen) {
+        g_state.main_seen = 1;
+        g_state.main_dump = v;
+        /* Keep software loud if dump looks like a glitch zero. */
+        if (v > 8) {
+            g_state.main_vol = v;
+            g_state.main_stable = v;
+        }
+        return;
+    }
+    if (!g_state.main_engaged) {
+        int d = (int)v - (int)g_state.main_dump;
+        if (d < 0)
+            d = -d;
+        if (d < 2)
+            return;
+        g_state.main_engaged = 1;
+    }
+    /* Reject lone zero while clearly up (cable/dump glitch). */
+    if (v == 0 && g_state.main_stable > 8)
+        return;
+    g_state.main_vol = v;
+    g_state.main_stable = v;
+}
+
+static void apply_fader_cc(uint8_t v)
+{
+    g_state.fader = v;
+    if (!g_state.fader_seen) {
+        g_state.fader_seen = 1;
+        g_state.fader_dump = v;
+        return;
+    }
+    if (!g_state.fader_engaged) {
+        int d = (int)v - (int)g_state.fader_dump;
+        if (d < 0)
+            d = -d;
+        if (d >= 2)
+            g_state.fader_engaged = 1;
+    }
+}
+
+static void dispatch_msg(int explicit_status)
+{
     int ch = m_status & 0x0f;
     int cmd = m_status & 0xf0;
 
-    /* Aftertouch / channel pressure: consume & ignore. Keep m_status as AT so
-     * continued (note,pressure) pairs are NOT reinterpreted as note-ons. */
+    /* Aftertouch / channel pressure: ignore; keep status so AT floods stay AT. */
     if (cmd == 0xa0 || cmd == 0xd0)
         return;
-
-    /* Pitch bend: ignore. */
-    if (cmd == 0xe0)
-        return;
-
-    /* Program change: ignore. */
-    if (cmd == 0xc0)
+    if (cmd == 0xe0 || cmd == 0xc0)
         return;
 
     if (cmd == 0xb0 && ch == 0) {
@@ -281,57 +313,35 @@ static void midi_feed(uint8_t b)
         case 18:
             g_state.k3 = m_d[1];
             break;
-        case 19: {
-            uint8_t v = m_d[1];
-            /* Debounce spurious main-vol zeros / single-sample glitches. */
-            if (!g_state.main_seen) {
-                g_state.main_seen = 1;
-                g_state.main_vol = v;
-                g_state.main_stable = v;
-            } else if (v == 0 && g_state.main_stable > 8) {
-                /* Ignore lone zero while hardware was clearly up. */
-            } else {
-                g_state.main_vol = v;
-                g_state.main_stable = v;
-            }
+        case 19:
+            apply_main_vol_cc(m_d[1]);
             break;
-        }
-        case 20: {
-            uint8_t v = m_d[1];
-            g_state.fader = v;
-            if (!g_state.fader_seen) {
-                g_state.fader_seen = 1;
-                g_state.fader_dump = v;
-                /* Do not engage — keep engine fader_gain at full until move. */
-            } else if (!g_state.fader_engaged) {
-                int d = (int)v - (int)g_state.fader_dump;
-                if (d < 0)
-                    d = -d;
-                if (d >= 2)
-                    g_state.fader_engaged = 1;
-            }
+        case 20:
+            apply_fader_cc(m_d[1]);
             break;
-        }
-        case 100: /* relative wheel — ignore value 0 (0x42 trailer) */
+        case 100:
             if (m_d[1] == 0)
-                break;
+                break; /* 0x42 trailer */
             if (m_d[1] > 0 && m_d[1] < 64)
                 g_state.wheel_accum += (int)m_d[1];
             else if (m_d[1] >= 64)
                 g_state.wheel_accum += (int)m_d[1] - 128;
             break;
         default:
-            break; /* unknown CC — ignore */
+            break; /* unknown CC — ignore (never treat as notes/LEDs) */
         }
         return;
     }
 
     if (ch == 0 && (cmd == 0x90 || cmd == 0x80)) {
-        /* Channel 1 buttons. Soft keys use rising-edge latch (note-off required
-         * between presses). Orphan post-SysEx data cannot reach here because
-         * SysEx clears running status and we never restore it. */
         int on = (cmd == 0x90 && m_d[1] > 0);
+        /* Note-on vel 0 = note-off */
+        if (cmd == 0x90 && m_d[1] == 0)
+            on = 0;
+
         if (m_d[0] == NOTE_SAMPLE) {
+            if (!explicit_status && on)
+                return; /* no running-status SAMPLE */
             g_state.sample_held = on ? 1 : 0;
             light_button(g_fd, NOTE_SAMPLE, on ? 2 : 0);
             return;
@@ -340,63 +350,138 @@ static void midi_feed(uint8_t b)
             g_state.shift_held = on ? 1 : 0;
             return;
         }
-        if (on && m_d[0] == NOTE_LOOP) {
-            g_state.loop_btn = 1;
+        if (m_d[0] == NOTE_LOOP) {
+            if (on && explicit_status)
+                g_state.loop_btn = 1;
             return;
         }
-        if (on && m_d[0] == 111)
-            g_state.wheel_press = 1;
-
-        if (m_d[0] == 12 || m_d[0] == 13 || m_d[0] == 14) {
-            soft_key_edge((int)m_d[0] - 12, on);
+        if (m_d[0] == 111) {
+            if (on && explicit_status)
+                g_state.wheel_press = 1;
             return;
         }
-        (void)NOTE_MUTE; /* reserved — Pad Play mute later */
+        if (m_d[0] == NOTE_SOFT0 || m_d[0] == NOTE_SOFT1 || m_d[0] == NOTE_SOFT2) {
+            soft_key_msg((int)m_d[0] - NOTE_SOFT0, on, explicit_status);
+            return;
+        }
+        (void)NOTE_MUTE;
         return;
     }
 
     if (ch == 9 && (cmd == 0x90 || cmd == 0x80)) {
         int idx = pad_index(m_d[0]);
         if (idx < 0)
-            return; /* unknown note on pad channel — ignore */
+            return;
         if (cmd == 0x90 && m_d[1] > 0) {
             g_state.pad_vel[idx] = m_d[1];
-            g_state.pad_down[idx] = 1; /* edge for note-on; app clears */
-            refresh_pad_led(idx);
+            g_state.pad_down[idx] = 1;
+            refresh_pad_led(idx); /* LED only on real note-on */
         } else {
-            /* note-off (0x80) or note-on vel 0 */
             if (g_state.pad_vel[idx] > 0)
                 g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
-            refresh_pad_led(idx);
+            refresh_pad_led(idx); /* LED only on real note-off */
+        }
+        return;
+    }
+}
+
+static void midi_feed(uint8_t b)
+{
+    if (b >= 0xf8)
+        return; /* realtime */
+
+    if (b & 0x80) {
+        if (b == 0xf0) {
+            m_sysex = 1;
+            m_status = 0;
+            m_n = 0;
+            m_need = 0;
+            m_fresh_status = 0;
+            return;
+        }
+        if (b == 0xf7) {
+            m_sysex = 0;
+            m_status = 0;
+            m_n = 0;
+            m_need = 0;
+            m_fresh_status = 0;
+            return;
+        }
+        m_sysex = 0;
+        if (b < 0xf0) {
+            int cmd = b & 0xf0;
+            m_status = b;
+            m_need = (cmd == 0xc0 || cmd == 0xd0) ? 1 : 2;
+            m_n = 0;
+            m_fresh_status = 1;
+        } else {
+            m_status = 0;
+            m_n = 0;
+            m_need = 0;
+            m_fresh_status = 0;
         }
         return;
     }
 
-    /* Any other channel/status: ignore. */
+    if (m_sysex)
+        return;
+
+    if (!m_status)
+        return; /* bare data, no running status — drop */
+
+    m_d[m_n++] = b;
+    if (m_n < m_need)
+        return;
+
+    int explicit = m_fresh_status;
+    m_n = 0;
+    m_fresh_status = 0; /* subsequent running-status msgs are not explicit */
+    dispatch_msg(explicit);
+}
+
+static void midi_drain(int fd, double seconds)
+{
+    double until = now_s() + seconds;
+    uint8_t buf[256];
+    while (now_s() < until) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n > 0) {
+            for (ssize_t i = 0; i < n; i++)
+                midi_feed(buf[i]);
+            continue;
+        }
+        struct pollfd p = {.fd = fd, .events = POLLIN, .revents = 0};
+        poll(&p, 1, 10);
+    }
+    /* Soft keys must not arm from the 0x42 dump / LED echo. */
+    g_state.soft_left = g_state.soft_mid = g_state.soft_right = 0;
+    memset(g_soft_down, 0, sizeof g_soft_down);
 }
 
 int surface_open(void)
 {
     memset(&g_state, 0, sizeof g_state);
     memset(g_pad_lit, 0, sizeof g_pad_lit);
-    memset(g_soft_held, 0, sizeof g_soft_held);
+    memset(g_soft_down, 0, sizeof g_soft_down);
+    memset(g_soft_down_t, 0, sizeof g_soft_down_t);
+    memset(g_soft_last_fire_t, 0, sizeof g_soft_last_fire_t);
     g_selected_pad = 0;
     g_loop_led_on = -1;
-    /* Software full until fader is engaged; main starts full then tracks CC19. */
     g_state.main_vol = 127;
     g_state.main_stable = 127;
+    g_state.main_dump = 127;
+    g_state.main_engaged = 0;
+    g_state.main_seen = 0;
     g_state.fader = 127;
     g_state.fader_dump = 127;
     g_state.fader_engaged = 0;
     g_state.fader_seen = 0;
-    g_state.main_seen = 0;
     g_fd = -1;
-    m_status = m_need = m_n = m_sysex = 0;
+    m_status = m_need = m_n = m_sysex = m_fresh_status = 0;
     snprintf(g_info, sizeof g_info, "no Surface card");
 
 #ifndef EPICYCLE_ON_DEVICE
-    /* Host/CI: pretend open succeeded and auto-request quit so smoke exits. */
     g_state.open = 0;
     g_state.quit_requested = 1;
     snprintf(g_info, sizeof g_info, "host stub (auto-quit)");
@@ -423,6 +508,8 @@ int surface_open(void)
         surface_lights_off(fd);
         static const uint8_t req[] = {0xf0, 0x47, 0x7f, 0x5c, 0x42, 0x00, 0x00, 0xf7};
         (void)midi_write_all(fd, req, sizeof req);
+        /* Absorb 0x42 dump + any LED write echoes before the app arms UI. */
+        midi_drain(fd, 0.08);
         return 0;
     }
 
@@ -445,6 +532,7 @@ void surface_poll(void)
 {
     if (g_fd < 0)
         return;
+    soft_clear_stuck();
     uint8_t buf[256];
     for (;;) {
         ssize_t n = read(g_fd, buf, sizeof buf);
@@ -458,7 +546,6 @@ void surface_poll(void)
         for (ssize_t i = 0; i < n; i++)
             midi_feed(buf[i]);
     }
-    /* Reconcile stuck pad LEDs after any missed note-off. */
     sync_pad_lights(g_fd);
 }
 
@@ -506,9 +593,12 @@ void surface_set_loop_led(int on)
 static void midi_selftest_reset(void)
 {
     memset(&g_state, 0, sizeof g_state);
-    memset(g_soft_held, 0, sizeof g_soft_held);
-    m_status = m_need = m_n = m_sysex = 0;
+    memset(g_soft_down, 0, sizeof g_soft_down);
+    memset(g_soft_down_t, 0, sizeof g_soft_down_t);
+    memset(g_soft_last_fire_t, 0, sizeof g_soft_last_fire_t);
+    m_status = m_need = m_n = m_sysex = m_fresh_status = 0;
     g_state.main_vol = 127;
+    g_state.main_stable = 127;
     g_state.fader = 127;
 }
 
@@ -521,64 +611,123 @@ static void midi_feed_buf(const uint8_t *b, size_t n)
 int surface_midi_selftest(void)
 {
     int fails = 0;
-    midi_selftest_reset();
 
     /* 1) Pad note-on + poly AT flood must NOT create other pad triggers. */
+    midi_selftest_reset();
     {
         const uint8_t seq[] = {
             0x99, 37, 100, /* pad 1 note-on */
             0xa9, 37, 80,  /* poly AT */
             37, 60,        /* AT running */
-            37, 40,        /* AT running */
-            36, 90,        /* AT on pad2 note — must NOT note-on pad 2 */
-            0x89, 37, 0,   /* pad 1 note-off */
+            37, 40,
+            36, 90, /* AT on pad2 note — must NOT note-on pad 2 */
+            0x89, 37, 0,
         };
         midi_feed_buf(seq, sizeof seq);
         if (g_state.pad_vel[0] != 0)
-            fails++; /* should be off after note-off */
+            fails++;
         if (g_state.pad_down[1] || g_state.pad_vel[1])
-            fails++; /* phantom pad 2 */
+            fails++;
         if (!g_state.pad_down[0] && !g_state.pad_up[0])
-            fails++; /* pad1 should have edged */
+            fails++;
     }
 
     /* 2) SysEx then orphan data must NOT become soft keys / quit. */
     midi_selftest_reset();
     {
         const uint8_t seq[] = {
-            0x90, 6, 127, /* SAMPLE on — would have been restored status */
-            0x80, 6, 0,
+            0x90, 6, 127, 0x80, 6, 0,
             0xf0, 0x47, 0x7f, 0x5c, 0x42, 0x00, 0x00, 0xf7,
-            12, 100, /* orphan: would be soft-left under restored 0x90 */
-            13, 100,
-            14, 100,
+            12, 100, 13, 100, 14, 100,
         };
         midi_feed_buf(seq, sizeof seq);
         if (g_state.soft_left || g_state.soft_mid || g_state.soft_right)
             fails++;
+        if (g_state.sample_held)
+            fails++;
     }
 
-    /* 3) Real soft-key note-on still works; repeat without note-off ignored. */
+    /* 3) Soft keys fire on release after hold; running-status soft key ignored. */
     midi_selftest_reset();
     {
-        const uint8_t seq[] = {0x90, 12, 100, 12, 100};
-        midi_feed_buf(seq, sizeof seq);
+        /* Too-short press — no fire */
+        const uint8_t shortp[] = {0x90, 12, 127, 0x80, 12, 0};
+        midi_feed_buf(shortp, sizeof shortp);
+        if (g_state.soft_left)
+            fails++;
+
+        /* Simulate held press: inject down, advance clock via stuck clear path
+         * by feeding with sleep — use direct state for unit timing instead:
+         * call soft path with artificial times via longer sequence not possible
+         * without sleep. Sleep briefly for real hold. */
+    }
+    midi_selftest_reset();
+    {
+        const uint8_t down[] = {0x90, 12, 127};
+        midi_feed_buf(down, sizeof down);
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 40 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+        const uint8_t up[] = {0x80, 12, 0};
+        midi_feed_buf(up, sizeof up);
         if (!g_state.soft_left)
             fails++;
         g_state.soft_left = 0;
-        /* still held — second edge must not fire */
-        if (g_state.soft_left)
-            fails++;
-        const uint8_t off[] = {0x80, 12, 0, 0x90, 12, 90};
-        midi_feed_buf(off, sizeof off);
-        if (!g_state.soft_left)
+
+        /* Running-status continuation must NOT arm soft key */
+        const uint8_t run[] = {13, 127}; /* would be soft-mid under 0x90 */
+        midi_feed_buf(run, sizeof run);
+        struct timespec ts2 = {.tv_sec = 0, .tv_nsec = 40 * 1000 * 1000L};
+        nanosleep(&ts2, NULL);
+        const uint8_t runoff[] = {0x80, 13, 0};
+        midi_feed_buf(runoff, sizeof runoff);
+        if (g_state.soft_mid)
             fails++;
     }
 
-    /* 4) Unknown CC ignored; known knobs update. */
+    /* 4) B3 quit needs longer hold; brief press must not quit. */
     midi_selftest_reset();
     {
-        const uint8_t seq[] = {0xb0, 16, 40, 0xb0, 99, 50, 0xb0, 17, 80};
+        const uint8_t down[] = {0x90, 14, 127};
+        midi_feed_buf(down, sizeof down);
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 40 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+        const uint8_t up[] = {0x80, 14, 0};
+        midi_feed_buf(up, sizeof up);
+        if (g_state.soft_right)
+            fails++; /* 40ms < 120ms quit hold */
+    }
+    midi_selftest_reset();
+    {
+        const uint8_t down[] = {0x90, 14, 127};
+        midi_feed_buf(down, sizeof down);
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 140 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+        const uint8_t up[] = {0x80, 14, 0};
+        midi_feed_buf(up, sizeof up);
+        if (!g_state.soft_right)
+            fails++;
+    }
+
+    /* 5) Volume CC isolated — does not set soft keys / SAMPLE. */
+    midi_selftest_reset();
+    {
+        const uint8_t seq[] = {0xb0, 19, 40, 0xb0, 19, 80, 0xb0, 16, 10};
+        midi_feed_buf(seq, sizeof seq);
+        if (g_state.soft_left || g_state.soft_mid || g_state.soft_right)
+            fails++;
+        if (g_state.sample_held)
+            fails++;
+        if (g_state.k1 != 10)
+            fails++;
+        /* First CC19 is dump; second engages */
+        if (!g_state.main_engaged || g_state.main_vol != 80)
+            fails++;
+    }
+
+    /* 6) Unknown messages dropped; known knobs update. */
+    midi_selftest_reset();
+    {
+        const uint8_t seq[] = {0xb0, 16, 40, 0xb0, 99, 50, 0xb0, 17, 80, 0xe0, 0, 64};
         midi_feed_buf(seq, sizeof seq);
         if (g_state.k1 != 40 || g_state.k2 != 80)
             fails++;

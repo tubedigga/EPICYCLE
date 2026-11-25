@@ -524,8 +524,11 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
 
 void engine_note_off(EpicycleEngine *eng, int pad)
 {
-    /* Pad release stops that pad's voice(s) so demo layers don't stack forever. */
+    /* Latch (loop_enable): keep looping after release — EPICYCLE default.
+     * One-shot: stop on note-off. LOOP button toggles the mode. */
     if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    if (eng->pads[pad].loop_enable)
         return;
     for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
         if (eng->voices[i].active && eng->voices[i].pad_index == pad)
