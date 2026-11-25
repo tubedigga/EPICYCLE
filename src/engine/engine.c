@@ -602,16 +602,22 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
          * Primary (no Shift): K1 Start + K2 End = region width (other edge fixed);
          * K3 Position = slide whole brace. Crossfade / ping-pong are Shift overlays
          * in main (not applied here).
-         * Division mode: K2 = beats; K1 unused for width; K3 still Position.
+         * Division mode: length locked to beats — K1 slides brace (same as POS),
+         * K2 selects beat count, K3 still Position. (K1 was previously unused,
+         * which looked like "Start broken" on division pads.)
          */
         if (p->freeform) {
             if (mask & 1u)
                 engine_trim_set_start(eng, pad, t1);
             if (mask & 2u)
                 engine_trim_set_end(eng, pad, t2);
-        } else if (mask & 2u) {
-            int beats = 1 + (int)((k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
-            engine_set_division(eng, pad, beats);
+        } else {
+            if (mask & 1u)
+                engine_trim_set_position(eng, pad, t1);
+            if (mask & 2u) {
+                int beats = 1 + (int)((k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
+                engine_set_division(eng, pad, beats);
+            }
         }
         if (mask & 4u)
             engine_trim_set_position(eng, pad, t3);
