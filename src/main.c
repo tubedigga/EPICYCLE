@@ -277,7 +277,12 @@ int main(int argc, char **argv)
 #endif
 
     int ticks = 0;
-    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255;
+    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255;
+
+    /* Apply any main-volume reply from surface position SysEx 0x42. */
+    surface_poll();
+    engine_set_master_gain_cc(&eng, surface_state()->main_vol);
+    last_main = surface_state()->main_vol;
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
@@ -293,6 +298,11 @@ int main(int argc, char **argv)
                 float vel = surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
                 engine_note_on(&eng, i, vel);
             }
+        }
+
+        if (surf->main_vol != last_main) {
+            engine_set_master_gain_cc(&eng, surf->main_vol);
+            last_main = surf->main_vol;
         }
 
         if (surf->k1 != last_k1 || surf->k2 != last_k2 || surf->k3 != last_k3) {

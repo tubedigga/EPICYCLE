@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.2.1-splash
+VERSION    := 0.2.2-panel-fix
 BUILD      := build
 DIST       := dist
 

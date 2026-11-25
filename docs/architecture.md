@@ -21,12 +21,15 @@ Power on
 
 - **platform** — app dir from `$0` / `MPC_APP_DIR`; card root from `/proc/mounts`;
   user data under `<card>/Epicycle/`; ALSA card id lookup via `/proc/asound/cards`.
-- **display** — software 320×240 `0x00RRGGBB` buffer; present via mmap/write to
-  `/dev/fb0` using `FBIOGET_*` stride and bpp (RGB565 or 32-bit).
+- **display** — software 320×240 `0x00RRGGBB` buffer; present as contiguous
+  320×240 BGRX via `write(2)` to `/dev/fb0` (SampleBoot path). Logs
+  `FBIOGET_*` bpp/stride; optional `FBIOPAN_DISPLAY` after write.
 - **audio** — I2S card PCM via kernel ioctls (no alsa-lib): S32_LE stereo 44.1 kHz,
   realtime thread calls `engine_render` when an engine is bound; `DROP` on close.
-- **surface** — Control Surface raw MIDI: pads, K1–K3, soft keys (free/div, LFO),
-  wheel scroll/quit, lights off, position-request SysEx.
+  Main Volume (surface CC19) → engine `master_gain` with squared taper (no ALSA mixer).
+- **surface** — Control Surface raw MIDI: pads (note map + LED SysEx I=pad−1),
+  K1–K3, Main Volume CC19, soft keys (free/div, LFO), wheel scroll/quit,
+  lights off, position-request SysEx `0x42`.
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
 - **engine** — 16 pads × scrollable brace window; division (1–32 beats) or freeform;
