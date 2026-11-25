@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.2.7-midi-stability"
+#define EPICYCLE_VERSION "0.2.8-midi-rewrite"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -165,6 +165,8 @@ typedef struct EpicycleSurfaceState {
     int fader_engaged;                   /* 1 after user moves fader from dump */
     uint8_t fader_dump;                   /* first CC20 value (ignored until move) */
     int main_seen;                       /* 1 after first CC19 */
+    int main_engaged;                    /* 1 after user moves main from dump */
+    uint8_t main_dump;                   /* first CC19 (0x42); ignored until move */
     uint8_t main_stable;                 /* last accepted main CC (debounce) */
     int wheel_accum;                     /* relative wheel steps since open */
     int wheel_press;                     /* encoder push edge — never quits */
