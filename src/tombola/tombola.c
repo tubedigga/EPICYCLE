@@ -224,13 +224,13 @@ void tombola_set_spin_cc(EpicycleTombola *tb, uint8_t k2)
 {
     if (!tb)
         tb = &g_tb;
-    /* Bipolar: 64 ± deadband = stop; below = CCW, above = CW. */
+    /* Bipolar: 64 ± wide deadband = stop (Ash: spin must not jump alone). */
     int c = (int)k2 - 64;
-    if (c > -4 && c < 4) {
+    if (c > -8 && c < 8) {
         tb->spin_speed = 0.0f;
         return;
     }
-    float n = (float)c / 63.0f; /* ≈ −1..+1 */
+    float n = (float)c / 56.0f; /* map outside deadband → ±1 */
     if (n < -1.0f)
         n = -1.0f;
     if (n > 1.0f)

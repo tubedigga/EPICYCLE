@@ -377,21 +377,68 @@ static void draw_line(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
     }
 }
 
-/* Filled disk (circle) — smoother balls than squares. */
-static void fill_disk(uint32_t *px, int cx, int cy, int r, uint32_t c)
+static uint32_t shade_rgb(uint32_t c, float lit)
+{
+    int r = (int)(((c >> 16) & 0xff) * lit);
+    int g = (int)(((c >> 8) & 0xff) * lit);
+    int b = (int)((c & 0xff) * lit);
+    if (r > 255)
+        r = 255;
+    if (g > 255)
+        g = 255;
+    if (b > 255)
+        b = 255;
+    if (r < 0)
+        r = 0;
+    if (g < 0)
+        g = 0;
+    if (b < 0)
+        b = 0;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+/* Shaded sphere (not a flat square/disk) — NW highlight for 3D read. */
+static void fill_sphere(uint32_t *px, int cx, int cy, int r, uint32_t base)
 {
     if (r < 1)
         r = 1;
     int r2 = r * r;
+    float inv_r = 1.0f / (float)r;
     for (int y = -r; y <= r; y++) {
         for (int x = -r; x <= r; x++) {
-            if (x * x + y * y <= r2)
-                put_px(px, cx + x, cy + y, c);
+            int d2 = x * x + y * y;
+            if (d2 > r2)
+                continue;
+            float nx = (float)x * inv_r;
+            float ny = (float)y * inv_r;
+            float nz2 = 1.0f - nx * nx - ny * ny;
+            float nz = nz2 > 0.0f ? nz2 : 0.0f; /* cheap sqrt-ish via clamp */
+            /* Approximate sqrt for z: two Newton-ish steps enough for look. */
+            if (nz > 0.0f) {
+                float z = nz;
+                z = 0.5f * (z + nz / (z > 1e-4f ? z : 1e-4f));
+                z = 0.5f * (z + nz / (z > 1e-4f ? z : 1e-4f));
+                nz = z;
+            }
+            /* Light from upper-left. */
+            float lit = 0.28f + 0.72f * (0.55f * (-nx) + 0.35f * (-ny) + 0.75f * nz);
+            if (lit < 0.12f)
+                lit = 0.12f;
+            if (lit > 1.15f)
+                lit = 1.15f;
+            /* Specular hotspot. */
+            float hx = nx + 0.35f, hy = ny + 0.4f, hz = nz - 0.9f;
+            float hs = hx * hx + hy * hy + hz * hz;
+            if (hs < 0.12f)
+                lit += (0.12f - hs) * 3.5f;
+            if (lit > 1.35f)
+                lit = 1.35f;
+            put_px(px, cx + x, cy + y, shade_rgb(base, lit));
         }
     }
 }
 
-/* Soft rim ring around a disk. */
+/* Soft rim ring around a sphere. */
 static void stroke_disk(uint32_t *px, int cx, int cy, int r, uint32_t c)
 {
     if (r < 2)
@@ -450,19 +497,21 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
     }
 
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        if (!tb->balls[i].active)
-            continue;
         int sx, sy;
         tombola_world_to_screen(tb, tb->balls[i].x, tb->balls[i].y, cx, cy, scale, &sx, &sy);
         uint32_t col = tombola_ball_color(i);
-        if (tb->balls[i].hit_flash > 0.2f)
-            col = COL_PLAY;
-        int r = (i == sel) ? 6 : 5;
-        fill_disk(px, sx, sy, r, col);
+        if (!tb->balls[i].active) {
+            /* MUTE'd out: faint outline slot (compose with MUTE+pad). */
+            stroke_disk(px, sx, sy, 4, shade_rgb(col, 0.28f));
+            continue;
+        }
+        /* Hit flash = brighter same pad colour (matches LED). */
+        if (tb->balls[i].hit_flash > 0.15f)
+            col = shade_rgb(col, 1.35f);
+        int r = (i == sel) ? 7 : 5;
+        fill_sphere(px, sx, sy, r, col);
         if (i == sel)
             stroke_disk(px, sx, sy, r + 2, COL_BRACE);
-        else
-            stroke_disk(px, sx, sy, r + 1, 0x00202828u);
     }
 }
 
@@ -522,7 +571,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         int active = tb ? tombola_active_count(tb) : 0;
         snprintf(v3, sizeof v3, "%d", active);
         draw_param_row(px, 188, "SHAPE", v1, "SPIN", v2, "BALLS", v3);
-        draw_text(px, 8, 226, "K1 shape  K2 spin+/-  K3/MUTE balls  FULL=HITMOD", COL_MUTED, 1);
+        draw_text(px, 8, 226, "MUTE+pad add/rem  K2 spin  faint=out  FULL=HITMOD", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_HITMOD) {
         draw_text(px, 8, 48, "HIT MOD", COL_FG, 2);
         draw_text(px, 120, 52, "src->dest matrix", COL_MUTED, 1);
@@ -612,8 +661,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             /* Large FREE / DIVn badge — encoder push toggles (Ash discoverability). */
             if (pad && pad->freeform) {
                 draw_text(px, 214, 52, "FREE", COL_BRACE, 3);
-                draw_text(px, 8, 212, "K1/K2 width  K3 slide", COL_MUTED, 1);
-                draw_text(px, 8, 226, "ENC push -> DIV  hold SHIFT xfade", COL_MUTED, 1);
+                draw_text(px, 8, 212, "K1/K2 frame-fine  K3 slide", COL_MUTED, 1);
+                draw_text(px, 8, 226, "ENC fine edge  push=DIV  SHIFT xfade", COL_MUTED, 1);
             } else {
                 snprintf(line, sizeof line, "DIV%d",
                          pad ? engine_division_quantize_slices(pad->division_beats) : 4);
@@ -649,12 +698,23 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         }
         draw_text(px, 8, 218, "K1 pad vol  K2 pan  SHIFT+K3 kit", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_AMP) {
-        draw_text(px, 8, 52, "AMP ENV", COL_FG, 4);
-        snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->amp_attack * 127.0f) : 0);
-        snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->amp_decay * 127.0f) : 0);
-        snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->vel_sens * 127.0f) : 0);
-        draw_param_row(px, 100, "ATK", v1, "DEC", v2, "VEL", v3);
-        draw_text(px, 8, 218, "K1 attack  K2 decay  K3 vel", COL_MUTED, 1);
+        draw_text(px, 8, 52, "AMP ADSR", COL_FG, 3);
+        int shift = surf && surf->shift_held;
+        if (shift) {
+            snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->amp_release * 127.0f) : 0);
+            snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->vel_sens * 127.0f) : 0);
+            snprintf(v3, sizeof v3, "--");
+            draw_param_row(px, 100, "REL", v1, "VEL", v2, "", v3);
+            draw_text(px, 8, 160, "LOOP bounce: hit=loop  hit again=Release fade", COL_MUTED, 1);
+            draw_text(px, 8, 218, "SHIFT+K1 release  SHIFT+K2 vel", COL_MUTED, 1);
+        } else {
+            snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->amp_attack * 127.0f) : 0);
+            snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->amp_decay * 127.0f) : 0);
+            snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->amp_sustain * 127.0f) : 0);
+            draw_param_row(px, 100, "ATK", v1, "DEC", v2, "SUS", v3);
+            draw_text(px, 8, 160, "full ADSR  hold SHIFT for Release", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 attack  K2 decay  K3 sustain", COL_MUTED, 1);
+        }
     } else if (page == EPICYCLE_PAGE_TUNE) {
         draw_text(px, 8, 52, "TUNE", COL_FG, 4);
         snprintf(v1, sizeof v1, "%+d", pad ? pad->semitone : 0);

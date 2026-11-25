@@ -139,8 +139,10 @@ typedef struct EpicyclePad {
     int ping_pong;          /* 1 = reverse at brace ends; 0 = forward only */
     int allow_scrub;        /* 1 = may use LFO brace scan (budgeted) */
     /* Amp / filter page params — Chamberlin SVF in the voice path. */
-    float amp_attack;  /* 0..1 */
-    float amp_decay;   /* 0..1 */
+    float amp_attack;  /* 0..1 → time */
+    float amp_decay;   /* 0..1 → time */
+    float amp_sustain; /* 0..1 level */
+    float amp_release; /* 0..1 → time */
     float vel_sens;    /* 0..1 */
     float filter_cutoff; /* 0..1 (open = full); mapped exponentially in DSP */
     float filter_reso;   /* 0..1 */
@@ -163,7 +165,9 @@ typedef struct EpicycleVoice {
     int pad_index;
     double phase;       /* sample-frame position within absolute sample */
     float velocity;
-    float env;          /* simple amp for one-shots */
+    float env;          /* ADSR amp level 0..1 */
+    int env_stage;      /* 0=A 1=D 2=S 3=R */
+    int gate;           /* 1 = held (sustain); 0 = releasing */
     int in_crossfade;
     double xfade_pos;   /* 0..1 through crossfade */
     int direction;      /* +1 forward, -1 reverse (ping-pong) */
@@ -175,7 +179,8 @@ typedef struct EpicycleVoice {
     float impact_pitch; /* pitch ratio multiplier */
     float impact_filt;  /* added to filter cutoff 0..1 */
     float impact_level; /* level multiplier */
-    int force_oneshot;  /* 1 = bounce/impact: never latch-loop (Ash) */
+    /* 1 = bounce one-shot when LOOP off; 0 = bounce may loop when LOOP on */
+    int force_oneshot;
 } EpicycleVoice;
 
 typedef struct EpicycleTombolaBall {
@@ -295,9 +300,9 @@ int surface_poll_quit(void);
 const EpicycleSurfaceState *surface_state(void);
 EpicycleSurfaceState *surface_state_mut(void);
 const char *surface_info(void);
-/* Selected pad = solid amber (edit focus). Wall-hit flash via surface_flash_pad. */
+/* Selected pad = solid pad RGB; wall-hit flash = brighter same colour. */
 void surface_set_selected_pad(int pad /* 0..15 */);
-/* Brief pad LED flash on tombola wall hit (connection feedback). */
+/* Brief pad LED flash on tombola wall hit (pad colour; connection feedback). */
 void surface_flash_pad(int pad /* 0..15 */);
 
 /* samples */
@@ -318,8 +323,8 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity);
 /* Tombola wall-hit: velocity + optional physics hit-mod (pitch/filt/level). */
 void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
                            float filt_add, float level_mul);
-void engine_note_off(EpicycleEngine *eng, int pad); /* gate stop — no-op while latch looping */
-void engine_stop_pad(EpicycleEngine *eng, int pad); /* always stop pad voices (latch toggle-off) */
+void engine_note_off(EpicycleEngine *eng, int pad); /* start Release stage (ADSR fade) */
+void engine_stop_pad(EpicycleEngine *eng, int pad); /* hard stop (MUTE ball / emergency) */
 int engine_pad_voice_active(const EpicycleEngine *eng, int pad); /* 1 if any voice for pad */
 /* Division helpers: equal-slice length; snap start to grid; map CC → N. */
 float engine_division_slice_frac(int slices);
