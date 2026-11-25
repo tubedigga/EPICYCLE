@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  *
- * Loop UI + Sample-Mode-style pages (0.2.5): Trim keeps large waveform;
- * B1/B2 cycle pages; B3 quit; LFO editor page. Splash prompt in bottom strip.
+ * Loop UI + Sample-Mode-style pages (0.2.6): Trim Start/End/POS + Shift
+ * overlays (crossfade, ping-pong); equidistant param columns; filter names.
  */
 #include "epicycle.h"
 
@@ -210,11 +210,21 @@ void ui_draw_splash_prompt(const char *prompt_line)
         draw_text(px, 28, 90, "EPICYCLE", COL_FG, 4);
         draw_text(px, 28, 140, "v" EPICYCLE_VERSION, COL_MUTED, 1);
     }
-    /* Bottom strip only — sits in the letterbox under a 226-tall logo (y≈233). */
-    fill_rect(px, 0, EPICYCLE_FB_H - 10, EPICYCLE_FB_W, 10, 0x00000000u);
+    /* Centered ALL CAPS under logo (letterbox strip below 226-tall boot.png). */
     const char *msg =
-        (prompt_line && prompt_line[0]) ? prompt_line : "Press encoder or soft key to start";
-    draw_text(px, 4, EPICYCLE_FB_H - 8, msg, COL_SOFT, 1);
+        (prompt_line && prompt_line[0]) ? prompt_line : "PRESS ANY PAD TO CONTINUE";
+    int scale = 1;
+    int text_w = 0;
+    for (const char *p = msg; *p; p++)
+        text_w += 6 * scale;
+    int x = (EPICYCLE_FB_W - text_w) / 2;
+    if (x < 2)
+        x = 2;
+    int y = g_logo ? (EPICYCLE_FB_H + g_logo_h) / 2 + 2 : EPICYCLE_FB_H - 14;
+    if (y > EPICYCLE_FB_H - 10)
+        y = EPICYCLE_FB_H - 10;
+    fill_rect(px, 0, y - 2, EPICYCLE_FB_W, 12, 0x00000000u);
+    draw_text(px, x, y, msg, COL_SOFT, scale);
     display_present();
 }
 
@@ -284,15 +294,18 @@ static void draw_waveform(uint32_t *px, const EpicyclePad *pad, float playhead, 
     }
 }
 
+/* Equidistant bottom param columns (320px / 3). */
+enum { UI_COL0 = 8, UI_COL1 = 112, UI_COL2 = 216 };
+
 static void draw_param_row(uint32_t *px, int y, const char *k1n, const char *k1v, const char *k2n,
                            const char *k2v, const char *k3n, const char *k3v)
 {
-    draw_text(px, 8, y, k1n, COL_MUTED, 1);
-    draw_text(px, 110, y, k2n, COL_MUTED, 1);
-    draw_text(px, 214, y, k3n, COL_MUTED, 1);
-    draw_text(px, 8, y + 14, k1v, COL_FG, 2);
-    draw_text(px, 110, y + 14, k2v, COL_FG, 2);
-    draw_text(px, 214, y + 14, k3v, COL_FG, 2);
+    draw_text(px, UI_COL0, y, k1n, COL_MUTED, 2);
+    draw_text(px, UI_COL1, y, k2n, COL_MUTED, 2);
+    draw_text(px, UI_COL2, y, k3n, COL_MUTED, 2);
+    draw_text(px, UI_COL0, y + 16, k1v, COL_FG, 2);
+    draw_text(px, UI_COL1, y + 16, k2v, COL_FG, 2);
+    draw_text(px, UI_COL2, y + 16, k3v, COL_FG, 2);
 }
 
 static const char *lfo_shape_name(EpicycleLfoShape s)
@@ -347,6 +360,12 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
 
     if (surf && surf->sample_held)
         draw_text(px, 200, 28, "SEL", COL_BRACE, 2);
+    if (surf && surf->shift_held)
+        draw_text(px, 168, 28, "SHIFT", COL_BRACE, 2);
+    if (pad && pad->loop_enable)
+        draw_text(px, 290, 4, "LOOP", COL_MOD, 1);
+    else
+        draw_text(px, 290, 4, "1SHOT", COL_MUTED, 1);
 
     if (page == EPICYCLE_PAGE_TRIM) {
         float playhead = eng ? engine_pad_playhead(eng, sel) : -1.0f;
@@ -357,68 +376,91 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         float end = start + len;
         if (end > 1.0f)
             end = 1.0f;
-        float pos = playhead >= 0.0f ? playhead : start;
+        /* POS = brace window offset (not playhead; playhead is the white line). */
+        float pos = start;
 
-        draw_text(px, 8, 168, "START", COL_MUTED, 1);
-        draw_text(px, 118, 168, "END", COL_MUTED, 1);
-        draw_text(px, 220, 168, "POS", COL_MUTED, 1);
-        snprintf(line, sizeof line, "%.2f", (double)start);
-        draw_text(px, 8, 180, line, COL_FG, 3);
-        snprintf(line, sizeof line, "%.2f", (double)end);
-        draw_text(px, 118, 180, line, COL_FG, 3);
-        snprintf(line, sizeof line, "%.2f", (double)pos);
-        draw_text(px, 220, 180, line, COL_BRACE, 3);
-
-        if (pad && pad->freeform)
-            draw_text(px, 8, 212, "K1 start  K2 len  K3 xfade  FREE", COL_MUTED, 1);
-        else
-            draw_text(px, 8, 212, "K1 start  K2 div  K3 xfade  DIV", COL_MUTED, 1);
-        draw_text(px, 8, 226, "enc push: free/div", COL_MUTED, 1);
+        int shift = surf && surf->shift_held;
+        if (shift) {
+            /* Shift overlay: crossfade + loop direction (Forward / Ping-pong). */
+            snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->crossfade * 100.0f) : 0);
+            snprintf(v2, sizeof v2, "%s", (pad && pad->ping_pong) ? "PINGPONG" : "FORWARD");
+            snprintf(v3, sizeof v3, "%.2f", (double)pos);
+            draw_text(px, UI_COL0, 168, "XFADE", COL_BRACE, 2);
+            draw_text(px, UI_COL1, 168, "DIR", COL_BRACE, 2);
+            draw_text(px, UI_COL2, 168, "POS", COL_MUTED, 2);
+            draw_text(px, UI_COL0, 184, v1, COL_FG, 2);
+            draw_text(px, UI_COL1, 184, v2, COL_FG, 2);
+            draw_text(px, UI_COL2, 184, v3, COL_MUTED, 2);
+            draw_text(px, 8, 212, "SHIFT+K1 xfade  SHIFT+K2 dir", COL_MUTED, 1);
+            draw_text(px, 8, 226, "release SHIFT for Start/End/Pos", COL_MUTED, 1);
+        } else {
+            draw_text(px, UI_COL0, 168, "START", COL_MUTED, 2);
+            draw_text(px, UI_COL1, 168, "END", COL_MUTED, 2);
+            draw_text(px, UI_COL2, 168, "POS", COL_MUTED, 2);
+            snprintf(line, sizeof line, "%.2f", (double)start);
+            draw_text(px, UI_COL0, 184, line, COL_FG, 3);
+            snprintf(line, sizeof line, "%.2f", (double)end);
+            draw_text(px, UI_COL1, 184, line, COL_FG, 3);
+            snprintf(line, sizeof line, "%.2f", (double)pos);
+            draw_text(px, UI_COL2, 184, line, COL_BRACE, 3);
+            if (pad && pad->freeform)
+                draw_text(px, 8, 212, "K1/K2 width  K3 slide  FREE", COL_MUTED, 1);
+            else
+                draw_text(px, 8, 212, "K2 div  K3 slide  DIV", COL_MUTED, 1);
+            draw_text(px, 8, 226, "enc: free/div  SHIFT: xfade/dir", COL_MUTED, 1);
+        }
     } else if (page == EPICYCLE_PAGE_MIX) {
-        draw_text(px, 8, 56, "MIX", COL_FG, 3);
+        draw_text(px, 8, 56, "MIX", COL_FG, 4);
         snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->level * 100.0f) : 0);
-        snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->kit_level * 100.0f) : 0);
         if (pad) {
             int pan = (int)((pad->pan - 0.5f) * 100.0f);
             if (pan < 0)
-                snprintf(v3, sizeof v3, "%dL", -pan);
+                snprintf(v2, sizeof v2, "%dL", -pan);
             else if (pan > 0)
-                snprintf(v3, sizeof v3, "%dR", pan);
+                snprintf(v2, sizeof v2, "%dR", pan);
             else
-                snprintf(v3, sizeof v3, "C");
+                snprintf(v2, sizeof v2, "C");
         } else {
-            snprintf(v3, sizeof v3, "C");
+            snprintf(v2, sizeof v2, "C");
         }
-        draw_param_row(px, 100, "VOL", v1, "KIT", v2, "PAN", v3);
+        if (surf && surf->shift_held)
+            snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->kit_level * 100.0f) : 0);
+        else
+            snprintf(v3, sizeof v3, "--");
+        draw_param_row(px, 100, "VOL", v1, "PAN", v2, surf && surf->shift_held ? "KIT" : "SEND",
+                       v3);
         if (surf) {
-            snprintf(line, sizeof line, "main %d  fader %d", (int)surf->main_vol, (int)surf->fader);
+            snprintf(line, sizeof line, "main %d  fader %s%d", (int)surf->main_vol,
+                     surf->fader_engaged ? "" : "~", (int)surf->fader);
             draw_text(px, 8, 160, line, COL_MUTED, 1);
         }
-        draw_text(px, 8, 218, "K1 pad vol  K2 kit  K3 pan", COL_MUTED, 1);
+        draw_text(px, 8, 218, "K1 pad vol  K2 pan  SHIFT+K3 kit", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_AMP) {
-        draw_text(px, 8, 56, "AMP ENV", COL_FG, 3);
+        draw_text(px, 8, 52, "AMP ENV", COL_FG, 4);
         snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->amp_attack * 127.0f) : 0);
         snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->amp_decay * 127.0f) : 0);
         snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->vel_sens * 127.0f) : 0);
         draw_param_row(px, 100, "ATK", v1, "DEC", v2, "VEL", v3);
         draw_text(px, 8, 218, "K1 attack  K2 decay  K3 vel", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_TUNE) {
-        draw_text(px, 8, 56, "TUNE", COL_FG, 3);
+        draw_text(px, 8, 52, "TUNE", COL_FG, 4);
         snprintf(v1, sizeof v1, "%+d", pad ? pad->semitone : 0);
         snprintf(v2, sizeof v2, "%+.0f", pad ? (double)pad->fine : 0.0);
         snprintf(v3, sizeof v3, "%+d", pad ? pad->octave : 0);
         draw_param_row(px, 100, "SEMI", v1, "FINE", v2, "OCT", v3);
+        draw_text(px, 8, 160, "0 / 0 / 0 = no pitch shift", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 semi  K2 fine  K3 oct", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_FILTER) {
-        draw_text(px, 8, 56, "FILTER", COL_FG, 3);
+        draw_text(px, 8, 56, "FILTER", COL_FG, 4);
         snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->filter_cutoff * 127.0f) : 0);
         snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->filter_reso * 127.0f) : 0);
-        snprintf(v3, sizeof v3, "%d", pad ? pad->filter_type : 0);
+        snprintf(v3, sizeof v3, "%s",
+                 epicycle_filter_type_name(pad ? pad->filter_type : 0));
         draw_param_row(px, 100, "CUT", v1, "RES", v2, "TYPE", v3);
         draw_text(px, 8, 160, "(DSP stub — values stored)", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 cutoff  K2 reso  K3 type", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_FILT_ENV) {
-        draw_text(px, 8, 56, "FILT ENV", COL_FG, 3);
+        draw_text(px, 8, 56, "FILT ENV", COL_FG, 4);
         snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->filt_attack * 127.0f) : 0);
         snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->filt_decay * 127.0f) : 0);
         snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->filt_depth * 127.0f) : 0);
@@ -426,7 +468,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         draw_text(px, 8, 160, "(follows filter stub)", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 attack  K2 decay  K3 depth", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_LFO) {
-        draw_text(px, 8, 56, "LFO", COL_FG, 3);
+        draw_text(px, 8, 56, "LFO", COL_FG, 4);
         const EpicycleLfo *l = pad ? &pad->lfos[0] : NULL;
         snprintf(v1, sizeof v1, "%s", l ? lfo_shape_name(l->shape) : "SIN");
         if (l && l->sync_beats > 0.0f)
@@ -440,15 +482,14 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         else
             draw_text(px, 8, 160, "FREE  enc push -> sync", COL_MUTED, 2);
         int on = l && l->enabled && l->depth > 0.0f;
-        draw_text(px, 8, 190, on ? "brace scrub ON" : "brace scrub off", on ? COL_MOD : COL_MUTED,
-                  1);
+        draw_text(px, 8, 190, on ? "POS scrub ON" : "POS scrub off", on ? COL_MOD : COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 shape  K2 rate  K3 depth", COL_MUTED, 1);
     }
 
     if (surf) {
-        fill_rect(px, 8, 234, 1 + (int)surf->k1 * 90 / 127, 4, COL_ACCENT);
-        fill_rect(px, 110, 234, 1 + (int)surf->k2 * 90 / 127, 4, COL_ACCENT);
-        fill_rect(px, 214, 234, 1 + (int)surf->k3 * 90 / 127, 4, COL_BRACE);
+        fill_rect(px, UI_COL0, 234, 1 + (int)surf->k1 * 90 / 127, 4, COL_ACCENT);
+        fill_rect(px, UI_COL1, 234, 1 + (int)surf->k2 * 90 / 127, 4, COL_ACCENT);
+        fill_rect(px, UI_COL2, 234, 1 + (int)surf->k3 * 90 / 127, 4, COL_BRACE);
     }
 
     display_present();

@@ -58,15 +58,19 @@ static void pad_defaults(EpicyclePad *p)
     p->division_beats = 4;
     p->level = 0.8f;
     p->pan = 0.5f;
+    p->octave = 0;
+    p->semitone = 0;
+    p->fine = 0.0f;
     p->crossfade = 0.05f;
-    p->loop_enable = 1;
+    p->loop_enable = 1; /* EPICYCLE default: latch loop (LOOP button toggles) */
+    p->ping_pong = 0;   /* Forward; SHIFT on Trim selects Ping-pong */
     p->allow_scrub = 1;
     p->amp_attack = 0.0f;
     p->amp_decay = 0.35f;
     p->vel_sens = 1.0f;
     p->filter_cutoff = 1.0f;
     p->filter_reso = 0.0f;
-    p->filter_type = 0;
+    p->filter_type = 1; /* LPF default name; DSP still stub */
     p->filt_attack = 0.0f;
     p->filt_decay = 0.35f;
     p->filt_depth = 0.0f;
@@ -119,6 +123,23 @@ const char *epicycle_page_name(EpicycleModePage page)
     }
 }
 
+const char *epicycle_filter_type_name(int type)
+{
+    switch (type) {
+    case 1:
+        return "LPF";
+    case 2:
+        return "HPF";
+    case 3:
+        return "BPF";
+    case 4:
+        return "NOTCH";
+    case 0:
+    default:
+        return "OFF";
+    }
+}
+
 static float division_length_frac(const EpicycleEngine *eng, const EpicyclePad *pad)
 {
     if (!pad->sample || pad->sample->frames == 0)
@@ -155,6 +176,22 @@ static int pad_wants_brace_scrub(const EpicyclePad *pad)
             return 1;
     }
     return 0;
+}
+
+void engine_sync_mod_window(EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    float start, len;
+    resolve_window(eng, p, &start, &len);
+    /* Only freeze to base window when brace scrub LFO is off. */
+    if (!pad_wants_brace_scrub(p)) {
+        p->mod_window_start = start;
+        p->mod_window_length = len;
+    }
+    p->mod_pitch_ratio = pitch_ratio(p->octave, p->semitone, p->fine);
+    p->mod_level = p->level;
 }
 
 /* First EPICYCLE_SCRUB_BUDGET pads (by index) that want brace scrub may scan;
@@ -210,12 +247,13 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
         float w = lfo_wave(l->shape, l->phase) * l->depth * r->amount;
         switch (r->dest) {
         case EPICYCLE_MOD_BRACE_START:
+            /* Brace scrub = Position slide (window offset), not Start/End width. */
             if (scrub_ok)
                 d_start += w * 0.5f; /* ±0.5 of sample at full depth */
             break;
         case EPICYCLE_MOD_BRACE_LEN:
-            if (scrub_ok)
-                d_len += w * 0.25f;
+            /* Width modulation reserved; scanning LFO must not change length. */
+            (void)w;
             break;
         case EPICYCLE_MOD_PITCH:
             d_pitch += w * 2.0f; /* ±2 semitones at full */
@@ -336,7 +374,9 @@ int engine_assign_sample(EpicycleEngine *eng, int pad, int bank_slot)
     }
     eng->pads[pad].sample = &eng->bank[bank_slot];
     eng->pads[pad].window_start = 0.0f;
-    eng->pads[pad].window_length = eng->pads[pad].freeform ? 0.5f : division_length_frac(eng, &eng->pads[pad]);
+    eng->pads[pad].window_length =
+        eng->pads[pad].freeform ? 0.5f : division_length_frac(eng, &eng->pads[pad]);
+    engine_sync_mod_window(eng, pad);
     return 0;
 }
 
@@ -356,6 +396,7 @@ void engine_set_division(EpicycleEngine *eng, int pad, int beats)
     EpicyclePad *p = &eng->pads[pad];
     if (beats <= 0) {
         p->freeform = 1;
+        engine_sync_mod_window(eng, pad);
         return;
     }
     p->freeform = 0;
@@ -363,6 +404,7 @@ void engine_set_division(EpicycleEngine *eng, int pad, int beats)
     p->window_length = division_length_frac(eng, p);
     if (p->window_start + p->window_length > 1.0f)
         p->window_start = 1.0f - p->window_length;
+    engine_sync_mod_window(eng, pad);
 }
 
 void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
@@ -374,6 +416,7 @@ void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
     p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
     if (!p->freeform)
         p->window_length = division_length_frac(eng, p);
+    engine_sync_mod_window(eng, pad);
 }
 
 void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float fine)
@@ -381,9 +424,70 @@ void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float 
     if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     EpicyclePad *p = &eng->pads[pad];
+    /* Clamp to neutral-friendly ranges; 0/0/0 = unity pitch. */
+    if (octave < -4)
+        octave = -4;
+    if (octave > 4)
+        octave = 4;
+    if (semi < -24)
+        semi = -24;
+    if (semi > 24)
+        semi = 24;
     p->octave = octave;
     p->semitone = semi;
-    p->fine = fine;
+    p->fine = clampf(fine, -100.0f, 100.0f);
+    p->mod_pitch_ratio = pitch_ratio(p->octave, p->semitone, p->fine);
+}
+
+void engine_toggle_loop(EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    eng->pads[pad].loop_enable = eng->pads[pad].loop_enable ? 0 : 1;
+}
+
+void engine_set_ping_pong(EpicycleEngine *eng, int pad, int on)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    eng->pads[pad].ping_pong = on ? 1 : 0;
+}
+
+void engine_trim_set_start(EpicycleEngine *eng, int pad, float start01)
+{
+    /* Move left edge; keep End fixed → changes region length/width only. */
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    float end = p->window_start + p->window_length;
+    if (end > 1.0f)
+        end = 1.0f;
+    float start = clampf(start01, 0.0f, end - 0.02f);
+    engine_set_window(eng, pad, start, end - start);
+}
+
+void engine_trim_set_end(EpicycleEngine *eng, int pad, float end01)
+{
+    /* Move right edge; keep Start fixed → changes region length/width only. */
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    float start = p->window_start;
+    float end = clampf(end01, start + 0.02f, 1.0f);
+    engine_set_window(eng, pad, start, end - start);
+}
+
+void engine_trim_set_position(EpicycleEngine *eng, int pad, float pos01)
+{
+    /* Slide whole brace; length unchanged. This is the LFO scrub target. */
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    EpicyclePad *p = &eng->pads[pad];
+    float len = p->window_length;
+    if (len < 0.02f)
+        len = 0.02f;
+    float start = clampf(pos01, 0.0f, 1.0f - len);
+    engine_set_window(eng, pad, start, len);
 }
 
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
@@ -415,6 +519,7 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     v->env = 1.0f;
     v->in_crossfade = 0;
     v->xfade_pos = 0;
+    v->direction = 1; /* always start forward; ping-pong flips at ends */
 }
 
 void engine_note_off(EpicycleEngine *eng, int pad)
@@ -481,10 +586,10 @@ void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad)
     }
 }
 
-void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
-                             uint8_t k2, uint8_t k3)
+void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
+                                  uint8_t k2, uint8_t k3, unsigned mask)
 {
-    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT || mask == 0)
         return;
     EpicyclePad *p = &eng->pads[pad];
     float t1 = (float)k1 / 127.0f;
@@ -493,77 +598,120 @@ void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page
 
     switch (page) {
     case EPICYCLE_PAGE_TRIM: {
-        /* Stock Trim: Start / End / Loop → EPICYCLE brace start / length|div / xfade. */
-        float start = t1;
-        float length = 0.02f + 0.98f * t2;
-        if (p->freeform)
-            engine_set_window(eng, pad, start, length);
-        else {
+        /*
+         * Primary (no Shift): K1 Start + K2 End = region width (other edge fixed);
+         * K3 Position = slide whole brace. Crossfade / ping-pong are Shift overlays
+         * in main (not applied here).
+         * Division mode: K2 = beats; K1 unused for width; K3 still Position.
+         */
+        if (p->freeform) {
+            if (mask & 1u)
+                engine_trim_set_start(eng, pad, t1);
+            if (mask & 2u)
+                engine_trim_set_end(eng, pad, t2);
+        } else if (mask & 2u) {
             int beats = 1 + (int)((k2 * (EPICYCLE_MAX_DIVISION - 1)) / 127);
             engine_set_division(eng, pad, beats);
-            p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
         }
-        p->crossfade = 0.01f + 0.49f * t3;
+        if (mask & 4u)
+            engine_trim_set_position(eng, pad, t3);
         break;
     }
     case EPICYCLE_PAGE_MIX:
-        /* Stock Mix: Volume / (kit) / Pan. */
-        p->level = t1;
-        eng->kit_level = 0.05f + 0.95f * t2;
-        p->pan = t3;
+        /* Pad vol + pan by default; kit only via SHIFT+K2 (handled in main). */
+        if (mask & 1u) {
+            p->level = t1;
+            p->mod_level = t1;
+        }
+        if (mask & 2u)
+            p->pan = t2;
+        if (mask & 4u) {
+            /* Reserved send stub (delay/reverb later); store as unused fine slot. */
+            (void)t3;
+        }
         break;
     case EPICYCLE_PAGE_AMP:
-        /* Stock Amp Env: Attack / Decay / Vel Sens (stored; simple env later). */
-        p->amp_attack = t1;
-        p->amp_decay = t2;
-        p->vel_sens = t3;
+        if (mask & 1u)
+            p->amp_attack = t1;
+        if (mask & 2u)
+            p->amp_decay = t2;
+        if (mask & 4u)
+            p->vel_sens = t3;
         break;
     case EPICYCLE_PAGE_TUNE: {
-        /* Stock Tune: Semi / Fine / (Warp unused — map to octave). */
-        int semi = (int)(t1 * 48.0f + 0.5f) - 24; /* -24..+24 */
-        float fine = t2 * 180.0f - 90.0f;         /* -90..+90 */
-        int oct = (int)(t3 * 8.0f + 0.5f) - 4;    /* -4..+4 */
+        /* Neutral at CC 64 ≈ 0. Only update axes the user moved. */
+        int semi = p->semitone;
+        float fine = p->fine;
+        int oct = p->octave;
+        if (mask & 1u)
+            semi = (int)(t1 * 48.0f + 0.5f) - 24; /* -24..+24; 64 → 0 */
+        if (mask & 2u)
+            fine = t2 * 200.0f - 100.0f; /* -100..+100; 64 → 0 */
+        if (mask & 4u)
+            oct = (int)(t3 * 8.0f + 0.5f) - 4; /* -4..+4; 64 → 0 */
         engine_set_pitch(eng, pad, oct, semi, fine);
         break;
     }
     case EPICYCLE_PAGE_FILTER:
-        /* Stub filter params (DSP later). */
-        p->filter_cutoff = t1;
-        p->filter_reso = t2;
-        p->filter_type = (int)(t3 * 7.0f + 0.5f); /* 0..7 */
+        if (mask & 1u)
+            p->filter_cutoff = t1;
+        if (mask & 2u)
+            p->filter_reso = t2;
+        if (mask & 4u) {
+            /* 0=OFF … 4=NOTCH */
+            int ft = (int)(t3 * 4.0f + 0.5f);
+            if (ft < 0)
+                ft = 0;
+            if (ft > 4)
+                ft = 4;
+            p->filter_type = ft;
+        }
         break;
     case EPICYCLE_PAGE_FILT_ENV:
-        p->filt_attack = t1;
-        p->filt_decay = t2;
-        p->filt_depth = t3;
+        if (mask & 1u)
+            p->filt_attack = t1;
+        if (mask & 2u)
+            p->filt_decay = t2;
+        if (mask & 4u)
+            p->filt_depth = t3;
         break;
     case EPICYCLE_PAGE_LFO: {
-        /* EPICYCLE LFO editor: shape / rate / depth (enable when depth > 0). */
-        int shape = (int)(t1 * (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) + 0.5f);
-        if (shape < 0)
-            shape = 0;
-        if (shape >= EPICYCLE_LFO_SHAPE_COUNT)
-            shape = EPICYCLE_LFO_SHAPE_COUNT - 1;
-        p->lfos[0].shape = (EpicycleLfoShape)shape;
-        if (p->lfos[0].sync_beats > 0.0f) {
-            /* Sync: map K2 to musical divisions 0.25..8 beats. */
-            static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
-            int idx = (int)(t2 * 5.0f + 0.5f);
-            if (idx < 0)
-                idx = 0;
-            if (idx > 5)
-                idx = 5;
-            p->lfos[0].sync_beats = beats[idx];
-        } else {
-            p->lfos[0].rate_hz = 0.05f + 7.95f * t2; /* ~0.05–8 Hz */
+        if (mask & 1u) {
+            int shape = (int)(t1 * (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) + 0.5f);
+            if (shape < 0)
+                shape = 0;
+            if (shape >= EPICYCLE_LFO_SHAPE_COUNT)
+                shape = EPICYCLE_LFO_SHAPE_COUNT - 1;
+            p->lfos[0].shape = (EpicycleLfoShape)shape;
         }
-        p->lfos[0].depth = t3;
-        engine_lfo_set_enabled(eng, pad, t3 > 0.02f);
+        if (mask & 2u) {
+            if (p->lfos[0].sync_beats > 0.0f) {
+                static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
+                int idx = (int)(t2 * 5.0f + 0.5f);
+                if (idx < 0)
+                    idx = 0;
+                if (idx > 5)
+                    idx = 5;
+                p->lfos[0].sync_beats = beats[idx];
+            } else {
+                p->lfos[0].rate_hz = 0.05f + 7.95f * t2;
+            }
+        }
+        if (mask & 4u) {
+            p->lfos[0].depth = t3;
+            engine_lfo_set_enabled(eng, pad, t3 > 0.02f);
+        }
         break;
     }
     default:
         break;
     }
+}
+
+void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
+                             uint8_t k2, uint8_t k3)
+{
+    engine_apply_page_knobs_mask(eng, pad, page, k1, k2, k3, 7u);
 }
 
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3)
@@ -641,8 +789,38 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 xfade_frames = (win1 - win0) * 0.45;
 
             float L = 0, R = 0;
-            if (pad->loop_enable) {
-                /* Keep phase inside window; near end, crossfade to window start. */
+            double step = (double)pad->mod_pitch_ratio;
+            if (v->direction < 0)
+                step = -step;
+
+            if (pad->loop_enable && pad->ping_pong) {
+                /* Ping-pong: reverse at brace ends (no wrap). Soften with xfade length. */
+                read_sample(s, v->phase, &L, &R);
+                v->phase += step;
+                if (v->phase >= win1) {
+                    v->phase = win1 - 1.0;
+                    if (v->phase < win0)
+                        v->phase = win0;
+                    v->direction = -1;
+                    v->in_crossfade = 0;
+                } else if (v->phase <= win0) {
+                    v->phase = win0;
+                    v->direction = 1;
+                    v->in_crossfade = 0;
+                }
+                /* Optional short edge soften using crossfade amount as amp dip. */
+                double edge = xfade_frames;
+                double dist_end = win1 - v->phase;
+                double dist_start = v->phase - win0;
+                double near = dist_end < dist_start ? dist_end : dist_start;
+                if (near < edge && edge > 1.0)
+                    v->env = (float)(0.55 + 0.45 * (near / edge));
+                else
+                    v->env = 1.0f;
+            } else if (pad->loop_enable) {
+                /* Forward loop: near end, crossfade to window start. */
+                if (v->direction < 0)
+                    v->direction = 1; /* force forward when leaving ping-pong */
                 if (v->phase >= win1 - xfade_frames && !v->in_crossfade) {
                     v->in_crossfade = 1;
                     v->xfade_pos = 0;
@@ -676,7 +854,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 }
                 v->env = 1.0f;
             } else {
-                if (v->phase >= win1) {
+                if (v->phase >= win1 || v->phase < win0) {
                     v->active = 0;
                     continue;
                 }

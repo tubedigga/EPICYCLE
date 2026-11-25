@@ -29,21 +29,21 @@ Power on
   `display-diag:` lines go to `last-session.log`.
 - **audio** — I2S card PCM via kernel ioctls (no alsa-lib): S32_LE stereo 44.1 kHz,
   realtime thread calls `engine_render` when an engine is bound; `DROP` on close.
-  Main Volume (CC19, squared) × fader (CC20, linear) → `master_gain` (0 = silence).
+  Main Volume (CC19, squared) × fader (CC20, linear, **latched** until user moves)
+  → `master_gain`.
 - **surface** — Control Surface raw MIDI: pads (note map + LED SysEx I=pad−1),
-  SAMPLE button (ch1 note 6) for select-hold, K1–K3, Main Volume CC19, fader CC20,
-  soft keys B1/B2/B3 (page prev / next / quit), wheel rotate + press (press never
-  quits), selected-pad amber LED, position SysEx `0x42`. Map from sample-base
-  `controls.h` / HARDWARE.md (MIT rewrite only).
+  SAMPLE (6) select-hold, SHIFT (49), LOOP (74), K1–K3, Main CC19, fader CC20,
+  soft keys B1/B2/B3, wheel (press never quits), selected-pad amber LED, position
+  SysEx `0x42`. Poly AT must not steal note running-status. Map from sample-base
+  HARDWARE.md / controls.h note numbers (MIT rewrite only).
 - **sample** — PCM WAV → interleaved stereo float; synth demo tones for host/no-card.
 - **image** — PNG load via vendored `stb_image` (MIT/PD); boot splash only.
-- **engine** — 16 pads × scrollable brace window; division (1–32 beats) or freeform;
-  pitch (oct/semi/fine); crossfade loopers; 16 voices with note-off + steal;
-  2 LFOs + 4 mod routes per pad; brace-scrub budget (`EPICYCLE_SCRUB_BUDGET` = 8);
-  page-aware K1–K3 maps.
-- **ui** — splash with bottom-strip start prompt (logo uncovered); Trim = large
-  waveform home; pages Trim/Mix/Amp/Tune/Filter/FiltEnv/LFO (Sample Mode mapping,
-  EPICYCLE identity — not a stock clone; no SEQ/Pad FX/Chop/16 Levels).
+- **engine** — 16 pads × brace window (Start/End width + Position slide); division
+  or freeform; pitch; forward crossfade loops + ping-pong; LOOP latch/one-shot;
+  2 LFOs + 4 mod routes; LFO scrub targets Position; scrub budget = 8.
+- **ui** — splash centered `PRESS ANY PAD TO CONTINUE`; Trim waveform + Shift
+  overlay (xfade / FORWARD|PINGPONG); Mix pad vol/pan; filter type names;
+  pages Trim/Mix/Amp/Tune/Filter/FiltEnv/LFO.
 
 ## Loop brace / modulation
 

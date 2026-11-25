@@ -6,7 +6,7 @@ Per pad: sample **start / end / loop brace** (a **window** you can scroll across
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.2.5-mode-pages` — Sample-Mode-style soft-key pages (Trim…LFO) + large Trim waveform; splash waits for encoder/soft key; encoder push never quits. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
+> **Status:** `0.2.6-device-ux` — Trim Start/End width + POS slide; Shift xfade/ping-pong; fader latch; LOOP button; Mix pad vol/pan. Host-tested. Needs Ash’s card retest + `Epicycle/logs/last-session.log`.
 
 ## Update the SD card (Ash — firmware 1.4)
 
@@ -17,7 +17,7 @@ Replace the **autorun payload only**; keep your `Epicycle/` user data.
 3. On the card root, **delete or rename** the old `autorun/` folder (and old top-level `autorun.sh` if present).
 4. Copy the new `autorun.sh` + `autorun/` onto the card root. Leave `Epicycle/` alone (projects / samples / logs stay).
 5. Reinsert → power on → Developer Mode autorun prompt → **Yes**.
-6. Expect: splash holds with bottom prompt → press encoder/soft key → Trim waveform; **B1/B2** pages; **B3** quits; encoder push does **not** quit. Paste `Epicycle/logs/last-session.log`.
+6. Expect: splash **PRESS ANY PAD TO CONTINUE** → Trim waveform; **B1/B2** pages; **B3** quits; encoder push does **not** quit. Paste `Epicycle/logs/last-session.log`.
 
 Rollback: remove the card, or rename `autorun` → `autorun-off`.
 
@@ -51,12 +51,12 @@ make test-host    # demo bank + non-silent preview WAV check
 
 ### What you should try on the device
 
-1. Splash holds; bottom strip **Press encoder or soft key to start** (logo uncovered).
+1. Splash holds; centered **PRESS ANY PAD TO CONTINUE** under logo.
 2. **Hold SAMPLE + pad** = select; plain pad = play while held; release = stop.
 3. Soft keys: **B1** prev page, **B2** next, **B3 QUIT**. Pages: Trim / Mix / Amp / Tune / Filt / FEnv / LFO.
-4. **Trim** keeps large waveform + brace; **K1/K2/K3** follow the page. Encoder push = free↔div (or LFO sync↔free) — never quits.
-5. **LFO** page: shape / rate / depth; no blind mid-key toggle.
-6. **Main Volume** + fader (both default full). Demo: pads 1–2 synced 4-beat; 3–4 = 3 vs 5.
+4. **Trim:** K1/K2 = Start/End width; K3 = POS slide. **SHIFT:** K1 xfade, K2 FORWARD/PINGPONG. Encoder = free↔div.
+5. **LOOP** button = per-pad latch ↔ one-shot. **Mix:** pad vol + pan (SHIFT+K3 = kit).
+6. Fader stays full until you move it; Main Volume tracks the knob.
 
 Session log: `Epicycle/logs/last-session.log` on the card.
 

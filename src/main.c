@@ -3,6 +3,8 @@
  * EPICYCLE loop engine — Sample-Mode-style soft-key pages for pad params
  * (Trim / Mix / Amp / Tune / Filter / Filt Env / LFO). Not a stock OS clone.
  * Hold SAMPLE + pad = select; B1/B2 cycle pages; B3 quit; encoder push never quits.
+ * Device UX 0.2.6: Trim Start/End width + POS slide; Shift xfade/ping-pong;
+ * fader latch; LOOP button; pad vol/pan Mix.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -91,10 +93,20 @@ static void page_next(EpicycleEngine *eng)
     eng->mode_page = (EpicycleModePage)p;
 }
 
+static int g_soft_guard_ticks; /* ignore soft keys briefly after pad hits */
+
 static void handle_soft_keys(EpicycleEngine *eng, EpicycleSurfaceState *st)
 {
     if (!eng || !st)
         return;
+    /* Debounce: MIDI noise / aftertouch floods were causing random page jumps
+     * and false B3 quits that look like crashes. */
+    if (g_soft_guard_ticks > 0) {
+        st->soft_left = 0;
+        st->soft_mid = 0;
+        st->soft_right = 0;
+        return;
+    }
     if (st->soft_left) {
         st->soft_left = 0;
         page_prev(eng);
@@ -174,9 +186,10 @@ static void write_host_preview_wav(const char *path, EpicycleEngine *eng, float 
 /* Wait on splash until pad / soft key / encoder press. Host skips. */
 static void splash_wait_for_input(const EpicyclePaths *paths)
 {
+    static const char *k_prompt = "PRESS ANY PAD TO CONTINUE";
 #ifdef EPICYCLE_ON_DEVICE
-    epicycle_log(paths, "splash: waiting for encoder / soft key / pad");
-    ui_draw_splash_prompt("Press encoder or soft key to start");
+    epicycle_log(paths, "splash: waiting for pad / encoder / soft key");
+    ui_draw_splash_prompt(k_prompt);
     for (;;) {
         if (g_stop)
             return;
@@ -215,12 +228,12 @@ static void splash_wait_for_input(const EpicyclePaths *paths)
         /* Keep prompt visible; refresh occasionally in case of display glitch. */
         static int blink;
         if ((blink++ % 30) == 0)
-            ui_draw_splash_prompt("Press encoder or soft key to start");
+            ui_draw_splash_prompt(k_prompt);
         sleep_ms(16);
     }
 #else
     (void)paths;
-    ui_draw_splash_prompt("Press encoder or soft key to start");
+    ui_draw_splash_prompt(k_prompt);
     sleep_ms(200);
 #endif
 }
@@ -351,31 +364,51 @@ int main(int argc, char **argv)
 #endif
 
     int ticks = 0;
-    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255, last_fader = 255;
+    uint8_t last_k1 = 255, last_k2 = 255, last_k3 = 255, last_main = 255;
+    EpicycleModePage last_page = eng.mode_page;
+    int last_sel = eng.selected_pad;
     uint8_t last_pad_vel[EPICYCLE_PAD_COUNT];
     memset(last_pad_vel, 0, sizeof last_pad_vel);
+    g_soft_guard_ticks = 45; /* ~0.7s after splash before soft keys armed */
 
     surface_poll();
+    /* Main tracks hardware; fader stays full until user moves it (latch). */
     engine_set_master_gain_cc(&eng, surface_state()->main_vol);
-    engine_set_fader_gain_cc(&eng, surface_state()->fader);
     last_main = surface_state()->main_vol;
-    last_fader = surface_state()->fader;
+    last_k1 = surface_state()->k1;
+    last_k2 = surface_state()->k2;
+    last_k3 = surface_state()->k3;
     surface_set_selected_pad(eng.selected_pad);
+    surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
 
     while (!g_stop && !surface_poll_quit()) {
         surface_poll();
         EpicycleSurfaceState *st = surface_state_mut();
         const EpicycleSurfaceState *surf = surface_state();
 
+        if (g_soft_guard_ticks > 0)
+            g_soft_guard_ticks--;
+
         handle_soft_keys(&eng, st);
         handle_encoder_press(&eng, st);
+
+        if (st->loop_btn) {
+            st->loop_btn = 0;
+            engine_toggle_loop(&eng, eng.selected_pad);
+            surface_set_loop_led(eng.pads[eng.selected_pad].loop_enable);
+            epicycle_log(&paths, "LOOP pad %d -> %s", eng.selected_pad + 1,
+                         eng.pads[eng.selected_pad].loop_enable ? "latch" : "one-shot");
+        }
 
         for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
             if (st->pad_down[i]) {
                 st->pad_down[i] = 0;
+                g_soft_guard_ticks = 12; /* ~200ms guard against phantom soft keys */
                 if (surf->sample_held) {
                     eng.selected_pad = i;
                     surface_set_selected_pad(i);
+                    surface_set_loop_led(eng.pads[i].loop_enable);
+                    engine_sync_mod_window(&eng, i);
                 } else {
                     float vel =
                         surf->pad_vel[i] > 0 ? (float)surf->pad_vel[i] / 127.0f : 0.8f;
@@ -391,31 +424,83 @@ int main(int argc, char **argv)
             last_pad_vel[i] = surf->pad_vel[i];
         }
 
-        if (surf->main_vol != last_main) {
-            engine_set_master_gain_cc(&eng, surf->main_vol);
-            last_main = surf->main_vol;
+        if (eng.selected_pad != last_sel) {
+            last_sel = eng.selected_pad;
+            surface_set_loop_led(eng.pads[last_sel].loop_enable);
+            /* Absorb parked pot positions so pad change doesn't jump params. */
+            last_k1 = surf->k1;
+            last_k2 = surf->k2;
+            last_k3 = surf->k3;
         }
-        if (surf->fader != last_fader) {
-            engine_set_fader_gain_cc(&eng, surf->fader);
-            last_fader = surf->fader;
-        }
-
-        if (surf->k1 != last_k1 || surf->k2 != last_k2 || surf->k3 != last_k3) {
-            engine_apply_page_knobs(&eng, eng.selected_pad, eng.mode_page, surf->k1, surf->k2,
-                                   surf->k3);
+        if (eng.mode_page != last_page) {
+            last_page = eng.mode_page;
             last_k1 = surf->k1;
             last_k2 = surf->k2;
             last_k3 = surf->k3;
         }
 
-        /* Wheel rotate: nudge focused param — on Trim, scroll brace start. */
+        if (surf->main_vol != last_main) {
+            engine_set_master_gain_cc(&eng, surf->main_vol);
+            last_main = surf->main_vol;
+        }
+        /* Fader: ignore 0x42 dump + spurious CC until user moves from dump. */
+        if (surf->fader_engaged)
+            engine_set_fader_gain_cc(&eng, surf->fader);
+
+        {
+            unsigned mask = 0;
+            if (surf->k1 != last_k1)
+                mask |= 1u;
+            if (surf->k2 != last_k2)
+                mask |= 2u;
+            if (surf->k3 != last_k3)
+                mask |= 4u;
+            if (mask) {
+                if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_TRIM) {
+                    EpicyclePad *p = &eng.pads[eng.selected_pad];
+                    if (mask & 1u)
+                        p->crossfade = 0.01f + 0.49f * ((float)surf->k1 / 127.0f);
+                    if (mask & 2u)
+                        engine_set_ping_pong(&eng, eng.selected_pad, surf->k2 >= 64);
+                    if (mask & 4u)
+                        engine_trim_set_position(&eng, eng.selected_pad,
+                                                 (float)surf->k3 / 127.0f);
+                } else if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_MIX) {
+                    if (mask & 4u)
+                        eng.kit_level = 0.05f + 0.95f * ((float)surf->k3 / 127.0f);
+                    if (mask & 1u)
+                        engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page,
+                                                    surf->k1, surf->k2, surf->k3, 1u);
+                    if (mask & 2u)
+                        engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page,
+                                                    surf->k1, surf->k2, surf->k3, 2u);
+                } else {
+                    engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page, surf->k1,
+                                                surf->k2, surf->k3, mask);
+                }
+                last_k1 = surf->k1;
+                last_k2 = surf->k2;
+                last_k3 = surf->k3;
+            }
+        }
+
+        /* Wheel: Trim = slide POS; Tune = semi; etc. */
         if (surf->wheel_accum != 0) {
             int delta = surf->wheel_accum;
             st->wheel_accum = 0;
             if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
-                EpicyclePad *p = &eng.pads[eng.selected_pad];
-                engine_set_window(&eng, eng.selected_pad, p->window_start + (float)delta * 0.002f,
-                                 p->window_length);
+                if (surf->shift_held) {
+                    EpicyclePad *p = &eng.pads[eng.selected_pad];
+                    p->crossfade += (float)delta * 0.01f;
+                    if (p->crossfade < 0.01f)
+                        p->crossfade = 0.01f;
+                    if (p->crossfade > 0.5f)
+                        p->crossfade = 0.5f;
+                } else {
+                    EpicyclePad *p = &eng.pads[eng.selected_pad];
+                    engine_trim_set_position(&eng, eng.selected_pad,
+                                             p->window_start + (float)delta * 0.002f);
+                }
             } else if (eng.mode_page == EPICYCLE_PAGE_TUNE) {
                 EpicyclePad *p = &eng.pads[eng.selected_pad];
                 engine_set_pitch(&eng, eng.selected_pad, p->octave, p->semitone + delta, p->fine);
@@ -441,6 +526,7 @@ int main(int argc, char **argv)
                     p->level = 0.0f;
                 if (p->level > 1.0f)
                     p->level = 1.0f;
+                p->mod_level = p->level;
             }
         }
 

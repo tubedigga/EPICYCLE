@@ -7,9 +7,11 @@
  *   - pad LED SysEx I = printed pad − 1 (0..15); fader light I=16
  *   - knobs K1–K3: CC 16/17/18; main volume CC 19; fader CC 20 (channel 1)
  *   - wheel: CC 100 relative; wheel push ≈ note 111
- *   - SAMPLE mode button: channel 1 note 6 (SEQ=7, Pad FX=1, Knob FX=0)
+ *   - SAMPLE=6, SHIFT=49, LOOP=74, MUTE=43 (Pad Play)
  * Soft keys above the screen: notes 12/13/14 — B1 prev page, B2 next, B3 quit.
- * Wheel push (note 111) is an edge only — never quits (Ash 0.2.5).
+ * Wheel push (note 111) is an edge only — never quits.
+ * Poly aftertouch must NOT steal pad note running-status (phantom pads / POS).
+ * Fader: record 0x42 dump but do not engage until the user moves it.
  * Hold SAMPLE + pad = select (app); plain pad = play. Pad LEDs show selection.
  * On open: clear leftover lights + send position-request SysEx 0x42.
  */
@@ -35,17 +37,24 @@ static const uint8_t PAD_NOTES[EPICYCLE_PAD_COUNT] = {
 static const uint8_t BUTTON_LED_CCS[] = {
     6, 7, 1, 0, 35, 9, 11, 75, 43, 74, 40, 36, 53, 73, 80, 81, 82};
 
-/* SAMPLE mode button — sample-base controls.h / HARDWARE.md. */
-enum { NOTE_SAMPLE = 6 };
+/* Buttons — sample-base controls.h / HARDWARE.md (MIT rewrite of note numbers). */
+enum {
+    NOTE_SAMPLE = 6,
+    NOTE_SHIFT = 49,
+    NOTE_LOOP = 74,
+    NOTE_MUTE = 43,
+};
 
 static int g_fd = -1;
 static EpicycleSurfaceState g_state;
 static char g_info[64] = "surface closed";
 static int g_selected_pad;
+static int g_loop_led_on = -1;
 
 /* MIDI parser */
 static int m_status, m_need, m_n, m_sysex;
-static int m_voice_status; /* last channel-voice status; kept across SysEx */
+static int m_voice_status;     /* last channel-voice status; kept across SysEx */
+static int m_note_voice_status; /* last note on/off only — AT must not steal this */
 static uint8_t m_d[2];
 static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT]; /* 1 if we last sent a non-black pad LED */
 
@@ -172,24 +181,31 @@ static void midi_feed(uint8_t b)
             m_sysex = 1;
             /* Spec cancels running status; the Surface sometimes keeps
              * sending bare data bytes after our LED SysEx / 0x42 reply.
-             * Keep m_voice_status so pad note-offs are not dropped (LED latch). */
+             * Keep note on/off status so pad note-offs are not dropped. */
             m_status = 0;
             return;
         }
         if (b == 0xf7) {
             m_sysex = 0;
-            /* Restore last channel-voice status for quirky running-status. */
-            if (m_voice_status)
+            /* Prefer note voice status so AT/SysEx cannot orphan pad offs. */
+            if (m_note_voice_status)
+                m_status = m_note_voice_status;
+            else if (m_voice_status)
                 m_status = m_voice_status;
             return;
         }
         m_sysex = 0;
         if (b < 0xf0) {
+            int cmd = b & 0xf0;
             m_status = b;
-            if ((b & 0xf0) >= 0x80 && (b & 0xf0) <= 0xe0)
+            if (cmd >= 0x80 && cmd <= 0xe0)
                 m_voice_status = b;
+            /* Note on/off only — poly/channel pressure must not become the
+             * running status for subsequent bare pad note-offs (phantoms). */
+            if (cmd == 0x80 || cmd == 0x90)
+                m_note_voice_status = b;
             /* Program change / channel pressure: 1 data byte; else 2. */
-            m_need = ((b & 0xf0) == 0xc0 || (b & 0xf0) == 0xd0) ? 1 : 2;
+            m_need = (cmd == 0xc0 || cmd == 0xd0) ? 1 : 2;
             m_n = 0;
         } else {
             m_status = 0;
@@ -198,11 +214,12 @@ static void midi_feed(uint8_t b)
     }
     if (m_sysex)
         return;
-    /* Bare data: prefer current status, else restored voice status. */
+    /* Bare data: prefer current status, else note status, else any voice. */
     if (!m_status) {
-        if (!m_voice_status)
+        int restore = m_note_voice_status ? m_note_voice_status : m_voice_status;
+        if (!restore)
             return;
-        m_status = m_voice_status;
+        m_status = restore;
         m_need = ((m_status & 0xf0) == 0xc0 || (m_status & 0xf0) == 0xd0) ? 1 : 2;
         m_n = 0;
     }
@@ -213,6 +230,19 @@ static void midi_feed(uint8_t b)
 
     int ch = m_status & 0x0f;
     int cmd = m_status & 0xf0;
+
+    /* After completing poly/channel pressure, snap running status back to
+     * last note on/off so velocity/AT floods cannot retarget POS via fake CCs
+     * or phantom pad note-ons under AT running status. */
+    if (cmd == 0xa0 || cmd == 0xd0) {
+        if (ch == 9 && cmd == 0xa0) {
+            /* Poly AT on pads: ignore completely for play/params (Ash). */
+            (void)pad_index(m_d[0]);
+        }
+        if (m_note_voice_status)
+            m_status = m_note_voice_status;
+        return;
+    }
 
     if (cmd == 0xb0 && ch == 0) {
         switch (m_d[0]) {
@@ -225,13 +255,40 @@ static void midi_feed(uint8_t b)
         case 18:
             g_state.k3 = m_d[1];
             break;
-        case 19:
-            g_state.main_vol = m_d[1];
+        case 19: {
+            uint8_t v = m_d[1];
+            /* Debounce spurious main-vol zeros / single-sample glitches. */
+            if (!g_state.main_seen) {
+                g_state.main_seen = 1;
+                g_state.main_vol = v;
+                g_state.main_stable = v;
+            } else if (v == 0 && g_state.main_stable > 8) {
+                /* Ignore lone zero while hardware was clearly up. */
+            } else {
+                g_state.main_vol = v;
+                g_state.main_stable = v;
+            }
             break;
-        case 20:
-            g_state.fader = m_d[1];
+        }
+        case 20: {
+            uint8_t v = m_d[1];
+            g_state.fader = v;
+            if (!g_state.fader_seen) {
+                g_state.fader_seen = 1;
+                g_state.fader_dump = v;
+                /* Do not engage — keep engine fader_gain at full until move. */
+            } else if (!g_state.fader_engaged) {
+                int d = (int)v - (int)g_state.fader_dump;
+                if (d < 0)
+                    d = -d;
+                if (d >= 2)
+                    g_state.fader_engaged = 1;
+            }
             break;
-        case 100: /* relative wheel */
+        }
+        case 100: /* relative wheel — ignore value 0 (0x42 trailer) */
+            if (m_d[1] == 0)
+                break;
             if (m_d[1] > 0 && m_d[1] < 64)
                 g_state.wheel_accum += (int)m_d[1];
             else if (m_d[1] >= 64)
@@ -248,11 +305,20 @@ static void midi_feed(uint8_t b)
          * Soft-left (12) / soft-mid (13) = page prev/next (main).
          * Soft-right (14) = quit edge only — main sets quit_requested after splash.
          * Wheel push (111) = press edge; never quits.
-         * SAMPLE (6) held + pad = select without play (handled in main). */
+         * SAMPLE (6) held + pad = select without play (handled in main).
+         * LOOP (74) = per-pad loop latch toggle. */
         int on = (cmd == 0x90 && m_d[1] > 0);
         if (m_d[0] == NOTE_SAMPLE) {
             g_state.sample_held = on ? 1 : 0;
             light_button(g_fd, NOTE_SAMPLE, on ? 2 : 0);
+            return;
+        }
+        if (m_d[0] == NOTE_SHIFT) {
+            g_state.shift_held = on ? 1 : 0;
+            return;
+        }
+        if (on && m_d[0] == NOTE_LOOP) {
+            g_state.loop_btn = 1;
             return;
         }
         if (on && m_d[0] == 111)
@@ -263,20 +329,14 @@ static void midi_feed(uint8_t b)
             g_state.soft_mid = 1;
         if (on && m_d[0] == 14)
             g_state.soft_right = 1;
+        (void)NOTE_MUTE; /* reserved — Pad Play mute later */
         return;
     }
 
-    if (ch == 9 && (cmd == 0x90 || cmd == 0x80 || cmd == 0xa0)) {
+    if (ch == 9 && (cmd == 0x90 || cmd == 0x80)) {
         int idx = pad_index(m_d[0]);
         if (idx < 0)
             return;
-        if (cmd == 0xa0) {
-            /* polyphonic pressure — keep lit while > 0 */
-            if (m_d[1] == 0 && g_state.pad_vel[idx]) {
-                /* pressure zero while held is common; leave velocity */
-            }
-            return;
-        }
         if (cmd == 0x90 && m_d[1] > 0) {
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1; /* edge for note-on; app clears */
@@ -296,12 +356,19 @@ int surface_open(void)
     memset(&g_state, 0, sizeof g_state);
     memset(g_pad_lit, 0, sizeof g_pad_lit);
     g_selected_pad = 0;
-    /* Both full until first CC — avoids main@100 vs fader@127 mismatch. */
+    g_loop_led_on = -1;
+    /* Software full until fader is engaged; main starts full then tracks CC19. */
     g_state.main_vol = 127;
+    g_state.main_stable = 127;
     g_state.fader = 127;
+    g_state.fader_dump = 127;
+    g_state.fader_engaged = 0;
+    g_state.fader_seen = 0;
+    g_state.main_seen = 0;
     g_fd = -1;
     m_status = m_need = m_n = m_sysex = 0;
     m_voice_status = 0;
+    m_note_voice_status = 0;
     snprintf(g_info, sizeof g_info, "no Surface card");
 
 #ifndef EPICYCLE_ON_DEVICE
@@ -401,4 +468,13 @@ void surface_set_selected_pad(int pad)
     g_selected_pad = pad;
     refresh_pad_led(prev);
     refresh_pad_led(pad);
+}
+
+void surface_set_loop_led(int on)
+{
+    int want = on ? 2 : 0;
+    if (want == g_loop_led_on)
+        return;
+    g_loop_led_on = want;
+    light_button(g_fd, NOTE_LOOP, (uint8_t)want);
 }
