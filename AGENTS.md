@@ -4,9 +4,9 @@
 
 **EPICYCLE** is a generative **tombola** for the Akai MPC Sample (AC50 SD autorun).
 Primary UI: 2D projected drum; coloured balls bounce; wall hits trigger pad samples.
-K1=shape morph, K2=spin±dir, K3/MUTE=balls (empty start); SAMPLE+pad selects.
-Edit pages (Trim/Mix/Amp/…) still reuse brace/env/filter. HitMod = multi-slot
-physics matrix. Freeze / reverb DSP = later. MIT static C (thin C++ allowed later).
+Fader=shape morph, MAIN=vol, K2=spin±dir; MUTE+pad balls (empty / rest at bottom);
+SAMPLE+pad selects. HitMod slots empty until user wires them. Freeze / reverb =
+later. MIT static C (thin C++ allowed later).
 
 ## Hard rules
 
@@ -62,8 +62,8 @@ No alsa-lib — kernel ioctls only so static builds stay simple.
 
 | Real | Still stub / later |
 | --- | --- |
-| Tombola 2D morph + bipolar spin + wall-hit | Freeze 2–5 s → loop |
-| Empty start; MUTE/K3 add balls one-by-one | Reverb/delay DSP (sends stubbed) |
-| HitMod multi-slot matrix UI (vol/pitch/cut/sends) | Ball–ball consequence list |
-| Bounce = one-shot; pad LED flash on hit | Phrase recorder |
+| Tombola morph (fader) + spin (K2) + wall-hit | Freeze 2–5 s → loop |
+| Empty start; MUTE+pad; rest→spin lift | Reverb/delay DSP (sends stubbed) |
+| HitMod multi-slot (empty default; K1/K2/K3=src/dest/amt) | Ball–ball consequence list |
+| Bounce = one-shot; pad LED flash on hit only | Phrase recorder |
 | Host `--preview` + tombola selftest | Hardware sign-off |

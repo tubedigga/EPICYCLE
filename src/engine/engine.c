@@ -75,9 +75,9 @@ static void pad_defaults(EpicyclePad *p)
     p->ping_pong = 0;   /* Forward; SHIFT on Trim selects Ping-pong */
     p->allow_scrub = 1;
     p->amp_attack = 0.0f;
-    p->amp_decay = 0.25f;
-    p->amp_sustain = 0.85f;
-    p->amp_release = 0.35f;
+    p->amp_decay = 0.18f;
+    p->amp_sustain = 0.55f;
+    p->amp_release = 0.22f;
     p->vel_sens = 1.0f;
     p->filter_cutoff = 1.0f; /* open */
     p->filter_reso = 0.0f;
@@ -708,12 +708,12 @@ void engine_trim_set_position(EpicycleEngine *eng, int pad, float pos01)
 
 enum { ENV_A = 0, ENV_D = 1, ENV_S = 2, ENV_R = 3 };
 
-/* Map 0..1 knob → seconds (A/D/R). */
+/* Map 0..1 knob → seconds (A/D/R). Cubed curve keeps low settings snappy. */
 static float adsr_time_s(float kn, float min_s, float max_s)
 {
     float t = clampf(kn, 0.0f, 1.0f);
-    /* Slightly exponential so low settings stay snappy. */
-    return min_s + (max_s - min_s) * t * t;
+    float t3 = t * t * t;
+    return min_s + (max_s - min_s) * t3;
 }
 
 static void voice_start_attack(EpicycleVoice *v, const EpicyclePad *p, float velocity)
@@ -733,6 +733,8 @@ static void voice_start_attack(EpicycleVoice *v, const EpicyclePad *p, float vel
     v->impact_pitch = 1.0f;
     v->impact_filt = 0.0f;
     v->impact_level = 1.0f;
+    /* Default one-shot; clear only when LOOP allows sustain/loop. */
+    v->force_oneshot = 1;
 }
 
 void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
@@ -759,7 +761,8 @@ void engine_note_on(EpicycleEngine *eng, int pad, float velocity)
     EpicycleVoice *v = &eng->voices[vidx];
     v->pad_index = pad;
     voice_start_attack(v, p, velocity);
-    v->force_oneshot = 0; /* pad press respects LOOP latch */
+    /* Pad press: loop sample only when LOOP latch is on for this pad. */
+    v->force_oneshot = p->loop_enable ? 0 : 1;
 }
 
 void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float pitch_mul,
@@ -792,8 +795,12 @@ void engine_note_on_impact(EpicycleEngine *eng, int pad, float velocity, float p
             eng->voices[i].impact_pitch = clampf(pitch_mul, 0.25f, 4.0f);
             eng->voices[i].impact_filt = clampf(filt_add, -0.9f, 0.9f);
             eng->voices[i].impact_level = clampf(level_mul, 0.05f, 2.0f);
-            /* LOOP off → one-shot bounce; LOOP on → allow sample loop + ADSR. */
+            /* Reaffirm: LOOP off → hard one-shot (no brace wrap). */
             eng->voices[i].force_oneshot = p->loop_enable ? 0 : 1;
+            if (!p->loop_enable) {
+                /* Impact one-shots are envelope-driven: no long sustain hold. */
+                eng->voices[i].gate = 0;
+            }
             break;
         }
     }
@@ -828,13 +835,16 @@ void engine_note_off(EpicycleEngine *eng, int pad)
 /* Advance ADSR one sample; returns 0 if voice finished Release. */
 static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr)
 {
-    float atk = adsr_time_s(pad->amp_attack, 0.001f, 2.0f);
-    float dec = adsr_time_s(pad->amp_decay, 0.005f, 3.0f);
+    float atk = adsr_time_s(pad->amp_attack, 0.0005f, 1.5f);
+    float dec = adsr_time_s(pad->amp_decay, 0.003f, 2.5f);
     float sus = clampf(pad->amp_sustain, 0.0f, 1.0f);
-    float rel = adsr_time_s(pad->amp_release, 0.005f, 4.0f);
+    float rel = adsr_time_s(pad->amp_release, 0.003f, 3.0f);
     float inv_sr = 1.0f / (float)(sr ? sr : 44100);
 
-    if (!v->gate && v->env_stage != ENV_R)
+    /* Impact one-shots (gate already low): A→D then straight to Release (no S hold). */
+    int skip_sustain = (!v->gate && v->force_oneshot && v->env_stage != ENV_R);
+
+    if (!v->gate && v->env_stage == ENV_S)
         v->env_stage = ENV_R;
 
     switch (v->env_stage) {
@@ -848,21 +858,31 @@ static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr
         break;
     }
     case ENV_D: {
-        float step = (1.0f - sus) * inv_sr / dec;
+        float target = skip_sustain ? 0.0f : sus;
+        float span = 1.0f - target;
+        if (span < 0.001f)
+            span = 0.001f;
+        float step = span * inv_sr / dec;
         v->env -= step;
-        if (v->env <= sus) {
-            v->env = sus;
-            v->env_stage = ENV_S;
+        if (v->env <= target + 0.001f) {
+            v->env = target;
+            if (skip_sustain || !v->gate) {
+                v->env_stage = ENV_R;
+            } else {
+                v->env_stage = ENV_S;
+            }
         }
         break;
     }
     case ENV_S:
         v->env = sus;
+        if (!v->gate)
+            v->env_stage = ENV_R;
         break;
     case ENV_R:
     default: {
-        /* Linear release from current level → 0 over release time. */
-        float step = inv_sr / rel;
+        /* Exponential-ish release (feels more natural than linear). */
+        float step = (v->env + 0.02f) * inv_sr / (rel * 0.55f);
         v->env -= step;
         if (v->env <= 0.001f) {
             v->env = 0.0f;

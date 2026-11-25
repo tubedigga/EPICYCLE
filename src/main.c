@@ -3,7 +3,8 @@
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
  * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.1: K1=shape K2=spin±dir K3=balls; empty start; bounce=one-shot; HitMod rows.
+ * 0.3.2: fader=morph, MAIN=vol, K2=spin; MUTE-only balls; HitMod empty;
+ *        rest-at-bottom physics; LED flash-only; LOOP-off one-shot.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -35,7 +36,7 @@ static void usage(const char *argv0)
             "  --tombola-selftest physics containment + hit + mute ball checks\n"
             "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
-            "  On device: K1 shape K2 spin K3 balls; MUTE+pad; FULL LEVEL=HitMod; B3 quit.\n",
+            "  On device: FADER morph, MAIN vol, K2 spin; MUTE+pad balls; FULL=HitMod; B3 quit.\n",
             EPICYCLE_VERSION, argv0);
 }
 
@@ -965,48 +966,48 @@ int main(int argc, char **argv)
             last_page = eng.mode_page;
             surface_set_hitmod_led(eng.mode_page == EPICYCLE_PAGE_HITMOD);
             pickup_arm(surf, &eng);
+            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
+                engine_set_fader_gain_cc(&eng, 127);
+                if (surf->fader_engaged)
+                    tombola_set_morph(tb, (float)surf->fader / 127.0f);
+            } else if (surf->fader_engaged) {
+                engine_set_fader_gain_cc(&eng, surf->fader);
+            }
         }
         if (surf->shift_held != last_shift) {
             last_shift = surf->shift_held;
             pickup_arm(surf, &eng);
         }
 
-        /* CC19 → gain only (smoothed in engine). Never restarts voices / Trim. */
+        /* CC19 MAIN VOL → gain only (smoothed in engine). Never restarts voices. */
         if (surf->main_seen && surf->main_vol != last_main) {
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
-        /* Fader = master gain on every page (shape morph moved to K1). */
+        /* Tombola: fader = morph (master stays on MAIN knob — Ash: fader down ≠ silence).
+         * Other pages: fader = master gain. */
         if (surf->fader_engaged && surf->fader != last_fader) {
             last_fader = surf->fader;
-            engine_set_fader_gain_cc(&eng, surf->fader);
+            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
+                tombola_set_morph(tb, (float)surf->fader / 127.0f);
+                engine_set_fader_gain_cc(&eng, 127);
+            } else {
+                engine_set_fader_gain_cc(&eng, surf->fader);
+            }
         }
 
         if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-            /* Engage latches: ignore dump + pot noise until user moves ≥3. */
-            static uint8_t tk1 = 255, tk2 = 255, tk3 = 255;
-            static uint8_t tk1_dump = 255, tk2_dump = 255, tk3_dump = 255;
-            static int tk1_on, tk2_on, tk3_on;
+            /* Keep fader gain full while on Tombola (morph only). */
+            engine_set_fader_gain_cc(&eng, 127);
+            /* K2 spin engage latch: ignore dump + pot noise until user moves ≥3. */
+            static uint8_t tk2 = 255;
+            static uint8_t tk2_dump = 255;
+            static int tk2_on;
             static uint8_t tk2_pend = 255;
             static int tk2_pend_n;
-            if (tk1_dump == 255) {
-                tk1_dump = surf->k1;
+            if (tk2_dump == 255) {
                 tk2_dump = surf->k2;
-                tk3_dump = surf->k3;
-                tk1 = surf->k1;
                 tk2 = surf->k2;
-                tk3 = surf->k3;
-            }
-            if (!tk1_on) {
-                int d = (int)surf->k1 - (int)tk1_dump;
-                if (d < 0)
-                    d = -d;
-                if (d >= 3)
-                    tk1_on = 1;
-            }
-            if (tk1_on && surf->k1 != tk1) {
-                tk1 = surf->k1;
-                tombola_set_morph(tb, (float)surf->k1 / 127.0f);
             }
             if (!tk2_on) {
                 int d = (int)surf->k2 - (int)tk2_dump;
@@ -1034,25 +1035,7 @@ int main(int argc, char **argv)
                     tk2_pend_n = 0;
                 }
             }
-            /* K3 ball count optional; MUTE+pad is primary compose path. */
-            if (!tk3_on) {
-                int d = (int)surf->k3 - (int)tk3_dump;
-                if (d < 0)
-                    d = -d;
-                if (d >= 3)
-                    tk3_on = 1;
-            }
-            if (tk3_on && surf->k3 != tk3) {
-                tk3 = surf->k3;
-                int n = (int)(((int)surf->k3 * EPICYCLE_PAD_COUNT + 63) / 127);
-                if (n > EPICYCLE_PAD_COUNT)
-                    n = EPICYCLE_PAD_COUNT;
-                tombola_set_ball_count(tb, n);
-                for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-                    if (!tombola_ball_active(tb, i))
-                        engine_note_off(&eng, i);
-                }
-            }
+            /* Ball count: MUTE+pad only (no K3 — Ash: sticky 1→16 jumps). */
         } else if (eng.mode_page == EPICYCLE_PAGE_AMP) {
             const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
             unsigned mask = pickup_mask(cur, 0);
@@ -1074,11 +1057,22 @@ int main(int argc, char **argv)
             if (tb->hitmod_edit >= EPICYCLE_HITMOD_SLOTS)
                 tb->hitmod_edit = EPICYCLE_HITMOD_SLOTS - 1;
             EpicycleHitModRoute *r = &tb->hitmods[tb->hitmod_edit];
-            /* Matrix row edit: K1=dest, K2=amount, K3=src (shift: threshold). */
+            /* Match matrix left→right: K1=SRC, K2=DEST, K3=AMT (SHIFT+K3=thr). */
             static uint8_t hk1 = 255, hk2 = 255, hk3 = 255;
             if (surf->k1 != hk1) {
                 hk1 = surf->k1;
-                int d = (int)((float)surf->k1 / 127.0f * (float)(EPICYCLE_HITMOD_DEST_COUNT - 1) +
+                int s = (int)((float)surf->k1 / 127.0f *
+                                  (float)(EPICYCLE_HITMOD_SRC_COUNT - 1) +
+                              0.5f);
+                if (s < 0)
+                    s = 0;
+                if (s >= EPICYCLE_HITMOD_SRC_COUNT)
+                    s = EPICYCLE_HITMOD_SRC_COUNT - 1;
+                r->src = (EpicycleHitModSrc)s;
+            }
+            if (surf->k2 != hk2) {
+                hk2 = surf->k2;
+                int d = (int)((float)surf->k2 / 127.0f * (float)(EPICYCLE_HITMOD_DEST_COUNT - 1) +
                               0.5f);
                 if (d < 0)
                     d = 0;
@@ -1087,24 +1081,12 @@ int main(int argc, char **argv)
                 r->dest = (EpicycleHitModDest)d;
                 r->enabled = (r->dest != EPICYCLE_HITMOD_NONE);
             }
-            if (surf->k2 != hk2) {
-                hk2 = surf->k2;
-                r->amount = (float)surf->k2 / 127.0f;
-            }
             if (surf->k3 != hk3) {
                 hk3 = surf->k3;
-                if (surf->shift_held) {
+                if (surf->shift_held)
                     r->threshold = (float)surf->k3 / 127.0f;
-                } else {
-                    int s = (int)((float)surf->k3 / 127.0f *
-                                      (float)(EPICYCLE_HITMOD_SRC_COUNT - 1) +
-                                  0.5f);
-                    if (s < 0)
-                        s = 0;
-                    if (s >= EPICYCLE_HITMOD_SRC_COUNT)
-                        s = EPICYCLE_HITMOD_SRC_COUNT - 1;
-                    r->src = (EpicycleHitModSrc)s;
-                }
+                else
+                    r->amount = (float)surf->k3 / 127.0f;
             }
         } else if (eng.mode_page == EPICYCLE_PAGE_TRIM) {
             handle_trim_knobs(&eng, surf);

@@ -77,7 +77,7 @@ static uint8_t m_d[2];
 static uint8_t g_pad_lit[EPICYCLE_PAD_COUNT];
 /* Wall-hit flash remaining (seconds); selected pad stays solid underneath. */
 static float g_pad_flash[EPICYCLE_PAD_COUNT];
-#define PAD_FLASH_S 0.14f
+#define PAD_FLASH_S 0.09f /* brief wall-hit flash only (Ash: never stay lit) */
 
 /*
  * Soft keys: hard-isolated from pads/knobs.
@@ -651,7 +651,8 @@ static void dispatch_msg(int explicit_status)
             g_state.pad_vel[idx] = m_d[1];
             g_state.pad_down[idx] = 1;
             mark_pad_activity();
-            /* Pad press does not drive LEDs — selected solid + wall-hit flash only. */
+            /* Blank any firmware auto-light; only selected solid / hit flash stay. */
+            refresh_pad_led(idx);
         } else {
             if (!explicit_status && g_state.pad_vel[idx] == 0) {
                 clear_ch_running();
@@ -660,6 +661,7 @@ static void dispatch_msg(int explicit_status)
             if (g_state.pad_vel[idx] > 0)
                 g_state.pad_up[idx] = 1;
             g_state.pad_vel[idx] = 0;
+            refresh_pad_led(idx);
         }
         /* Kill running status so orphan AT data cannot become pad notes. */
         clear_ch_running();
