@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.3.11-main-lfo-gfx
+VERSION    := 0.3.12-lfo-pos
 BUILD      := build
 DIST       := dist
 
@@ -85,6 +85,7 @@ test-host: host
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --midi-selftest
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --tombola-selftest
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --sample-preview-selftest
+	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --lfo-selftest
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --preview $(BUILD)/preview.wav
 	@python3 tools/check_preview.py $(BUILD)/preview.wav
 	MPC_APP_DIR=$(CURDIR)/$(BUILD) $(BUILD)/$(APP)-host --demo

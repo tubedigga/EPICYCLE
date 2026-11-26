@@ -5,6 +5,7 @@
  * B1/B2 cycle Tombola / Trim / Mix / Delay / Reverb / …; B3 quit.
  * 0.3.10: SAMPLE browse/preview crash harden (cap, UAF retire, soft fail).
  * 0.3.11: MAIN absolute latch + hard mute; LFO POS-only default; shrink + AA gfx.
+ * 0.3.12: LFO depth → audible POS scrub; kill phase-follow Doppler pitch.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -32,11 +33,13 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "EPICYCLE %s — tombola for MPC Sample\n"
             "usage: %s [--help] [--version] [--demo] [--midi-selftest] "
-            "[--tombola-selftest] [--sample-preview-selftest] [--wav PATH]...\n"
+            "[--tombola-selftest] [--sample-preview-selftest] [--lfo-selftest] "
+            "[--wav PATH]...\n"
             "  --demo             synth demo tones onto pads (host / no card samples)\n"
             "  --midi-selftest    host MIDI parser regression checks\n"
             "  --tombola-selftest physics containment + hit + mute ball checks\n"
             "  --sample-preview-selftest  SAMPLE browse/preview fuzz (host)\n"
+            "  --lfo-selftest     LFO POS scrub (no pitch) regression checks\n"
             "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
             "  On device: FADER morph, MAIN vol, K1 spin; SAMPLE page=browse/preview/assign;\n"
@@ -920,6 +923,13 @@ int main(int argc, char **argv)
             puts(rc == 0 ? "sample-preview-selftest: ok" : "sample-preview-selftest: FAIL");
             if (rc != 0)
                 fprintf(stderr, "sample-preview-selftest rc=%d\n", rc);
+            return rc == 0 ? 0 : 1;
+        }
+        if (strcmp(argv[i], "--lfo-selftest") == 0) {
+            int rc = engine_lfo_selftest();
+            puts(rc == 0 ? "lfo-selftest: ok" : "lfo-selftest: FAIL");
+            if (rc != 0)
+                fprintf(stderr, "lfo-selftest rc=%d\n", rc);
             return rc == 0 ? 0 : 1;
         }
         if (strcmp(argv[i], "--tombola-selftest") == 0) {
