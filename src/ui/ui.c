@@ -669,7 +669,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
     char line[48];
     char v1[24], v2[24], v3[24];
 
-    /* Header: pad + page name + tempo. */
+    /* Header: pad + page name + tempo. Modifier badges never share this row
+     * (Ash 0.3.15: SHIFT/MUTE/SEL used to draw under the title → graphic mess). */
     snprintf(line, sizeof line, "PAD %d  %s", sel + 1, epicycle_page_name(page));
     draw_text(px, 8, 30, line, COL_PAGE, 2);
 
@@ -680,12 +681,17 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
     draw_text(px, 248, 30, line, COL_MUTED, 2);
     draw_text(px, 290, 34, "bpm", COL_MUTED, 1);
 
-    if (surf && surf->sample_held)
-        draw_text(px, 200, 30, "SEL", COL_BRACE, 2);
-    if (surf && surf->mute_held)
-        draw_text(px, 168, 30, "MUTE", COL_BRACE, 2);
-    if (surf && surf->shift_held)
-        draw_text(px, 140, 30, "SHIFT", COL_BRACE, 2);
+    /* Modifier chrome: top soft-key clear zone (between PAGE> and QUIT). */
+    if (surf) {
+        if (surf->shift_held && surf->mute_held)
+            draw_text(px, 168, 4, "SH+MU", COL_BRACE, 2);
+        else if (surf->shift_held)
+            draw_text(px, 168, 4, "SHIFT", COL_BRACE, 2);
+        else if (surf->mute_held)
+            draw_text(px, 168, 4, "MUTE", COL_BRACE, 2);
+        else if (surf->sample_held)
+            draw_text(px, 178, 4, "SEL", COL_BRACE, 2);
+    }
     if (eng && engine_freeze_active(eng))
         draw_text(px, 250, 4, "FRZ", COL_MOD, 1);
     if (pad && pad->loop_enable)
@@ -866,8 +872,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                     snprintf(line, sizeof line, "w=%.4f", (double)len);
                     draw_text(px, 248, 82, line, COL_MUTED, 1);
                 }
-                draw_text(px, 8, 212, "K1/K2 absolute Start/End  K3 POS", COL_MUTED, 1);
-                draw_text(px, 8, 226, "frame-quantized  ENC fine  SEQ=home", COL_MUTED, 1);
+                draw_text(px, 8, 212, "K1/K2 Start/End  short=frame-fine  K3 POS", COL_MUTED, 1);
+                draw_text(px, 8, 226, "tiny grain holds  ENC fine  SEQ=home", COL_MUTED, 1);
             } else {
                 snprintf(line, sizeof line, "DIV%d",
                          pad ? engine_division_quantize_slices(pad->division_beats) : 4);
@@ -878,29 +884,35 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         }
     } else if (page == EPICYCLE_PAGE_MIX) {
         draw_text(px, 8, 56, "MIX", COL_FG, 4);
+        int shift = surf && surf->shift_held;
         snprintf(v1, sizeof v1, "%d", pad ? (int)(pad->level * 100.0f) : 0);
-        if (pad) {
-            int pan = (int)((pad->pan - 0.5f) * 100.0f);
-            if (pan < 0)
-                snprintf(v2, sizeof v2, "%dL", -pan);
-            else if (pan > 0)
-                snprintf(v2, sizeof v2, "%dR", pan);
-            else
+        if (shift) {
+            if (pad) {
+                int pan = (int)((pad->pan - 0.5f) * 100.0f);
+                if (pan < 0)
+                    snprintf(v2, sizeof v2, "%dL", -pan);
+                else if (pan > 0)
+                    snprintf(v2, sizeof v2, "%dR", pan);
+                else
+                    snprintf(v2, sizeof v2, "C");
+            } else {
                 snprintf(v2, sizeof v2, "C");
-        } else {
-            snprintf(v2, sizeof v2, "C");
-        }
-        if (surf && surf->shift_held)
+            }
             snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->kit_level * 100.0f) : 0);
-        else
+            draw_param_row(px, 100, "VOL", v1, "PAN", v2, "KIT", v3);
+            draw_text(px, 8, 160, "SHIFT: pan + kit  ·  release for sends", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 vol  K2 pan  K3 kit level", COL_MUTED, 1);
+        } else {
+            snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->send_del * 100.0f) : 0);
             snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->send_rev * 100.0f) : 0);
-        draw_param_row(px, 100, "VOL", v1, "PAN", v2, surf && surf->shift_held ? "KIT" : "FX",
-                       v3);
-        if (surf) {
-            snprintf(line, sizeof line, "main %d  fader morph-only", (int)surf->main_vol);
-            draw_text(px, 8, 160, line, COL_MUTED, 1);
+            draw_param_row(px, 100, "VOL", v1, "DEL", v2, "REV", v3);
+            if (surf) {
+                snprintf(line, sizeof line, "main %d  fader morph-only", (int)surf->main_vol);
+                draw_text(px, 8, 160, line, COL_MUTED, 1);
+            }
+            draw_text(px, 8, 218, "K1 vol  K2 delay send  K3 reverb send", COL_MUTED, 1);
+            draw_text(px, 8, 226, "SHIFT+K2 pan  SHIFT+K3 kit", COL_MUTED, 1);
         }
-        draw_text(px, 8, 218, "K1 vol  K2 pan  K3 FX send  SHIFT+K3 kit", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_DELAY) {
         draw_text(px, 8, 52, "DELAY", COL_FG, 4);
         int shift = surf && surf->shift_held;
@@ -982,43 +994,66 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         draw_text(px, 8, 160, "depth>0 auto-LPF  opens then closes", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 attack  K2 decay  K3 depth", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_LFO) {
-        draw_text(px, 8, 48, "LFO", COL_FG, 3);
+        /* Always-visible matrix (HitMod-style). DEST incl. POS is primary —
+         * never Shift-secret (Ash 0.3.15). */
+        draw_text(px, 8, 48, "LFO", COL_FG, 2);
+        draw_text(px, 72, 52, "mod matrix", COL_MUTED, 1);
         const EpicycleLfo *l = pad ? &pad->lfos[0] : NULL;
         int slot = pad ? pad->mod_edit_slot : 0;
         if (slot < 0)
             slot = 0;
         if (slot >= EPICYCLE_MOD_SLOTS)
             slot = EPICYCLE_MOD_SLOTS - 1;
+        int row_y = 68;
+        draw_text(px, 8, row_y - 12, "#  LFO  DEST  AMT", COL_MUTED, 1);
+        for (int s = 0; s < EPICYCLE_MOD_SLOTS; s++) {
+            const EpicycleModRoute *rr = pad ? &pad->mods[s] : NULL;
+            uint32_t fg = (s == slot) ? COL_BRACE : COL_FG;
+            uint32_t dim = (s == slot) ? COL_PAGE : COL_MUTED;
+            if (s == slot)
+                fill_rect(px, 4, row_y - 1, 312, 14, 0x00201810u);
+            snprintf(line, sizeof line, "%d", s + 1);
+            draw_text(px, 8, row_y, line, dim, 1);
+            if (rr && rr->dest != EPICYCLE_MOD_NONE && rr->lfo_index >= 0)
+                snprintf(line, sizeof line, "L%d", rr->lfo_index);
+            else
+                snprintf(line, sizeof line, "--");
+            draw_text(px, 28, row_y, line, fg, 1);
+            snprintf(line, sizeof line, "%s",
+                     rr ? epicycle_mod_dest_name(rr->dest) : "OFF");
+            draw_text(px, 72, row_y, line, fg, 1);
+            snprintf(line, sizeof line, "%3d%%",
+                     rr ? (int)(fabsf(rr->amount) * 100.0f) : 0);
+            draw_text(px, 140, row_y, line, fg, 1);
+            if (rr && rr->dest == EPICYCLE_MOD_BRACE_START && fabsf(rr->amount) > 0.02f)
+                draw_text(px, 200, row_y, "POS", COL_OK, 1);
+            row_y += 16;
+        }
         const EpicycleModRoute *mr = pad ? &pad->mods[slot] : NULL;
         int shift = surf && surf->shift_held;
-        if (!shift) {
+        if (shift) {
+            /* SHIFT overlay lives in the param/footer zone — never over title. */
             snprintf(v1, sizeof v1, "%s", l ? lfo_shape_name(l->shape) : "SIN");
             if (l && l->sync_beats > 0.0f)
                 snprintf(v2, sizeof v2, "%.2fb", (double)l->sync_beats);
             else
                 snprintf(v2, sizeof v2, "%.2fHz", l ? (double)l->rate_hz : 0.0);
-            snprintf(v3, sizeof v3, "%d", l ? (int)(l->depth * 100.0f) : 0);
-            draw_param_row(px, 92, "SHAPE", v1, "RATE", v2, "DEPTH", v3);
-            draw_text(px, 8, 148, "source — depth alone does nothing", COL_MUTED, 1);
+            snprintf(v3, sizeof v3, "L%d", mr && mr->lfo_index >= 0 ? mr->lfo_index : 0);
+            draw_param_row(px, 148, "SHAPE", v1, "RATE", v2, "LFO#", v3);
+            draw_text(px, 8, 214, "SHIFT: shape/rate/LFO#  enc=slot", COL_MUTED, 1);
+            draw_text(px, 8, 226, "release SHIFT for DEST/AMT/DEPTH", COL_MUTED, 1);
         } else {
             snprintf(v1, sizeof v1, "%s", mr ? epicycle_mod_dest_name(mr->dest) : "OFF");
             snprintf(v2, sizeof v2, "%d", mr ? (int)(fabsf(mr->amount) * 100.0f) : 0);
-            snprintf(v3, sizeof v3, "L%d", mr && mr->lfo_index >= 0 ? mr->lfo_index : 0);
-            draw_param_row(px, 92, "DEST", v1, "AMT", v2, "LFO", v3);
-            draw_text(px, 8, 148, "matrix route (per pad)", COL_MOD, 1);
+            snprintf(v3, sizeof v3, "%d", l ? (int)(l->depth * 100.0f) : 0);
+            draw_param_row(px, 148, "DEST", v1, "AMT", v2, "DEPTH", v3);
+            if (mr && mr->dest == EPICYCLE_MOD_BRACE_START && fabsf(mr->amount) > 0.02f && l &&
+                l->enabled && l->depth > 0.02f)
+                draw_text(px, 8, 214, "POS offset ON  ENC=slot", COL_OK, 1);
+            else
+                draw_text(px, 8, 214, "K1 DEST(POS..) K2 AMT K3 DEPTH  ENC=slot", COL_MUTED, 1);
+            draw_text(px, 8, 226, "DEPTH alone does nothing — set DEST+AMT", COL_MUTED, 1);
         }
-        snprintf(line, sizeof line, "slot %d/%d  dest=%s amt=%d", slot + 1, EPICYCLE_MOD_SLOTS,
-                 mr ? epicycle_mod_dest_name(mr->dest) : "OFF",
-                 mr ? (int)(fabsf(mr->amount) * 100.0f) : 0);
-        draw_text(px, 8, 168, line, COL_PAGE, 1);
-        if (mr && mr->dest == EPICYCLE_MOD_BRACE_START && fabsf(mr->amount) > 0.02f && l &&
-            l->enabled && l->depth > 0.02f)
-            draw_text(px, 8, 186, "POS offset ON", COL_OK, 1);
-        else
-            draw_text(px, 8, 186, "POS off until DEST=POS+AMT", COL_MUTED, 1);
-        draw_text(px, 8, 210, shift ? "SHIFT: DEST AMT LFO#  enc=slot" : "K1/K2/K3 source  SHIFT=matrix",
-                  COL_MUTED, 1);
-        draw_text(px, 8, 224, "SAMPLE+pad select  then route", COL_MUTED, 1);
     }
 
     if (surf) {

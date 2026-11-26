@@ -1164,17 +1164,16 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
         break;
     }
     case EPICYCLE_PAGE_MIX:
-        /* Pad vol + pan; K3 = FX send (rev+delay); kit via SHIFT+K3 in main. */
+        /* K1 vol · K2 delay send · K3 reverb send (independent; Ash 0.3.15).
+         * Pan / kit via SHIFT in main. */
         if (mask & 1u) {
             p->level = t1;
             p->mod_level = t1;
         }
         if (mask & 2u)
-            p->pan = t2;
-        if (mask & 4u) {
+            p->send_del = t2;
+        if (mask & 4u)
             p->send_rev = t3;
-            p->send_del = t3 * 0.55f;
-        }
         break;
     case EPICYCLE_PAGE_DELAY:
         /* K1 time · K2 feedback · K3 delay wet. SHIFT in main: tone / sync / freeze. */
@@ -2228,6 +2227,30 @@ int engine_lfo_selftest(void)
     if (max_pr - min_pr < 0.01f) {
         engine_shutdown(&eng);
         return -30;
+    }
+
+    /* DEST labels include POS in the normal list (Ash 0.3.15 — not Shift-secret). */
+    if (strcmp(epicycle_mod_dest_name(EPICYCLE_MOD_NONE), "OFF") != 0 ||
+        strcmp(epicycle_mod_dest_name(EPICYCLE_MOD_BRACE_START), "POS") != 0 ||
+        strcmp(epicycle_mod_dest_name(EPICYCLE_MOD_BRACE_LEN), "LEN") != 0 ||
+        strcmp(epicycle_mod_dest_name(EPICYCLE_MOD_PITCH), "PITCH") != 0 ||
+        strcmp(epicycle_mod_dest_name(EPICYCLE_MOD_LEVEL), "LEVEL") != 0 ||
+        strcmp(epicycle_mod_dest_name(EPICYCLE_MOD_FILTER), "FILT") != 0) {
+        engine_shutdown(&eng);
+        return -40;
+    }
+    if (EPICYCLE_MOD_BRACE_START <= EPICYCLE_MOD_NONE ||
+        EPICYCLE_MOD_BRACE_START >= EPICYCLE_MOD_DEST_COUNT) {
+        engine_shutdown(&eng);
+        return -41;
+    }
+
+    /* Mix sends are independent fields (not one grouped FX). */
+    p->send_del = 0.33f;
+    p->send_rev = 0.66f;
+    if (fabsf(p->send_del - 0.33f) > 1e-6f || fabsf(p->send_rev - 0.66f) > 1e-6f) {
+        engine_shutdown(&eng);
+        return -42;
     }
 
     engine_shutdown(&eng);
