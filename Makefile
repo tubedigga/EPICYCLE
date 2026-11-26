@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.3.14-lfo-matrix-gfx
+VERSION    := 0.3.15-matrix-ui
 BUILD      := build
 DIST       := dist
 

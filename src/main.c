@@ -8,6 +8,8 @@
  * 0.3.12: LFO depth → audible POS scrub; kill phase-follow Doppler pitch.
  * 0.3.13: relative-phase POS scrub (no trill); pads boot empty (no pad01/kit).
  * 0.3.14: LFO depth = matrix source only; POS via slot dest; graphics polish.
+ * 0.3.15: Always-visible LFO matrix; SHIFT chrome clear of title; FREE grain hold;
+ *         SAMPLE+pad stays on edit page; Mix independent DEL/REV sends.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -173,20 +175,29 @@ static float trim_frame_frac(const EpicycleEngine *eng, int pad)
     return 1e-6f;
 }
 
+/* Short audible slice — absolute 0..127 pots are too coarse here (Ash 0.3.15). */
+static int trim_is_short_slice(const EpicycleEngine *eng, int pad)
+{
+    float w = eng->pads[pad].window_length;
+    float frame = trim_frame_frac(eng, pad);
+    return w <= 0.02f || w <= frame * 256.0f;
+}
+
 /*
  * Nudge Start/End by CC delta — width only (POS slides separately).
  * Close AND reopen must always work (Ash: End locked after 0.23–0.25).
- * Smaller per-tick steps + |dcc| cap → less jumpy (Ash 0.3.5 Trim feel).
+ * Short-slice open uses frame steps so a tiny grain stays holdable (Ash 0.3.15).
  */
 static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
 {
     if (!dcc)
         return;
-    /* Cap MIDI jumps — allow faster close so true grains are reachable (Ash). */
-    if (dcc > 3)
-        dcc = 3;
-    if (dcc < -3)
-        dcc = -3;
+    /* Cap MIDI jumps — tighter while short so a nudge cannot explode width. */
+    int cap = trim_is_short_slice(eng, pad) ? 2 : 3;
+    if (dcc > cap)
+        dcc = cap;
+    if (dcc < -cap)
+        dcc = -cap;
     EpicyclePad *p = &eng->pads[pad];
     float frame = trim_frame_frac(eng, pad);
     float start = p->window_start;
@@ -212,15 +223,29 @@ static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
             step = per * (float)dcc;
         }
     } else {
-        /* Opening: unlocks after a narrow grain without large jumps. */
+        /* Opening: fine while short; proportional once past grain territory. */
         float headroom = end_edge ? (1.0f - start - width) : start;
         if (headroom < 0.0f)
             headroom = 0.0f;
-        float per = headroom * 0.10f;
-        if (per < 0.008f)
-            per = 0.008f;
-        if (per < frame * 16.0f)
-            per = frame * 16.0f;
+        float per;
+        if (width <= frame * 64.0f) {
+            /* Hold tiny audible grains — open a few frames per CC tick. */
+            per = frame * (width <= frame * 8.0f ? 1.0f : 4.0f);
+        } else if (width <= 0.02f) {
+            per = width * 0.12f;
+            if (per < frame * 4.0f)
+                per = frame * 4.0f;
+        } else if (width <= 0.08f) {
+            per = width * 0.10f;
+            if (per < frame * 8.0f)
+                per = frame * 8.0f;
+        } else {
+            per = headroom * 0.10f;
+            if (per < 0.008f)
+                per = 0.008f;
+            if (per < frame * 16.0f)
+                per = frame * 16.0f;
+        }
         if (per > headroom && headroom > frame)
             per = headroom;
         step = per * (float)dcc;
@@ -328,9 +353,14 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
     }
     case EPICYCLE_PAGE_MIX:
         t0 = (uint8_t)clampf_u8((int)(p->level * 127.0f + 0.5f));
-        t1 = (uint8_t)clampf_u8((int)(p->pan * 127.0f + 0.5f));
-        t2 = shift ? (uint8_t)clampf_u8((int)((eng->kit_level - 0.05f) / 0.95f * 127.0f + 0.5f))
-                   : (uint8_t)clampf_u8((int)(p->send_rev * 127.0f + 0.5f));
+        if (shift) {
+            t1 = (uint8_t)clampf_u8((int)(p->pan * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)((eng->kit_level - 0.05f) / 0.95f * 127.0f + 0.5f));
+        } else {
+            /* Independent Delay / Reverb sends (Ash 0.3.15) — not one FX. */
+            t1 = (uint8_t)clampf_u8((int)(p->send_del * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)(p->send_rev * 127.0f + 0.5f));
+        }
         break;
     case EPICYCLE_PAGE_AMP:
         if (shift) {
@@ -361,13 +391,31 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
         t1 = (uint8_t)clampf_u8((int)(p->filt_decay * 127.0f + 0.5f));
         t2 = (uint8_t)clampf_u8((int)(p->filt_depth * 127.0f + 0.5f));
         break;
-    case EPICYCLE_PAGE_LFO:
-        t0 = (uint8_t)clampf_u8((int)((float)p->lfos[0].shape /
-                                      (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) * 127.0f +
-                                  0.5f));
-        t1 = (uint8_t)clampf_u8((int)((p->lfos[0].rate_hz - 0.05f) / 7.95f * 127.0f + 0.5f));
-        t2 = (uint8_t)clampf_u8((int)(p->lfos[0].depth * 127.0f + 0.5f));
+    case EPICYCLE_PAGE_LFO: {
+        /* Primary = matrix DEST/AMT/DEPTH; SHIFT = SHAPE/RATE/LFO#. */
+        int slot = p->mod_edit_slot;
+        if (slot < 0)
+            slot = 0;
+        if (slot >= EPICYCLE_MOD_SLOTS)
+            slot = EPICYCLE_MOD_SLOTS - 1;
+        const EpicycleModRoute *r = &p->mods[slot];
+        if (shift) {
+            t0 = (uint8_t)clampf_u8((int)((float)p->lfos[0].shape /
+                                          (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) * 127.0f +
+                                      0.5f));
+            t1 = (uint8_t)clampf_u8(
+                (int)((p->lfos[0].rate_hz - 0.05f) / 7.95f * 127.0f + 0.5f));
+            int li = r->lfo_index >= 0 ? r->lfo_index : 0;
+            t2 = (uint8_t)clampf_u8(
+                (int)((float)li / (float)(EPICYCLE_LFO_PER_PAD - 1) * 127.0f + 0.5f));
+        } else {
+            t0 = (uint8_t)clampf_u8(
+                (int)((float)r->dest / (float)(EPICYCLE_MOD_DEST_COUNT - 1) * 127.0f + 0.5f));
+            t1 = (uint8_t)clampf_u8((int)(fabsf(r->amount) * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)(p->lfos[0].depth * 127.0f + 0.5f));
+        }
         break;
+    }
     case EPICYCLE_PAGE_DELAY:
         if (shift) {
             t0 = (uint8_t)clampf_u8((int)(eng->fx_delay_tone * 127.0f + 0.5f));
@@ -541,20 +589,22 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
 
     if (p->freeform) {
         /*
-         * Start/End = absolute after pickup (Ash 0.3.9: precise predictable landing).
-         * Fine moves (|d|≤1) still nudge by frames for grain work; larger turns
-         * track the pot with sample-frame quantization.
+         * Wide brace: absolute after pickup (Ash 0.3.9).
+         * Short slice / grain: stay relative + frame-fine — absolute 0..127
+         * jumps the audible length too far (Ash 0.3.15).
          */
         if (mask & 1u) {
+            int short_slice = trim_is_short_slice(eng, eng->selected_pad);
             if (!g_trim_rel[0]) {
                 g_trim_rel[0] = 1;
                 g_trim_edge_cc[0] = surf->k1;
-                /* Soft engage: land at pot (quantized) so aim matches feel. */
-                trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
+                /* Soft engage only when wide — never explode a held grain. */
+                if (!short_slice)
+                    trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
             } else {
                 int d = (int)surf->k1 - (int)g_trim_edge_cc[0];
                 g_trim_edge_cc[0] = surf->k1;
-                if (d == 1 || d == -1)
+                if (d && (short_slice || d == 1 || d == -1))
                     trim_nudge_edge(eng, eng->selected_pad, 0, d);
                 else if (d)
                     trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
@@ -566,14 +616,16 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
             g_trim_pos_idle = 1000;
         }
         if (mask & 2u) {
+            int short_slice = trim_is_short_slice(eng, eng->selected_pad);
             if (!g_trim_rel[1]) {
                 g_trim_rel[1] = 1;
                 g_trim_edge_cc[1] = surf->k2;
-                trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
+                if (!short_slice)
+                    trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
             } else {
                 int d = (int)surf->k2 - (int)g_trim_edge_cc[1];
                 g_trim_edge_cc[1] = surf->k2;
-                if (d == 1 || d == -1)
+                if (d && (short_slice || d == 1 || d == -1))
                     trim_nudge_edge(eng, eng->selected_pad, 1, d);
                 else if (d)
                     trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
@@ -877,6 +929,17 @@ int main(int argc, char **argv)
                     trim_nudge_edge(&eng, pad, 1, +1);
                 if (eng.pads[pad].window_length < w0 + 0.05f)
                     rc = -24; /* End reopen failed */
+                /* Ash 0.3.15: tiny grain stays holdable — one open nudge ≠ fat. */
+                {
+                    float frame = trim_frame_frac(&eng, pad);
+                    engine_set_window(&eng, pad, 0.40f, frame);
+                    float wg = eng.pads[pad].window_length;
+                    trim_nudge_edge(&eng, pad, 1, +1);
+                    if (eng.pads[pad].window_length > wg + frame * 8.0f)
+                        rc = -27; /* single nudge exploded grain */
+                    if (!trim_is_short_slice(&eng, pad) && eng.pads[pad].window_length > 0.02f)
+                        rc = -28;
+                }
                 /* Start/End scrub must not silence a live voice (Ash Trim mute). */
                 {
                     engine_set_window(&eng, pad, 0.10f, 0.40f);
@@ -1202,16 +1265,16 @@ int main(int argc, char **argv)
                 pad_hit = 1;
                 g_quit_guard_ticks = 18; /* ~300ms: block false B3 only */
                 if (surf->sample_held) {
+                    /* Select pad for the current edit page — do NOT jump to
+                     * SAMPLE browser (Ash 0.3.15). Browser only when already
+                     * on SAMPLE (B1/B2) or explicit browse. */
                     eng.selected_pad = i;
                     surface_set_selected_pad(i);
                     surface_set_loop_led(eng.pads[i].loop_enable);
                     engine_sync_mod_window(&eng, i);
                     pickup_arm(surf, &eng);
-                    /* Jump to SAMPLE browser so assign target is obvious. */
-                    if (eng.mode_page != EPICYCLE_PAGE_SAMPLE) {
-                        eng.mode_page = EPICYCLE_PAGE_SAMPLE;
-                        epicycle_log(&paths, "page -> SAMPLE (SAMPLE+pad %d)", i + 1);
-                    }
+                    epicycle_log(&paths, "SAMPLE+pad %d select (stay %s)", i + 1,
+                                 epicycle_page_name(eng.mode_page));
                 } else if (surf->mute_held) {
                     /* Hold MUTE + pad: add/remove ball (compose 1–2 then build). */
                     tombola_toggle_ball(tb, i);
@@ -1377,8 +1440,9 @@ int main(int argc, char **argv)
                                                 surf->k2, surf->k3, mask);
                 }
             }
-        } else if (eng.mode_page == EPICYCLE_PAGE_LFO && surf->shift_held) {
-            /* Matrix edit: K1=DEST, K2=AMT, K3=LFO index. Encoder=slot. */
+        } else if (eng.mode_page == EPICYCLE_PAGE_LFO) {
+            /* Primary = always-visible matrix: K1=DEST K2=AMT K3=DEPTH.
+             * SHIFT = source edit: K1=SHAPE K2=RATE K3=LFO#. Encoder=slot. */
             EpicyclePad *p = &eng.pads[eng.selected_pad];
             if (p->mod_edit_slot < 0)
                 p->mod_edit_slot = 0;
@@ -1386,37 +1450,73 @@ int main(int argc, char **argv)
                 p->mod_edit_slot = EPICYCLE_MOD_SLOTS - 1;
             EpicycleModRoute *r = &p->mods[p->mod_edit_slot];
             static uint8_t mk1 = 255, mk2 = 255, mk3 = 255;
-            if (surf->k1 != mk1) {
-                mk1 = surf->k1;
-                int d = (int)((float)surf->k1 / 127.0f * (float)(EPICYCLE_MOD_DEST_COUNT - 1) +
-                              0.5f);
-                if (d < 0)
-                    d = 0;
-                if (d >= EPICYCLE_MOD_DEST_COUNT)
-                    d = EPICYCLE_MOD_DEST_COUNT - 1;
-                r->dest = (EpicycleModDest)d;
-                if (r->dest == EPICYCLE_MOD_NONE) {
-                    r->lfo_index = -1;
-                    r->amount = 0.0f;
-                } else if (r->lfo_index < 0) {
-                    r->lfo_index = 0;
+            if (surf->shift_held) {
+                const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
+                unsigned mask = pickup_mask(cur, 0);
+                if (mask & 1u) {
+                    int shape = (int)((float)surf->k1 / 127.0f *
+                                         (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) +
+                                     0.5f);
+                    if (shape < 0)
+                        shape = 0;
+                    if (shape >= EPICYCLE_LFO_SHAPE_COUNT)
+                        shape = EPICYCLE_LFO_SHAPE_COUNT - 1;
+                    p->lfos[0].shape = (EpicycleLfoShape)shape;
                 }
-            }
-            if (surf->k2 != mk2) {
-                mk2 = surf->k2;
-                r->amount = (float)surf->k2 / 127.0f;
-                if (r->dest != EPICYCLE_MOD_NONE && r->lfo_index < 0)
-                    r->lfo_index = 0;
-            }
-            if (surf->k3 != mk3) {
-                mk3 = surf->k3;
-                int li = (int)((float)surf->k3 / 127.0f * (float)(EPICYCLE_LFO_PER_PAD - 1) + 0.5f);
-                if (li < 0)
-                    li = 0;
-                if (li >= EPICYCLE_LFO_PER_PAD)
-                    li = EPICYCLE_LFO_PER_PAD - 1;
-                if (r->dest != EPICYCLE_MOD_NONE)
-                    r->lfo_index = li;
+                if (mask & 2u) {
+                    if (p->lfos[0].sync_beats > 0.0f) {
+                        static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
+                        int idx = (int)((float)surf->k2 / 127.0f * 5.0f + 0.5f);
+                        if (idx < 0)
+                            idx = 0;
+                        if (idx > 5)
+                            idx = 5;
+                        p->lfos[0].sync_beats = beats[idx];
+                    } else {
+                        p->lfos[0].rate_hz = 0.05f + 7.95f * ((float)surf->k2 / 127.0f);
+                    }
+                }
+                if (surf->k3 != mk3) {
+                    mk3 = surf->k3;
+                    int li = (int)((float)surf->k3 / 127.0f *
+                                       (float)(EPICYCLE_LFO_PER_PAD - 1) +
+                                   0.5f);
+                    if (li < 0)
+                        li = 0;
+                    if (li >= EPICYCLE_LFO_PER_PAD)
+                        li = EPICYCLE_LFO_PER_PAD - 1;
+                    if (r->dest != EPICYCLE_MOD_NONE)
+                        r->lfo_index = li;
+                }
+            } else {
+                if (surf->k1 != mk1) {
+                    mk1 = surf->k1;
+                    int d = (int)((float)surf->k1 / 127.0f *
+                                      (float)(EPICYCLE_MOD_DEST_COUNT - 1) +
+                                  0.5f);
+                    if (d < 0)
+                        d = 0;
+                    if (d >= EPICYCLE_MOD_DEST_COUNT)
+                        d = EPICYCLE_MOD_DEST_COUNT - 1;
+                    r->dest = (EpicycleModDest)d;
+                    if (r->dest == EPICYCLE_MOD_NONE) {
+                        r->lfo_index = -1;
+                        r->amount = 0.0f;
+                    } else if (r->lfo_index < 0) {
+                        r->lfo_index = 0;
+                    }
+                }
+                if (surf->k2 != mk2) {
+                    mk2 = surf->k2;
+                    r->amount = (float)surf->k2 / 127.0f;
+                    if (r->dest != EPICYCLE_MOD_NONE && r->lfo_index < 0)
+                        r->lfo_index = 0;
+                }
+                if (surf->k3 != mk3) {
+                    mk3 = surf->k3;
+                    p->lfos[0].depth = (float)surf->k3 / 127.0f;
+                    engine_lfo_set_enabled(&eng, eng.selected_pad, p->lfos[0].depth > 0.02f);
+                }
             }
         } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
             if (tb->hitmod_edit < 0)
@@ -1462,14 +1562,14 @@ int main(int argc, char **argv)
             unsigned mask = pickup_mask(cur, 0);
             if (mask) {
                 if (surf->shift_held && eng.mode_page == EPICYCLE_PAGE_MIX) {
-                    if (mask & 4u)
-                        eng.kit_level = 0.05f + 0.95f * ((float)surf->k3 / 127.0f);
+                    /* SHIFT: K1 vol · K2 pan · K3 kit (sends are primary). */
                     if (mask & 1u)
                         engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page,
                                                     surf->k1, surf->k2, surf->k3, 1u);
                     if (mask & 2u)
-                        engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page,
-                                                    surf->k1, surf->k2, surf->k3, 2u);
+                        eng.pads[eng.selected_pad].pan = (float)surf->k2 / 127.0f;
+                    if (mask & 4u)
+                        eng.kit_level = 0.05f + 0.95f * ((float)surf->k3 / 127.0f);
                 } else {
                     engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page, surf->k1,
                                                 surf->k2, surf->k3, mask);
@@ -1548,30 +1648,14 @@ int main(int argc, char **argv)
                 EpicyclePad *p = &eng.pads[eng.selected_pad];
                 engine_set_pitch(&eng, eng.selected_pad, p->octave, p->semitone + delta, p->fine);
             } else if (eng.mode_page == EPICYCLE_PAGE_LFO) {
+                /* Encoder always selects matrix slot (HitMod-style). */
                 EpicyclePad *p = &eng.pads[eng.selected_pad];
-                if (surf->shift_held) {
-                    int s = p->mod_edit_slot + (delta > 0 ? 1 : (delta < 0 ? -1 : 0));
-                    if (s < 0)
-                        s = EPICYCLE_MOD_SLOTS - 1;
-                    if (s >= EPICYCLE_MOD_SLOTS)
-                        s = 0;
-                    p->mod_edit_slot = s;
-                } else {
-                    EpicycleLfo *l = &p->lfos[0];
-                    if (l->sync_beats > 0.0f) {
-                        l->sync_beats += (float)delta * 0.25f;
-                        if (l->sync_beats < 0.25f)
-                            l->sync_beats = 0.25f;
-                        if (l->sync_beats > 8.0f)
-                            l->sync_beats = 8.0f;
-                    } else {
-                        l->rate_hz += (float)delta * 0.02f;
-                        if (l->rate_hz < 0.05f)
-                            l->rate_hz = 0.05f;
-                        if (l->rate_hz > 8.0f)
-                            l->rate_hz = 8.0f;
-                    }
-                }
+                int s = p->mod_edit_slot + (delta > 0 ? 1 : (delta < 0 ? -1 : 0));
+                if (s < 0)
+                    s = EPICYCLE_MOD_SLOTS - 1;
+                if (s >= EPICYCLE_MOD_SLOTS)
+                    s = 0;
+                p->mod_edit_slot = s;
             } else if (eng.mode_page == EPICYCLE_PAGE_MIX) {
                 EpicyclePad *p = &eng.pads[eng.selected_pad];
                 p->level += (float)delta * 0.01f;
