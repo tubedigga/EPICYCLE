@@ -972,7 +972,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         else
             draw_text(px, 8, 160, "FREE  enc push -> sync", COL_MUTED, 2);
         int on = l && l->enabled && l->depth > 0.0f;
-        draw_text(px, 8, 190, on ? "POS scrub ON" : "POS scrub off", on ? COL_MOD : COL_MUTED, 1);
+        draw_text(px, 8, 190, on ? "POS scrub ON (const rate)" : "POS scrub off",
+                  on ? COL_MOD : COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 shape  K2 rate  K3 depth", COL_MUTED, 1);
     }
 

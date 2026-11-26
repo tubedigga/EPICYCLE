@@ -6,7 +6,7 @@ Primary screen: 2D projected tombola — **Fader** morph, **MAIN** vol, **K1** s
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.3.12-lfo-pos` — LFO depth scrubs Trim POS (no Doppler pitch). Host-tested. Needs Ash card boot + log paste.
+> **Status:** `0.3.13-scrub-empty` — constant-rate LFO POS scrub; pads boot empty. Host-tested. Needs Ash card boot + log paste.
 
 ## Update the SD card (Ash — firmware 1.4)
 
@@ -45,7 +45,7 @@ make test-host    # demo bank + non-silent preview WAV check
    - `autorun.sh` (top-level 1.4 bridge)
    - `autorun/` (launcher + `epicycle/` payload)
    - optional: `Epicycle/` user-data folder (projects / samples / logs)
-4. Put WAVs on the card as `Epicycle/samples/pad01.wav` … `pad16.wav` (or `1.wav` …). If none are found, EPICYCLE loads a built-in synth demo bank.
+4. Put any WAVs in `Epicycle/samples/` (any filename). Pads boot **empty** — assign via SAMPLE browse (no pad01 auto-map / no demo kit).
 5. Insert the card and power on. Stock boots, then asks to run the autorun script — choose **Yes**.
 6. The launcher stops `ac50.service`, runs EPICYCLE from `/run`, and on exit starts stock again.
 
