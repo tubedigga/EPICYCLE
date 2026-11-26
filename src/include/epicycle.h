@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.13-scrub-empty"
+#define EPICYCLE_VERSION "0.3.14-lfo-matrix-gfx"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -173,10 +173,13 @@ typedef struct EpicyclePad {
     float send_del;   /* 0..1 Mix send → delay bus */
     EpicycleLfo lfos[EPICYCLE_LFO_PER_PAD];
     EpicycleModRoute mods[EPICYCLE_MOD_SLOTS];
+    int mod_edit_slot; /* LFO matrix UI: which slot encoder selects 0..SLOTS-1 */
     /* Runtime modulated (engine fills each block; UI may read) */
     float mod_window_start;
-    float mod_window_start_prev; /* prior-block start — scrub lerp / phase follow */
+    float mod_window_start_prev; /* prior-block start — Trim lerp */
     float mod_window_length;
+    float mod_pos_offset;       /* -1..1 LFO→POS read offset (matrix only) */
+    float mod_pos_smooth;       /* one-pole smoothed offset for audio */
     float mod_pitch_ratio;
     float mod_level;
     float mod_filter_cutoff; /* after LFO / filt-env */
@@ -185,9 +188,7 @@ typedef struct EpicyclePad {
 typedef struct EpicycleVoice {
     int active;
     int pad_index;
-    double phase;       /* absolute sample-frame pos (UI playhead / non-scrub) */
-    double phase_rel;   /* offset within brace when POS scrubbing (constant rate) */
-    int scrub_rel_valid; /* 1 = phase_rel is live for scrub path */
+    double phase; /* absolute sample-frame pos within brace */
     float velocity;
     float env;          /* ADSR amp level 0..1 */
     int env_stage;      /* 0=A 1=D 2=S 3=R */
@@ -426,8 +427,9 @@ void engine_set_freeze_seconds(EpicycleEngine *eng, float seconds); /* clamp 2..
 int engine_normalize_pad(EpicycleEngine *eng, int pad);
 void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on);
 void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad); /* free ↔ 1-beat sync */
-/* Host/CI: LFO depth+POS must scrub brace and must not change pitch ratio. */
+/* Host/CI: depth alone no POS; matrix POS = constant-rate offset scrub. */
 int engine_lfo_selftest(void);
+const char *epicycle_mod_dest_name(EpicycleModDest dest);
 void engine_toggle_loop(EpicycleEngine *eng, int pad);     /* loop latch ↔ one-shot */
 void engine_set_ping_pong(EpicycleEngine *eng, int pad, int on);
 void engine_sync_mod_window(EpicycleEngine *eng, int pad); /* copy window → mod (no LFO) */

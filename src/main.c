@@ -7,6 +7,7 @@
  * 0.3.11: MAIN absolute latch + hard mute; LFO POS-only default; shrink + AA gfx.
  * 0.3.12: LFO depth → audible POS scrub; kill phase-follow Doppler pitch.
  * 0.3.13: relative-phase POS scrub (no trill); pads boot empty (no pad01/kit).
+ * 0.3.14: LFO depth = matrix source only; POS via slot dest; graphics polish.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -1376,6 +1377,47 @@ int main(int argc, char **argv)
                                                 surf->k2, surf->k3, mask);
                 }
             }
+        } else if (eng.mode_page == EPICYCLE_PAGE_LFO && surf->shift_held) {
+            /* Matrix edit: K1=DEST, K2=AMT, K3=LFO index. Encoder=slot. */
+            EpicyclePad *p = &eng.pads[eng.selected_pad];
+            if (p->mod_edit_slot < 0)
+                p->mod_edit_slot = 0;
+            if (p->mod_edit_slot >= EPICYCLE_MOD_SLOTS)
+                p->mod_edit_slot = EPICYCLE_MOD_SLOTS - 1;
+            EpicycleModRoute *r = &p->mods[p->mod_edit_slot];
+            static uint8_t mk1 = 255, mk2 = 255, mk3 = 255;
+            if (surf->k1 != mk1) {
+                mk1 = surf->k1;
+                int d = (int)((float)surf->k1 / 127.0f * (float)(EPICYCLE_MOD_DEST_COUNT - 1) +
+                              0.5f);
+                if (d < 0)
+                    d = 0;
+                if (d >= EPICYCLE_MOD_DEST_COUNT)
+                    d = EPICYCLE_MOD_DEST_COUNT - 1;
+                r->dest = (EpicycleModDest)d;
+                if (r->dest == EPICYCLE_MOD_NONE) {
+                    r->lfo_index = -1;
+                    r->amount = 0.0f;
+                } else if (r->lfo_index < 0) {
+                    r->lfo_index = 0;
+                }
+            }
+            if (surf->k2 != mk2) {
+                mk2 = surf->k2;
+                r->amount = (float)surf->k2 / 127.0f;
+                if (r->dest != EPICYCLE_MOD_NONE && r->lfo_index < 0)
+                    r->lfo_index = 0;
+            }
+            if (surf->k3 != mk3) {
+                mk3 = surf->k3;
+                int li = (int)((float)surf->k3 / 127.0f * (float)(EPICYCLE_LFO_PER_PAD - 1) + 0.5f);
+                if (li < 0)
+                    li = 0;
+                if (li >= EPICYCLE_LFO_PER_PAD)
+                    li = EPICYCLE_LFO_PER_PAD - 1;
+                if (r->dest != EPICYCLE_MOD_NONE)
+                    r->lfo_index = li;
+            }
         } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
             if (tb->hitmod_edit < 0)
                 tb->hitmod_edit = 0;
@@ -1506,19 +1548,29 @@ int main(int argc, char **argv)
                 EpicyclePad *p = &eng.pads[eng.selected_pad];
                 engine_set_pitch(&eng, eng.selected_pad, p->octave, p->semitone + delta, p->fine);
             } else if (eng.mode_page == EPICYCLE_PAGE_LFO) {
-                EpicycleLfo *l = &eng.pads[eng.selected_pad].lfos[0];
-                if (l->sync_beats > 0.0f) {
-                    l->sync_beats += (float)delta * 0.25f;
-                    if (l->sync_beats < 0.25f)
-                        l->sync_beats = 0.25f;
-                    if (l->sync_beats > 8.0f)
-                        l->sync_beats = 8.0f;
+                EpicyclePad *p = &eng.pads[eng.selected_pad];
+                if (surf->shift_held) {
+                    int s = p->mod_edit_slot + (delta > 0 ? 1 : (delta < 0 ? -1 : 0));
+                    if (s < 0)
+                        s = EPICYCLE_MOD_SLOTS - 1;
+                    if (s >= EPICYCLE_MOD_SLOTS)
+                        s = 0;
+                    p->mod_edit_slot = s;
                 } else {
-                    l->rate_hz += (float)delta * 0.02f;
-                    if (l->rate_hz < 0.05f)
-                        l->rate_hz = 0.05f;
-                    if (l->rate_hz > 8.0f)
-                        l->rate_hz = 8.0f;
+                    EpicycleLfo *l = &p->lfos[0];
+                    if (l->sync_beats > 0.0f) {
+                        l->sync_beats += (float)delta * 0.25f;
+                        if (l->sync_beats < 0.25f)
+                            l->sync_beats = 0.25f;
+                        if (l->sync_beats > 8.0f)
+                            l->sync_beats = 8.0f;
+                    } else {
+                        l->rate_hz += (float)delta * 0.02f;
+                        if (l->rate_hz < 0.05f)
+                            l->rate_hz = 0.05f;
+                        if (l->rate_hz > 8.0f)
+                            l->rate_hz = 8.0f;
+                    }
                 }
             } else if (eng.mode_page == EPICYCLE_PAGE_MIX) {
                 EpicyclePad *p = &eng.pads[eng.selected_pad];

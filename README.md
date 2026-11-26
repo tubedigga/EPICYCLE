@@ -6,7 +6,7 @@ Primary screen: 2D projected tombola — **Fader** morph, **MAIN** vol, **K1** s
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.3.13-scrub-empty` — constant-rate LFO POS scrub; pads boot empty. Host-tested. Needs Ash card boot + log paste.
+> **Status:** `0.3.14-lfo-matrix-gfx` — per-pad LFO matrix (no default POS); clean offset scrub; graphics polish. Host-tested. Needs Ash boot + log.
 
 ## Update the SD card (Ash — firmware 1.4)
 
