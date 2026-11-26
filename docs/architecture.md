@@ -83,5 +83,5 @@ pads / encoder never change `mode_page`. Filter Chamberlin damping maps knob
       *.txt                  # recovery / samples hints
   Epicycle/
     projects/ samples/ kits/ logs/ settings.json
-    samples/pad01.wav …      # optional; else synth demo bank
+    samples/*.wav            # free-named; assign via SAMPLE (pads boot empty)
 ```

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.12-lfo-pos"
+#define EPICYCLE_VERSION "0.3.13-scrub-empty"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -185,7 +185,9 @@ typedef struct EpicyclePad {
 typedef struct EpicycleVoice {
     int active;
     int pad_index;
-    double phase;       /* sample-frame position within absolute sample */
+    double phase;       /* absolute sample-frame pos (UI playhead / non-scrub) */
+    double phase_rel;   /* offset within brace when POS scrubbing (constant rate) */
+    int scrub_rel_valid; /* 1 = phase_rel is live for scrub path */
     float velocity;
     float env;          /* ADSR amp level 0..1 */
     int env_stage;      /* 0=A 1=D 2=S 3=R */

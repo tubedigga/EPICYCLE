@@ -6,6 +6,7 @@
  * 0.3.10: SAMPLE browse/preview crash harden (cap, UAF retire, soft fail).
  * 0.3.11: MAIN absolute latch + hard mute; LFO POS-only default; shrink + AA gfx.
  * 0.3.12: LFO depth → audible POS scrub; kill phase-follow Doppler pitch.
+ * 0.3.13: relative-phase POS scrub (no trill); pads boot empty (no pad01/kit).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -56,35 +57,16 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
+/*
+ * Ash 0.3.13: pads boot empty. No pad01.wav / 1.wav auto-map, no kit preload,
+ * no silent synth fallback. User assigns via SAMPLE browse. Host --demo / --wav
+ * / --preview still seed banks explicitly.
+ */
 static int try_load_card_samples(EpicycleEngine *eng, const EpicyclePaths *paths)
 {
-    int loaded = 0;
-    char path[768];
-    for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
-        snprintf(path, sizeof path, "%s/samples/pad%02d.wav", paths->data_dir, i + 1);
-        if (engine_load_bank_wav(eng, i, path) == 0) {
-            engine_assign_sample(eng, i, i);
-            loaded++;
-            continue;
-        }
-        snprintf(path, sizeof path, "%s/samples/%d.wav", paths->data_dir, i + 1);
-        if (engine_load_bank_wav(eng, i, path) == 0) {
-            engine_assign_sample(eng, i, i);
-            loaded++;
-        }
-    }
-    if (loaded == 0) {
-        static const char *names[] = {"demo-a.wav", "demo-b.wav", "demo-c.wav", "demo-d.wav", NULL};
-        for (int i = 0; names[i]; i++) {
-            snprintf(path, sizeof path, "%s/%s", paths->app_dir, names[i]);
-            if (engine_load_bank_wav(eng, i, path) == 0) {
-                engine_assign_sample(eng, i, i);
-                engine_assign_sample(eng, i + 4, i);
-                loaded++;
-            }
-        }
-    }
-    return loaded;
+    (void)eng;
+    (void)paths;
+    return 0;
 }
 
 static void page_prev(EpicycleEngine *eng)
@@ -1069,14 +1051,15 @@ int main(int argc, char **argv)
         }
     }
     if (!force_demo && loaded == 0)
-        loaded = try_load_card_samples(&eng, &paths);
-    if (force_demo || loaded == 0) {
+        loaded = try_load_card_samples(&eng, &paths); /* always 0 — pads stay empty */
+    if (force_demo) {
         engine_host_demo_setup(&eng);
-        epicycle_log(&paths, "using synth demo bank (DIV4/DIV8/DIV16 equal-slice pads)");
+        loaded = EPICYCLE_PAD_COUNT;
+        epicycle_log(&paths, "using synth demo bank (--demo / host preview)");
+    } else if (loaded == 0) {
+        epicycle_log(&paths, "pads empty — assign WAVs via SAMPLE (no pad01 auto-map)");
     } else {
-        /* Stay freeform so Trim Start/End work on every pad; encoder push
-         * toggles division when wanted (forced division made Start look dead). */
-        epicycle_log(&paths, "loaded %d sample slot(s) (freeform Trim default)", loaded);
+        epicycle_log(&paths, "loaded %d sample slot(s) from --wav (freeform Trim default)", loaded);
     }
 
     EpicycleTombola *tb = tombola_state();
