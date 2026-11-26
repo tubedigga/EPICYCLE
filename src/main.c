@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT
  *
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
- * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
- * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.8: Pro graphics, MAIN absolute, grain, phantom, FX, freeze, live SAMPLE.
+ * SAMPLE+pad select; MUTE+pad toggle ball; SEQ → Tombola; PAD FX → Hit Mod;
+ * B1/B2 cycle Tombola / Trim / Mix / Delay / Reverb / …; B3 quit.
+ * 0.3.9: clean LFO scrub, precise Trim, Delay/Reverb pages, normalize, palette.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -245,11 +245,28 @@ static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
     }
 }
 
-/* Absolute pot → edge, but never fight a closing gesture past the other edge. */
+/* Quantize 0..1 to nearest sample frame for predictable Start/End landing. */
+static float trim_quantize_01(const EpicycleEngine *eng, int pad, float v)
+{
+    const EpicyclePad *p = &eng->pads[pad];
+    if (!p->sample || p->sample->frames < 2)
+        return v;
+    size_t fr = p->sample->frames;
+    if (v < 0.0f)
+        v = 0.0f;
+    if (v > 1.0f)
+        v = 1.0f;
+    size_t i = (size_t)(v * (float)(fr - 1) + 0.5f);
+    if (i >= fr)
+        i = fr - 1;
+    return (float)i / (float)(fr - 1);
+}
+
+/* Absolute pot → frame-quantized edge; grain snap at the other edge. */
 static void trim_set_edge_abs(EpicycleEngine *eng, int pad, int end_edge, uint8_t cc)
 {
     EpicyclePad *p = &eng->pads[pad];
-    float abs01 = (float)cc / 127.0f;
+    float abs01 = trim_quantize_01(eng, pad, (float)cc / 127.0f);
     float start = p->window_start;
     float end = start + p->window_length;
     if (end > 1.0f)
@@ -259,13 +276,13 @@ static void trim_set_edge_abs(EpicycleEngine *eng, int pad, int end_edge, uint8_
     if (end_edge) {
         /* Pot at/under Start → snap to 1-frame grain. */
         if (abs01 <= start + frame * 2.0f)
-            engine_trim_set_end(eng, pad, start + frame);
+            engine_trim_set_end(eng, pad, trim_quantize_01(eng, pad, start + frame));
         else
             engine_trim_set_end(eng, pad, abs01);
     } else {
         /* Pot at/over End → snap to 1-frame grain. */
         if (abs01 >= end - frame * 2.0f)
-            engine_trim_set_start(eng, pad, end - frame);
+            engine_trim_set_start(eng, pad, trim_quantize_01(eng, pad, end - frame));
         else
             engine_trim_set_start(eng, pad, abs01);
     }
@@ -363,15 +380,26 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
         t1 = (uint8_t)clampf_u8((int)((p->lfos[0].rate_hz - 0.05f) / 7.95f * 127.0f + 0.5f));
         t2 = (uint8_t)clampf_u8((int)(p->lfos[0].depth * 127.0f + 0.5f));
         break;
-    case EPICYCLE_PAGE_FX:
+    case EPICYCLE_PAGE_DELAY:
         if (shift) {
-            t0 = (uint8_t)clampf_u8((int)(eng->fx_rev_damp * 127.0f + 0.5f));
+            t0 = (uint8_t)clampf_u8((int)(eng->fx_delay_tone * 127.0f + 0.5f));
             t1 = (uint8_t)clampf_u8((int)(eng->fx_wet * 127.0f + 0.5f));
             t2 = (uint8_t)clampf_u8((int)((eng->freeze_seconds - 2.0f) / 3.0f * 127.0f + 0.5f));
         } else {
             t0 = (uint8_t)clampf_u8((int)(eng->fx_delay_time * 127.0f + 0.5f));
             t1 = (uint8_t)clampf_u8((int)(eng->fx_delay_fb * 127.0f + 0.5f));
-            t2 = (uint8_t)clampf_u8((int)(eng->fx_rev_decay * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)(eng->fx_delay_wet * 127.0f + 0.5f));
+        }
+        break;
+    case EPICYCLE_PAGE_REVERB:
+        if (shift) {
+            t0 = (uint8_t)clampf_u8((int)(eng->fx_rev_wet * 127.0f + 0.5f));
+            t1 = (uint8_t)clampf_u8((int)(eng->fx_wet * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)((eng->freeze_seconds - 2.0f) / 3.0f * 127.0f + 0.5f));
+        } else {
+            t0 = (uint8_t)clampf_u8((int)(eng->fx_rev_decay * 127.0f + 0.5f));
+            t1 = (uint8_t)clampf_u8((int)(eng->fx_rev_damp * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8((int)(eng->fx_rev_size * 127.0f + 0.5f));
         }
         break;
     case EPICYCLE_PAGE_TOMBOLA:
@@ -525,18 +553,23 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
 
     if (p->freeform) {
         /*
-         * Start/End = region length only. Smooth relative tracking after pickup
-         * (Ash: abs snap on engage felt jumpy). Never jump brace to pot position.
+         * Start/End = absolute after pickup (Ash 0.3.9: precise predictable landing).
+         * Fine moves (|d|≤1) still nudge by frames for grain work; larger turns
+         * track the pot with sample-frame quantization.
          */
         if (mask & 1u) {
             if (!g_trim_rel[0]) {
                 g_trim_rel[0] = 1;
-                g_trim_edge_cc[0] = surf->k1; /* arm only — no abs jump */
+                g_trim_edge_cc[0] = surf->k1;
+                /* Soft engage: land at pot (quantized) so aim matches feel. */
+                trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
             } else {
                 int d = (int)surf->k1 - (int)g_trim_edge_cc[0];
                 g_trim_edge_cc[0] = surf->k1;
-                if (d)
+                if (d == 1 || d == -1)
                     trim_nudge_edge(eng, eng->selected_pad, 0, d);
+                else if (d)
+                    trim_set_edge_abs(eng, eng->selected_pad, 0, surf->k1);
             }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
             g_pick_target[2] = (uint8_t)clampf_u8(
@@ -547,12 +580,15 @@ static void handle_trim_knobs(EpicycleEngine *eng, const EpicycleSurfaceState *s
         if (mask & 2u) {
             if (!g_trim_rel[1]) {
                 g_trim_rel[1] = 1;
-                g_trim_edge_cc[1] = surf->k2; /* arm only — no abs jump */
+                g_trim_edge_cc[1] = surf->k2;
+                trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
             } else {
                 int d = (int)surf->k2 - (int)g_trim_edge_cc[1];
                 g_trim_edge_cc[1] = surf->k2;
-                if (d)
+                if (d == 1 || d == -1)
                     trim_nudge_edge(eng, eng->selected_pad, 1, d);
+                else if (d)
+                    trim_set_edge_abs(eng, eng->selected_pad, 1, surf->k2);
             }
             g_trim_lock_len = eng->pads[eng->selected_pad].window_length;
             g_pick_target[2] = (uint8_t)clampf_u8(
@@ -611,7 +647,7 @@ static void handle_encoder_press(EpicycleEngine *eng, EpicycleSurfaceState *st)
     st->wheel_press = 0;
     int pad = eng->selected_pad;
     if (eng->mode_page == EPICYCLE_PAGE_TOMBOLA) {
-        /* Encoder push = freeze last 2–5 s (HitMod stays on FULL LEVEL). */
+        /* Encoder push = freeze last 2–5 s (HitMod = PAD FX). */
         engine_freeze_toggle(eng);
         if (g_log_paths)
             epicycle_log(g_log_paths, "freeze -> %s (%.1fs)",
@@ -620,10 +656,21 @@ static void handle_encoder_press(EpicycleEngine *eng, EpicycleSurfaceState *st)
         return;
     }
     if (eng->mode_page == EPICYCLE_PAGE_SAMPLE) {
-        if (st->shift_held) {
+        if (st->sample_held) {
+            /* SAMPLE+ENC = rescan folder (after dropping new WAVs). */
             int n = sample_browser_rescan(&g_browser, g_browser_paths);
             if (g_log_paths)
                 epicycle_log(g_log_paths, "sample browser rescan -> %d", n);
+            return;
+        }
+        if (st->shift_held) {
+            /* SHIFT+ENC = peak-normalize selected pad (quiet WAVs). */
+            int rc = engine_normalize_pad(eng, pad);
+            if (g_log_paths)
+                epicycle_log(g_log_paths, "normalize pad %d -> %s", pad + 1,
+                             rc == 0 ? "ok" : "fail");
+            snprintf(g_browser.status, sizeof g_browser.status, "%s",
+                     rc == 0 ? "normalized" : "norm fail");
             return;
         }
         /* Commit after audition — assign cursor WAV to selected pad. */
@@ -1121,12 +1168,22 @@ int main(int argc, char **argv)
 
         handle_encoder_press(&eng, st);
 
+        if (st->seq_btn) {
+            st->seq_btn = 0;
+            if (eng.mode_page != EPICYCLE_PAGE_TOMBOLA) {
+                eng.mode_page = EPICYCLE_PAGE_TOMBOLA;
+                surface_set_hitmod_led(0);
+                pickup_arm(surf, &eng);
+                epicycle_log(&paths, "page -> TOMBOLA (SEQ)");
+            }
+        }
+
         if (st->hitmod_btn) {
             st->hitmod_btn = 0;
             eng.mode_page = EPICYCLE_PAGE_HITMOD;
             surface_set_hitmod_led(1);
             pickup_arm(surf, &eng);
-            epicycle_log(&paths, "page -> HITMOD (FULL LEVEL)");
+            epicycle_log(&paths, "page -> HITMOD (PAD FX)");
         }
 
         if (st->loop_btn) {
@@ -1271,13 +1328,29 @@ int main(int argc, char **argv)
                 }
             }
             /* Ball count: MUTE+pad only. Morph: fader only (no auto shrink). */
-        } else if (eng.mode_page == EPICYCLE_PAGE_FX) {
+        } else if (eng.mode_page == EPICYCLE_PAGE_DELAY) {
             const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
             unsigned mask = pickup_mask(cur, 0);
             if (mask) {
                 if (surf->shift_held) {
                     if (mask & 1u)
-                        eng.fx_rev_damp = (float)surf->k1 / 127.0f;
+                        eng.fx_delay_tone = (float)surf->k1 / 127.0f;
+                    if (mask & 2u)
+                        eng.fx_wet = (float)surf->k2 / 127.0f;
+                    if (mask & 4u)
+                        engine_set_freeze_seconds(&eng, 2.0f + 3.0f * ((float)surf->k3 / 127.0f));
+                } else {
+                    engine_apply_page_knobs_mask(&eng, eng.selected_pad, eng.mode_page, surf->k1,
+                                                surf->k2, surf->k3, mask);
+                }
+            }
+        } else if (eng.mode_page == EPICYCLE_PAGE_REVERB) {
+            const uint8_t cur[3] = {surf->k1, surf->k2, surf->k3};
+            unsigned mask = pickup_mask(cur, 0);
+            if (mask) {
+                if (surf->shift_held) {
+                    if (mask & 1u)
+                        eng.fx_rev_wet = (float)surf->k1 / 127.0f;
                     if (mask & 2u)
                         eng.fx_wet = (float)surf->k2 / 127.0f;
                     if (mask & 4u)
@@ -1483,8 +1556,9 @@ int main(int argc, char **argv)
 
         /* Trim / Tombola / Sample: every frame for responsive UI. */
         if (eng.mode_page == EPICYCLE_PAGE_TRIM || eng.mode_page == EPICYCLE_PAGE_TOMBOLA ||
-            eng.mode_page == EPICYCLE_PAGE_SAMPLE || eng.mode_page == EPICYCLE_PAGE_FX ||
-            eng.mode_page == EPICYCLE_PAGE_HITMOD || (ticks % 2) == 0)
+            eng.mode_page == EPICYCLE_PAGE_SAMPLE || eng.mode_page == EPICYCLE_PAGE_DELAY ||
+            eng.mode_page == EPICYCLE_PAGE_REVERB || eng.mode_page == EPICYCLE_PAGE_HITMOD ||
+            (ticks % 2) == 0)
             ui_draw_loop(&hw, &eng, surf, tb, &g_browser);
 
         if (!audio_running()) {

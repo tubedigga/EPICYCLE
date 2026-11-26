@@ -10,7 +10,7 @@
  *     strike 99 nn vv → poly AT A9 nn pp → release 89 nn 00
  *   - pad LED SysEx I = printed pad − 1 (0..15); fader light I=16
  *   - Main vol CC19; K1–K3 CC16/17/18; fader CC20; wheel CC100 relative
- *   - SAMPLE=6, SHIFT=49, LOOP=74, MUTE=43; soft B1/B2/B3 = 12/13/14
+ *   - SAMPLE=6, SEQ=7, PAD FX=1, SHIFT=49, LOOP=74, MUTE=43; soft B1/B2/B3 = 12/13/14
  *   - 0x42 position request → dump CC19,16,17,18,20 + CC100=0
  *
  * Untrusted-stream rules (0.2.8+; 0.2.11 hard-isolates soft keys / SAMPLE):
@@ -52,7 +52,8 @@ static const uint8_t BUTTON_LED_CCS[] = {
 
 enum {
     NOTE_SAMPLE = 6,
-    NOTE_FULL_LEVEL = 7, /* spare → Hit Mod page (physics matrix stub) */
+    NOTE_SEQ = 7,      /* SEQ → Tombola home (Ash 0.3.9; sequencer = tombola) */
+    NOTE_PAD_FX = 1,   /* PAD FX spare → Hit Mod page */
     NOTE_SHIFT = 49,
     NOTE_LOOP = 74,
     NOTE_MUTE = 43,
@@ -625,8 +626,15 @@ static void dispatch_msg(int explicit_status)
             clear_ch_running();
             return;
         }
-        if (m_d[0] == NOTE_FULL_LEVEL) {
-            /* Spare button → open physics Hit Mod page (edge on press). */
+        if (m_d[0] == NOTE_SEQ) {
+            /* SEQ = Tombola home from any edit page (Ash 0.3.9). */
+            if (on && explicit_status)
+                g_state.seq_btn = 1;
+            clear_ch_running();
+            return;
+        }
+        if (m_d[0] == NOTE_PAD_FX) {
+            /* PAD FX spare → physics Hit Mod page (edge on press). */
             if (on && explicit_status)
                 g_state.hitmod_btn = 1;
             clear_ch_running();
@@ -947,7 +955,7 @@ void surface_set_hitmod_led(int on)
         return;
     g_hitmod_led = want;
     if (!g_open_quiet)
-        light_button(g_fd, NOTE_FULL_LEVEL, (uint8_t)want);
+        light_button(g_fd, NOTE_PAD_FX, (uint8_t)want);
 }
 
 static void midi_selftest_reset(void)
@@ -1291,7 +1299,7 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 15) MUTE momentary; FULL LEVEL (spare) → hitmod edge. */
+    /* 15) MUTE momentary; SEQ → tombola home; PAD FX → hitmod. */
     midi_selftest_reset();
     {
         const uint8_t on[] = {0x90, 43, 127};
@@ -1302,8 +1310,12 @@ int surface_midi_selftest(void)
         midi_feed_buf(off, sizeof off);
         if (g_state.mute_held)
             fails++;
-        const uint8_t fl[] = {0x90, 7, 127};
-        midi_feed_buf(fl, sizeof fl);
+        const uint8_t seq[] = {0x90, 7, 127};
+        midi_feed_buf(seq, sizeof seq);
+        if (!g_state.seq_btn)
+            fails++;
+        const uint8_t pfx[] = {0x90, 1, 127};
+        midi_feed_buf(pfx, sizeof pfx);
         if (!g_state.hitmod_btn)
             fails++;
         /* Running-status MUTE ignored */

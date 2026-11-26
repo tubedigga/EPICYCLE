@@ -37,12 +37,11 @@ static uint8_t g_wall_touch[EPICYCLE_PAD_COUNT];
 /* Last impact face (-1 = circle / none). New face = new hit even if still touching. */
 static int8_t g_wall_face[EPICYCLE_PAD_COUNT];
 
-/* Distinct pad colours (0x00RRGGBB). */
-/* Cool / muted pad colours — no toy yellow (Ash 0.3.8 palette). */
+/* Distinct pad colours (0x00RRGGBB) — vibrant pro, no washed yellow (Ash 0.3.9). */
 static const uint32_t BALL_RGB[EPICYCLE_PAD_COUNT] = {
-    0x00D45A52u, 0x00C87848u, 0x00A89058u, 0x0048A070u, 0x0038B098u, 0x003898C0u,
-    0x004878D0u, 0x007858C0u, 0x00B050A8u, 0x00C06088u, 0x00A87058u, 0x00888870u,
-    0x00589888u, 0x00508098u, 0x0090A0A8u, 0x00C8D0D4u,
+    0x00E83848u, 0x00F06030u, 0x00E88820u, 0x0020C860u, 0x0010C8A0u, 0x0018A8E0u,
+    0x003868F0u, 0x008848E0u, 0x00D038C0u, 0x00E04080u, 0x00C05030u, 0x0060B070u,
+    0x0020A090u, 0x003890B8u, 0x00A0B0C0u, 0x00E0E8F0u,
 };
 
 static float clampf(float v, float lo, float hi)
