@@ -147,25 +147,25 @@ static void draw_text(uint32_t *px, int x, int y, const char *s, uint32_t fg, in
 }
 
 enum {
-    /* Firmware chrome — cool slate, high contrast, no toy yellow (Ash 0.3.14). */
-    COL_BG = 0x00060A10u,
-    COL_BG_TOP = 0x000E1620u,
-    COL_FG = 0x00F2F6FAu,
-    COL_MUTED = 0x00586878u,
-    COL_ACCENT = 0x0030C8D8u,
-    COL_OK = 0x0030D080u,
-    COL_WAVE = 0x00384858u,
-    COL_WAVE_DIM = 0x00141C24u,
-    COL_BRACE = 0x0028E0F0u,
-    COL_BRACE_FILL = 0x00101C28u,
-    COL_MESH = 0x00D0E4ECu, /* bright silver silhouette */
-    COL_MESH_DIM = 0x00384850u,
-    COL_MESH_CORE = 0x00F0F8FCu,
-    COL_MOD = 0x00E85870u,
-    COL_PLAY = 0x00F8FCFFu,
-    COL_SOFT = 0x008898A0u,
-    COL_PAGE = 0x00D8E4ECu,
-    COL_RULE = 0x00182830u,
+    /* AC50-adjacent chrome — deep navy, crisp silver, cyan accent (Ash 0.3.16). */
+    COL_BG = 0x00040A12u,
+    COL_BG_TOP = 0x000C1824u,
+    COL_FG = 0x00F4F8FCu,
+    COL_MUTED = 0x005A6A7Au,
+    COL_ACCENT = 0x0028D4E8u,
+    COL_OK = 0x0028D888u,
+    COL_WAVE = 0x003A4A5Au,
+    COL_WAVE_DIM = 0x00101820u,
+    COL_BRACE = 0x0020E8F8u,
+    COL_BRACE_FILL = 0x000C1822u,
+    COL_MESH = 0x00C8DCE8u,
+    COL_MESH_DIM = 0x00283038u,
+    COL_MESH_CORE = 0x00F4FAFEu,
+    COL_MOD = 0x00F06078u,
+    COL_PLAY = 0x00FFFFFF,
+    COL_SOFT = 0x00788898u,
+    COL_PAGE = 0x00E0ECF4u,
+    COL_RULE = 0x00142028u,
 };
 
 int ui_load_splash_logo(const char *path)
@@ -553,31 +553,57 @@ static void draw_line_aa(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t 
 
 static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
 {
-    /* Drum under title with margin; morph feel kept (Ash). */
-    int cx = 160, cy = 116, scale = 64;
+    /* Drum under title; morph kept. Aim: polished AC50-grade silhouette. */
+    int cx = 160, cy = 118, scale = 66;
     if (!tb)
         return;
 
-    /* Layered elliptical floor — vignette depth. */
-    for (int y = -(int)(scale * 0.62f); y <= (int)(scale * 0.68f); y++) {
-        float ty = (float)y / (float)scale;
-        float fall = 1.0f - ty * ty * 0.88f;
-        if (fall < 0.04f)
-            continue;
-        int half = (int)(fall * (float)scale * 1.02f);
-        if (half < 2)
-            continue;
-        float shade = 0.35f + 0.55f * fall;
-        uint32_t gcol = shade_rgb(0x000C141Cu, shade);
-        fill_rect(px, cx - half, cy + y, half * 2, 1, gcol);
+    /* Radial vignette plate under the drum. */
+    for (int y = -(int)(scale * 0.78f); y <= (int)(scale * 0.82f); y++) {
+        for (int x = -(int)(scale * 1.15f); x <= (int)(scale * 1.15f); x++) {
+            float fx = (float)x / (float)scale;
+            float fy = (float)y / ((float)scale * 0.92f);
+            float d = fx * fx + fy * fy;
+            if (d > 1.35f)
+                continue;
+            float fall = 1.0f - d * 0.72f;
+            if (fall < 0.05f)
+                continue;
+            float shade = 0.22f + 0.48f * fall;
+            put_px_soft(px, cx + x, cy + y, shade_rgb(0x00081018u, shade),
+                        clampf_ui(fall * 0.55f));
+        }
     }
 
-    /* Multi-pass AA silhouette — dim halo → body → bright core (no spokes). */
+    /* Soft filled drum body (projected ellipse) — depth before edges. */
+    {
+        const int segs = 96;
+        for (int ring = 0; ring < 5; ring++) {
+            float rad = tb->radius * (0.92f - 0.14f * (float)ring);
+            float a_amt = 0.16f - 0.028f * (float)ring;
+            int prevx = 0, prevy = 0;
+            for (int i = 0; i <= segs; i++) {
+                float a = (float)i / (float)segs * (float)(2.0 * M_PI) + tb->spin_rad;
+                float ox = cosf(a) * rad;
+                float oy = sinf(a) * rad;
+                int sx, sy;
+                tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
+                if (i > 0)
+                    draw_line_aa(px, prevx, prevy, sx, sy, shade_rgb(0x00101828u, 1.0f),
+                                 2.4f - 0.3f * (float)ring);
+                (void)a_amt;
+                prevx = sx;
+                prevy = sy;
+            }
+        }
+    }
+
+    /* Multi-pass AA silhouette — outer halo → body → bright core. */
     {
         int faces = tb->face_count;
         if (faces <= 0) {
             int prevx = 0, prevy = 0;
-            const int segs = 160;
+            const int segs = 192;
             for (int i = 0; i <= segs; i++) {
                 float a = (float)i / (float)segs * (float)(2.0 * M_PI) + tb->spin_rad;
                 float ox = cosf(a) * tb->radius;
@@ -585,25 +611,31 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
                 int sx, sy;
                 tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
                 if (i > 0) {
-                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH_DIM, 2.85f);
-                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH, 1.55f);
-                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH_CORE, 0.70f);
+                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH_DIM, 3.20f);
+                    draw_line_aa(px, prevx, prevy, sx, sy, shade_rgb(COL_MESH, 0.55f), 2.10f);
+                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH, 1.25f);
+                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH_CORE, 0.55f);
                 }
                 prevx = sx;
                 prevy = sy;
             }
-            /* Inner rim — firmware depth cue. */
-            prevx = prevy = 0;
-            for (int i = 0; i <= segs; i++) {
-                float a = (float)i / (float)segs * (float)(2.0 * M_PI) + tb->spin_rad;
-                float ox = cosf(a) * tb->radius * 0.86f;
-                float oy = sinf(a) * tb->radius * 0.86f;
-                int sx, sy;
-                tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
-                if (i > 0)
-                    draw_line_aa(px, prevx, prevy, sx, sy, shade_rgb(COL_MESH, 0.35f), 0.85f);
-                prevx = sx;
-                prevy = sy;
+            /* Dual inner rims — firmware depth. */
+            for (int pass = 0; pass < 2; pass++) {
+                float rr = pass == 0 ? 0.88f : 0.78f;
+                float hw = pass == 0 ? 1.05f : 0.70f;
+                uint32_t rc = pass == 0 ? shade_rgb(COL_MESH, 0.42f) : shade_rgb(COL_MESH, 0.22f);
+                prevx = prevy = 0;
+                for (int i = 0; i <= segs; i++) {
+                    float a = (float)i / (float)segs * (float)(2.0 * M_PI) + tb->spin_rad;
+                    float ox = cosf(a) * tb->radius * rr;
+                    float oy = sinf(a) * tb->radius * rr;
+                    int sx, sy;
+                    tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
+                    if (i > 0)
+                        draw_line_aa(px, prevx, prevy, sx, sy, rc, hw);
+                    prevx = sx;
+                    prevy = sy;
+                }
             }
         } else {
             for (int e = 0; e < faces; e++) {
@@ -613,9 +645,24 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
                 int sx0, sy0, sx1, sy1;
                 tombola_world_to_screen(tb, x0, y0, cx, cy, scale, &sx0, &sy0);
                 tombola_world_to_screen(tb, x1, y1, cx, cy, scale, &sx1, &sy1);
-                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH_DIM, 2.90f);
-                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH, 1.60f);
-                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH_CORE, 0.72f);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH_DIM, 3.25f);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, shade_rgb(COL_MESH, 0.55f), 2.15f);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH, 1.30f);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH_CORE, 0.58f);
+            }
+            /* Inner polygon inset. */
+            for (int e = 0; e < faces; e++) {
+                float x0, y0, x1, y1;
+                tombola_edge_point(tb, e, 0.0f, &x0, &y0);
+                tombola_edge_point(tb, e, 1.0f, &x1, &y1);
+                x0 *= 0.86f;
+                y0 *= 0.86f;
+                x1 *= 0.86f;
+                y1 *= 0.86f;
+                int sx0, sy0, sx1, sy1;
+                tombola_world_to_screen(tb, x0, y0, cx, cy, scale, &sx0, &sy0);
+                tombola_world_to_screen(tb, x1, y1, cx, cy, scale, &sx1, &sy1);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, shade_rgb(COL_MESH, 0.32f), 0.95f);
             }
         }
     }
@@ -625,22 +672,25 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         uint32_t col = tombola_ball_color(i);
         if (!tb->balls[i].active) {
             float ang = (float)i * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
-            float ox = cosf(ang) * 0.70f;
-            float oy = sinf(ang) * 0.70f;
+            float ox = cosf(ang) * 0.68f;
+            float oy = sinf(ang) * 0.68f;
             tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
-            stroke_disk(px, sx, sy, 3, shade_rgb(col, 0.22f));
+            stroke_disk(px, sx, sy, 3, shade_rgb(col, 0.18f));
             continue;
         }
         tombola_world_to_screen(tb, tb->balls[i].x, tb->balls[i].y, cx, cy, scale, &sx, &sy);
-        /* Soft contact shadow. */
-        fill_rect(px, sx - 4, sy + 4, 8, 2, 0x00101820u);
+        /* Soft elliptical contact shadow. */
+        for (int syy = 0; syy < 3; syy++)
+            fill_rect(px, sx - 5 + syy, sy + 5 + syy, 10 - syy * 2, 1,
+                      shade_rgb(0x00000000u, 0.35f - 0.08f * (float)syy));
         if (tb->balls[i].hit_flash > 0.15f)
-            col = shade_rgb(col, 1.42f);
-        int r = (i == sel) ? 8 : 6;
+            col = shade_rgb(col, 1.48f);
+        int r = (i == sel) ? 9 : 7;
         fill_sphere(px, sx, sy, r, col);
-        stroke_disk(px, sx - 1, sy - 1, r - 2, shade_rgb(0x00FFFFFF, 0.22f));
+        stroke_disk(px, sx - 1, sy - 2, r - 2, shade_rgb(0x00FFFFFF, 0.28f));
+        stroke_disk(px, sx, sy, r + 1, shade_rgb(col, 0.35f));
         if (i == sel)
-            stroke_disk(px, sx, sy, r + 2, COL_ACCENT);
+            stroke_disk(px, sx, sy, r + 3, COL_ACCENT);
     }
 }
 
@@ -994,24 +1044,33 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         draw_text(px, 8, 160, "depth>0 auto-LPF  opens then closes", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 attack  K2 decay  K3 depth", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_LFO) {
-        /* Always-visible matrix (HitMod-style). DEST incl. POS is primary —
-         * never Shift-secret (Ash 0.3.15). */
+        /* Always-visible matrix. One DEPTH (= how hard LFO hits DEST). 8 slots. */
         draw_text(px, 8, 48, "LFO", COL_FG, 2);
-        draw_text(px, 72, 52, "mod matrix", COL_MUTED, 1);
+        draw_text(px, 72, 52, "mod matrix  8 slots", COL_MUTED, 1);
         const EpicycleLfo *l = pad ? &pad->lfos[0] : NULL;
         int slot = pad ? pad->mod_edit_slot : 0;
         if (slot < 0)
             slot = 0;
         if (slot >= EPICYCLE_MOD_SLOTS)
             slot = EPICYCLE_MOD_SLOTS - 1;
+        int top = slot - EPICYCLE_MOD_VISIBLE / 2;
+        if (top < 0)
+            top = 0;
+        if (top > EPICYCLE_MOD_SLOTS - EPICYCLE_MOD_VISIBLE)
+            top = EPICYCLE_MOD_SLOTS - EPICYCLE_MOD_VISIBLE;
+        if (top < 0)
+            top = 0;
         int row_y = 68;
-        draw_text(px, 8, row_y - 12, "#  LFO  DEST  AMT", COL_MUTED, 1);
-        for (int s = 0; s < EPICYCLE_MOD_SLOTS; s++) {
+        draw_text(px, 8, row_y - 12, "#  LFO  DEST  DEPTH", COL_MUTED, 1);
+        for (int i = 0; i < EPICYCLE_MOD_VISIBLE; i++) {
+            int s = top + i;
+            if (s >= EPICYCLE_MOD_SLOTS)
+                break;
             const EpicycleModRoute *rr = pad ? &pad->mods[s] : NULL;
             uint32_t fg = (s == slot) ? COL_BRACE : COL_FG;
             uint32_t dim = (s == slot) ? COL_PAGE : COL_MUTED;
             if (s == slot)
-                fill_rect(px, 4, row_y - 1, 312, 14, 0x00201810u);
+                fill_rect(px, 4, row_y - 1, 312, 14, 0x00182028u);
             snprintf(line, sizeof line, "%d", s + 1);
             draw_text(px, 8, row_y, line, dim, 1);
             if (rr && rr->dest != EPICYCLE_MOD_NONE && rr->lfo_index >= 0)
@@ -1024,35 +1083,34 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             draw_text(px, 72, row_y, line, fg, 1);
             snprintf(line, sizeof line, "%3d%%",
                      rr ? (int)(fabsf(rr->amount) * 100.0f) : 0);
-            draw_text(px, 140, row_y, line, fg, 1);
+            draw_text(px, 148, row_y, line, fg, 1);
             if (rr && rr->dest == EPICYCLE_MOD_BRACE_START && fabsf(rr->amount) > 0.02f)
-                draw_text(px, 200, row_y, "POS", COL_OK, 1);
+                draw_text(px, 210, row_y, "POS", COL_OK, 1);
             row_y += 16;
         }
         const EpicycleModRoute *mr = pad ? &pad->mods[slot] : NULL;
         int shift = surf && surf->shift_held;
         if (shift) {
-            /* SHIFT overlay lives in the param/footer zone — never over title. */
             snprintf(v1, sizeof v1, "%s", l ? lfo_shape_name(l->shape) : "SIN");
-            if (l && l->sync_beats > 0.0f)
-                snprintf(v2, sizeof v2, "%.2fb", (double)l->sync_beats);
-            else
-                snprintf(v2, sizeof v2, "%.2fHz", l ? (double)l->rate_hz : 0.0);
-            snprintf(v3, sizeof v3, "L%d", mr && mr->lfo_index >= 0 ? mr->lfo_index : 0);
-            draw_param_row(px, 148, "SHAPE", v1, "RATE", v2, "LFO#", v3);
-            draw_text(px, 8, 214, "SHIFT: shape/rate/LFO#  enc=slot", COL_MUTED, 1);
-            draw_text(px, 8, 226, "release SHIFT for DEST/AMT/DEPTH", COL_MUTED, 1);
+            snprintf(v2, sizeof v2, "L%d", mr && mr->lfo_index >= 0 ? mr->lfo_index : 0);
+            snprintf(v3, sizeof v3, "--");
+            draw_param_row(px, 148, "SHAPE", v1, "LFO#", v2, "", v3);
+            draw_text(px, 8, 214, "SHIFT: shape / LFO#   enc=slot", COL_MUTED, 1);
+            draw_text(px, 8, 226, "release: DEST / DEPTH / RATE", COL_MUTED, 1);
         } else {
             snprintf(v1, sizeof v1, "%s", mr ? epicycle_mod_dest_name(mr->dest) : "OFF");
             snprintf(v2, sizeof v2, "%d", mr ? (int)(fabsf(mr->amount) * 100.0f) : 0);
-            snprintf(v3, sizeof v3, "%d", l ? (int)(l->depth * 100.0f) : 0);
-            draw_param_row(px, 148, "DEST", v1, "AMT", v2, "DEPTH", v3);
-            if (mr && mr->dest == EPICYCLE_MOD_BRACE_START && fabsf(mr->amount) > 0.02f && l &&
-                l->enabled && l->depth > 0.02f)
-                draw_text(px, 8, 214, "POS offset ON  ENC=slot", COL_OK, 1);
+            if (l && l->sync_beats > 0.0f)
+                snprintf(v3, sizeof v3, "%.2fb", (double)l->sync_beats);
             else
-                draw_text(px, 8, 214, "K1 DEST(POS..) K2 AMT K3 DEPTH  ENC=slot", COL_MUTED, 1);
-            draw_text(px, 8, 226, "DEPTH alone does nothing — set DEST+AMT", COL_MUTED, 1);
+                snprintf(v3, sizeof v3, "%.2fHz", l ? (double)l->rate_hz : 0.0);
+            draw_param_row(px, 148, "DEST", v1, "DEPTH", v2, "RATE", v3);
+            if (mr && mr->dest == EPICYCLE_MOD_BRACE_START && fabsf(mr->amount) > 0.02f && l &&
+                l->enabled)
+                draw_text(px, 8, 214, "POS scrub ON  (dual-reader)  ENC=slot", COL_OK, 1);
+            else
+                draw_text(px, 8, 214, "K1 DEST  K2 DEPTH  K3 RATE  ENC=slot", COL_MUTED, 1);
+            draw_text(px, 8, 226, "DEPTH = how much LFO hits DEST  (one knob)", COL_MUTED, 1);
         }
     }
 

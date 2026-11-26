@@ -10,6 +10,7 @@
  * 0.3.14: LFO depth = matrix source only; POS via slot dest; graphics polish.
  * 0.3.15: Always-visible LFO matrix; SHIFT chrome clear of title; FREE grain hold;
  *         SAMPLE+pad stays on edit page; Mix independent DEL/REV sends.
+ * 0.3.16: Dual-reader POS (no Doppler); one DEPTH; 8 slots; audible reverb; gfx.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -392,7 +393,7 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
         t2 = (uint8_t)clampf_u8((int)(p->filt_depth * 127.0f + 0.5f));
         break;
     case EPICYCLE_PAGE_LFO: {
-        /* Primary = matrix DEST/AMT/DEPTH; SHIFT = SHAPE/RATE/LFO#. */
+        /* Primary = DEST / DEPTH / RATE; SHIFT = SHAPE / LFO# (Ash 0.3.16). */
         int slot = p->mod_edit_slot;
         if (slot < 0)
             slot = 0;
@@ -403,16 +404,16 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
             t0 = (uint8_t)clampf_u8((int)((float)p->lfos[0].shape /
                                           (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) * 127.0f +
                                       0.5f));
-            t1 = (uint8_t)clampf_u8(
-                (int)((p->lfos[0].rate_hz - 0.05f) / 7.95f * 127.0f + 0.5f));
             int li = r->lfo_index >= 0 ? r->lfo_index : 0;
-            t2 = (uint8_t)clampf_u8(
+            t1 = (uint8_t)clampf_u8(
                 (int)((float)li / (float)(EPICYCLE_LFO_PER_PAD - 1) * 127.0f + 0.5f));
+            t2 = g_pick_prev[2];
         } else {
             t0 = (uint8_t)clampf_u8(
                 (int)((float)r->dest / (float)(EPICYCLE_MOD_DEST_COUNT - 1) * 127.0f + 0.5f));
             t1 = (uint8_t)clampf_u8((int)(fabsf(r->amount) * 127.0f + 0.5f));
-            t2 = (uint8_t)clampf_u8((int)(p->lfos[0].depth * 127.0f + 0.5f));
+            t2 = (uint8_t)clampf_u8(
+                (int)((p->lfos[0].rate_hz - 0.05f) / 7.95f * 127.0f + 0.5f));
         }
         break;
     }
@@ -1441,8 +1442,8 @@ int main(int argc, char **argv)
                 }
             }
         } else if (eng.mode_page == EPICYCLE_PAGE_LFO) {
-            /* Primary = always-visible matrix: K1=DEST K2=AMT K3=DEPTH.
-             * SHIFT = source edit: K1=SHAPE K2=RATE K3=LFO#. Encoder=slot. */
+            /* Primary: K1=DEST K2=DEPTH K3=RATE. One depth only (Ash 0.3.16).
+             * SHIFT: K1=SHAPE K2=LFO#. Encoder=slot. */
             EpicyclePad *p = &eng.pads[eng.selected_pad];
             if (p->mod_edit_slot < 0)
                 p->mod_edit_slot = 0;
@@ -1463,22 +1464,9 @@ int main(int argc, char **argv)
                         shape = EPICYCLE_LFO_SHAPE_COUNT - 1;
                     p->lfos[0].shape = (EpicycleLfoShape)shape;
                 }
-                if (mask & 2u) {
-                    if (p->lfos[0].sync_beats > 0.0f) {
-                        static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
-                        int idx = (int)((float)surf->k2 / 127.0f * 5.0f + 0.5f);
-                        if (idx < 0)
-                            idx = 0;
-                        if (idx > 5)
-                            idx = 5;
-                        p->lfos[0].sync_beats = beats[idx];
-                    } else {
-                        p->lfos[0].rate_hz = 0.05f + 7.95f * ((float)surf->k2 / 127.0f);
-                    }
-                }
-                if (surf->k3 != mk3) {
-                    mk3 = surf->k3;
-                    int li = (int)((float)surf->k3 / 127.0f *
+                if (surf->k2 != mk2) {
+                    mk2 = surf->k2;
+                    int li = (int)((float)surf->k2 / 127.0f *
                                        (float)(EPICYCLE_LFO_PER_PAD - 1) +
                                    0.5f);
                     if (li < 0)
@@ -1488,6 +1476,7 @@ int main(int argc, char **argv)
                     if (r->dest != EPICYCLE_MOD_NONE)
                         r->lfo_index = li;
                 }
+                (void)mask;
             } else {
                 if (surf->k1 != mk1) {
                     mk1 = surf->k1;
@@ -1502,6 +1491,7 @@ int main(int argc, char **argv)
                     if (r->dest == EPICYCLE_MOD_NONE) {
                         r->lfo_index = -1;
                         r->amount = 0.0f;
+                        engine_lfo_set_enabled(&eng, eng.selected_pad, 0);
                     } else if (r->lfo_index < 0) {
                         r->lfo_index = 0;
                     }
@@ -1509,13 +1499,26 @@ int main(int argc, char **argv)
                 if (surf->k2 != mk2) {
                     mk2 = surf->k2;
                     r->amount = (float)surf->k2 / 127.0f;
-                    if (r->dest != EPICYCLE_MOD_NONE && r->lfo_index < 0)
-                        r->lfo_index = 0;
+                    p->lfos[0].depth = 1.0f; /* source always full */
+                    if (r->dest != EPICYCLE_MOD_NONE) {
+                        if (r->lfo_index < 0)
+                            r->lfo_index = 0;
+                        engine_lfo_set_enabled(&eng, eng.selected_pad, r->amount > 0.02f);
+                    }
                 }
                 if (surf->k3 != mk3) {
                     mk3 = surf->k3;
-                    p->lfos[0].depth = (float)surf->k3 / 127.0f;
-                    engine_lfo_set_enabled(&eng, eng.selected_pad, p->lfos[0].depth > 0.02f);
+                    if (p->lfos[0].sync_beats > 0.0f) {
+                        static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
+                        int idx = (int)((float)surf->k3 / 127.0f * 5.0f + 0.5f);
+                        if (idx < 0)
+                            idx = 0;
+                        if (idx > 5)
+                            idx = 5;
+                        p->lfos[0].sync_beats = beats[idx];
+                    } else {
+                        p->lfos[0].rate_hz = 0.05f + 7.95f * ((float)surf->k3 / 127.0f);
+                    }
                 }
             }
         } else if (eng.mode_page == EPICYCLE_PAGE_HITMOD) {
