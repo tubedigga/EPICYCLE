@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.9-polish"
+#define EPICYCLE_VERSION "0.3.10-sample-crash"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -18,6 +18,9 @@
 #define EPICYCLE_SCRUB_BUDGET 8 /* aggressive LFO window-scan limit */
 #define EPICYCLE_MAX_DIVISION 32
 #define EPICYCLE_XFADE_MAX 2048
+/* Refuse WAVs that would blow device RAM (≈20 s @ 48 kHz stereo float). */
+#define EPICYCLE_WAV_MAX_FRAMES (48000u * 20u)
+#define EPICYCLE_WAV_ERR_TOO_BIG (-2)
 
 typedef struct EpicyclePaths {
     char app_dir[512];   /* folder that holds the binary / payload */
@@ -273,6 +276,9 @@ typedef struct EpicycleEngine {
     float preview_phase;
     float preview_env;
     int preview_env_stage;  /* 0=A 1=S 2=R */
+    /* Deferred free so audio thread never reads a freed preview buffer. */
+    float *preview_retire;
+    int preview_retire_ttl; /* audio periods left before free */
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */
@@ -354,6 +360,7 @@ void surface_flash_pad(int pad /* 0..15 */);
 
 /* samples */
 void sample_free(EpicycleSample *s);
+/* Load WAV → stereo float. 0=ok, -1=bad/missing, EPICYCLE_WAV_ERR_TOO_BIG if over cap. */
 int sample_load_wav(EpicycleSample *out, const char *path);
 int sample_synth_demo(EpicycleSample *out, unsigned rate, float freq_hz, float seconds);
 /* Peak-normalize sample in place to ~0.95. Returns 0 ok, -1 empty/quiet. */
@@ -370,6 +377,8 @@ int sample_browser_assign(EpicycleSampleBrowser *b, EpicycleEngine *eng, int pad
 int sample_browser_preview(EpicycleSampleBrowser *b, EpicycleEngine *eng, int hold);
 void engine_preview_stop(EpicycleEngine *eng);
 int engine_preview_wav(EpicycleEngine *eng, const char *path, int hold);
+/* Host/CI: browse+preview fuzz (empty/huge/bad/mono/stereo) must not crash. */
+int sample_preview_selftest(void);
 
 /* loop engine */
 void engine_init(EpicycleEngine *eng, unsigned sample_rate);

@@ -28,6 +28,8 @@ static float clampf(float v, float lo, float hi)
     return v;
 }
 
+void engine_stop_pad(EpicycleEngine *eng, int pad); /* defined below */
+
 /* Near-zero FREE width: 1 sample frame when bank known, else tiny epsilon.
  * No forced musical min-gap (Ash: Start/End froze at the old ~2% clamp). */
 static float trim_min_len(const EpicyclePad *p)
@@ -579,6 +581,8 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->preview_phase = 0.0f;
     eng->preview_env = 0.0f;
     eng->preview_env_stage = 0;
+    eng->preview_retire = NULL;
+    eng->preview_retire_ttl = 0;
     eng->mode_page = EPICYCLE_PAGE_TOMBOLA;
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
@@ -598,16 +602,26 @@ void engine_shutdown(EpicycleEngine *eng)
     }
     sample_free(&eng->freeze_sample);
     eng->freeze_playing = 0;
-    sample_free(&eng->preview_sample);
     eng->preview_playing = 0;
+    sample_free(&eng->preview_sample);
+    free(eng->preview_retire);
+    eng->preview_retire = NULL;
+    eng->preview_retire_ttl = 0;
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
         eng->pads[i].sample = NULL;
 }
 
 int engine_load_bank_wav(EpicycleEngine *eng, int slot, const char *path)
 {
-    if (!eng || !eng->bank || slot < 0 || slot >= eng->bank_count)
+    if (!eng || !eng->bank || slot < 0 || slot >= eng->bank_count || !path || !path[0])
         return -1;
+    /* Detach pads that borrow this slot before free — avoid audio UAF. */
+    for (int p = 0; p < EPICYCLE_PAD_COUNT; p++) {
+        if (eng->pads[p].sample == &eng->bank[slot]) {
+            engine_stop_pad(eng, p);
+            eng->pads[p].sample = NULL;
+        }
+    }
     sample_free(&eng->bank[slot]);
     return sample_load_wav(&eng->bank[slot], path);
 }
@@ -1569,20 +1583,56 @@ void engine_preview_stop(EpicycleEngine *eng)
     }
 }
 
+/* Retire previous preview PCM after a few audio periods so render never UAFs. */
+static void preview_retire_push(EpicycleEngine *eng, float *old)
+{
+    if (!eng || !old)
+        return;
+    if (eng->preview_retire) {
+        /* Prior retire still pending — safe to free now (ttl already elapsed
+         * or we're shutting the previous slot down before a new one). */
+        free(eng->preview_retire);
+        eng->preview_retire = NULL;
+    }
+    eng->preview_retire = old;
+    eng->preview_retire_ttl = 4; /* ~4 periods ≈ 12 ms @ 44.1 kHz / 128 */
+}
+
+static void preview_retire_tick(EpicycleEngine *eng)
+{
+    if (!eng || !eng->preview_retire)
+        return;
+    if (eng->preview_retire_ttl > 0)
+        eng->preview_retire_ttl--;
+    if (eng->preview_retire_ttl <= 0) {
+        free(eng->preview_retire);
+        eng->preview_retire = NULL;
+        eng->preview_retire_ttl = 0;
+    }
+}
+
 int engine_preview_wav(EpicycleEngine *eng, const char *path, int hold)
 {
     if (!eng || !path || !path[0])
         return -1;
     EpicycleSample tmp;
-    if (sample_load_wav(&tmp, path) != 0)
-        return -1;
-    sample_free(&eng->preview_sample);
+    memset(&tmp, 0, sizeof tmp);
+    int rc = sample_load_wav(&tmp, path);
+    if (rc != 0)
+        return rc; /* -1 bad, EPICYCLE_WAV_ERR_TOO_BIG oversized */
+
+    /* Disarm → swap → deferred-free old PCM. Never free while render may
+     * still index the previous buffer (wheel-scroll crash on SAMPLE). */
+    eng->preview_playing = 0;
+    eng->preview_gate = 0;
+    float *old = eng->preview_sample.data;
     eng->preview_sample = tmp;
     eng->preview_phase = 0.0f;
     eng->preview_env = 0.0f;
     eng->preview_env_stage = 0;
     eng->preview_gate = hold ? 1 : 0;
     eng->preview_playing = 1;
+    preview_retire_push(eng, old);
     return 0;
 }
 
@@ -1595,6 +1645,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
     if (!eng || !eng->running)
         return;
 
+    preview_retire_tick(eng);
     recount_scrub(eng);
     for (int p = 0; p < EPICYCLE_PAD_COUNT; p++)
         apply_modulation(eng, p, frames);
