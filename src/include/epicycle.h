@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.11-main-lfo-gfx"
+#define EPICYCLE_VERSION "0.3.12-lfo-pos"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -424,6 +424,8 @@ void engine_set_freeze_seconds(EpicycleEngine *eng, float seconds); /* clamp 2..
 int engine_normalize_pad(EpicycleEngine *eng, int pad);
 void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on);
 void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad); /* free ↔ 1-beat sync */
+/* Host/CI: LFO depth+POS must scrub brace and must not change pitch ratio. */
+int engine_lfo_selftest(void);
 void engine_toggle_loop(EpicycleEngine *eng, int pad);     /* loop latch ↔ one-shot */
 void engine_set_ping_pong(EpicycleEngine *eng, int pad, int on);
 void engine_sync_mod_window(EpicycleEngine *eng, int pad); /* copy window → mod (no LFO) */

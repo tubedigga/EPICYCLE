@@ -6,7 +6,7 @@ Primary screen: 2D projected tombola — **Fader** morph, **MAIN** vol, **K1** s
 
 This repository is **MIT**, static **aarch64 C**. It is **not** sample-base / Melodee (AGPL) and does **not** flash firmware. Custom OSes run from microSD via the stock autorun path.
 
-> **Status:** `0.3.11-main-lfo-gfx` — MAIN absolute floor mute, LFO POS-only, shrink + AA tombola. Host-tested. Needs Ash card boot + log paste.
+> **Status:** `0.3.12-lfo-pos` — LFO depth scrubs Trim POS (no Doppler pitch). Host-tested. Needs Ash card boot + log paste.
 
 ## Update the SD card (Ash — firmware 1.4)
 
