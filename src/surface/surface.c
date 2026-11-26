@@ -427,18 +427,25 @@ static int confirm_drop(uint8_t *pending, int *pending_n, uint8_t v, int need)
 
 static void apply_main_vol_cc(uint8_t v)
 {
-    /* CC19 → gain only. Never touches pads/soft keys/Trim.
-     * Latch like fader (Ash 0.3.5: volume dropouts / never silent wrongly):
-     * record 0x42 dump, stay disengaged until user moves ≥3 from dump.
-     * Engine keeps full until engaged. Once engaged, track; large plunges
-     * (and any move to 0) need confirm to reject cable glitches. */
+    /* CC19 → gain only. Absolute hardware map once engaged (Ash 0.3.8):
+     * dump of near-zero stays ignored (no wrongful mute); usable dump is
+     * adopted as the live level so pot-at-halfway is not “already full”.
+     * First move ≥3 from dump engages absolute tracking — turning up raises. */
     if (!g_state.main_seen) {
         g_state.main_seen = 1;
         g_state.main_dump = v;
-        g_state.main_vol = 127; /* UI full until engage — no false silence */
-        g_state.main_stable = 127;
-        g_state.main_engaged = 0;
         g_main_pending_n = 0;
+        if (v >= 16) {
+            /* Absolute from dump: physical position = software level. */
+            g_state.main_vol = v;
+            g_state.main_stable = v;
+            g_state.main_engaged = 1;
+        } else {
+            /* Near-zero dump: keep audible until user moves pot. */
+            g_state.main_vol = 100;
+            g_state.main_stable = 100;
+            g_state.main_engaged = 0;
+        }
         return;
     }
     if (!g_state.main_engaged) {
@@ -447,7 +454,6 @@ static void apply_main_vol_cc(uint8_t v)
             d = -d;
         if (d < 3)
             return;
-        /* Refuse to engage at near-silence (Ash: no wrongful mute from dump). */
         if (v < 8)
             return;
         g_state.main_engaged = 1;
@@ -456,7 +462,7 @@ static void apply_main_vol_cc(uint8_t v)
         g_main_pending_n = 0;
         return;
     }
-    /* Confirm large drops + any zero (glitch mute). Ups / small moves apply. */
+    /* Absolute track. Confirm large drops + zero (glitch mute). Ups apply. */
     int drop = (int)g_state.main_stable - (int)v;
     if (drop > 16 || v == 0) {
         if (!confirm_drop(&g_main_pending, &g_main_pending_n, v, 2))
@@ -658,7 +664,7 @@ static void dispatch_msg(int explicit_status)
                 clear_ch_running();
                 return;
             }
-            if (m_d[1] < 8) {
+            if (m_d[1] < 12) {
                 clear_ch_running();
                 return; /* ignore low-velocity phantoms / AT bleed */
             }
@@ -1075,7 +1081,7 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 5) Volume CC isolated — dump latches; engage on move (Ash dropouts). */
+    /* 5) Volume CC absolute from usable dump (Ash 0.3.8 MAIN pickup). */
     midi_selftest_reset();
     {
         const uint8_t seq[] = {0xb0, 19, 40, 0xb0, 19, 80, 0xb0, 16, 10};
@@ -1086,7 +1092,7 @@ int surface_midi_selftest(void)
             fails++;
         if (g_state.k1 != 10)
             fails++;
-        /* Dump=40; move to 80 engages and tracks */
+        /* Dump=40 (≥16) engages absolute; move to 80 tracks */
         if (!g_state.main_engaged || g_state.main_vol != 80)
             fails++;
     }
@@ -1098,12 +1104,25 @@ int surface_midi_selftest(void)
         midi_feed_buf(z, sizeof z);
         if (g_state.main_engaged)
             fails++;
-        if (g_state.main_vol != 127)
-            fails++; /* stay full until user moves */
-        /* Move from dump 0 → mid engages */
+        if (g_state.main_vol != 100)
+            fails++; /* safe audible until user moves */
+        /* Move from dump 0 → mid engages absolute */
         const uint8_t up[] = {0xb0, 19, 64};
         midi_feed_buf(up, sizeof up);
         if (!g_state.main_engaged || g_state.main_vol != 64)
+            fails++;
+    }
+
+    /* 5e) Dump at halfway is already engaged at half — turning up raises. */
+    midi_selftest_reset();
+    {
+        const uint8_t dump[] = {0xb0, 19, 64};
+        midi_feed_buf(dump, sizeof dump);
+        if (!g_state.main_engaged || g_state.main_vol != 64)
+            fails++;
+        const uint8_t up[] = {0xb0, 19, 100};
+        midi_feed_buf(up, sizeof up);
+        if (g_state.main_vol != 100)
             fails++;
     }
 

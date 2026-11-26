@@ -11,6 +11,7 @@
 #include "epicycle.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -120,10 +121,14 @@ const char *epicycle_page_name(EpicycleModePage page)
     switch (page) {
     case EPICYCLE_PAGE_TOMBOLA:
         return "TOMBOLA";
+    case EPICYCLE_PAGE_SAMPLE:
+        return "SAMPLE";
     case EPICYCLE_PAGE_TRIM:
         return "TRIM";
     case EPICYCLE_PAGE_MIX:
         return "MIX";
+    case EPICYCLE_PAGE_FX:
+        return "FX";
     case EPICYCLE_PAGE_AMP:
         return "AMP";
     case EPICYCLE_PAGE_TUNE:
@@ -548,6 +553,22 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->kit_level = 1.0f;
     eng->fx_bus_rev = 0.0f;
     eng->fx_bus_del = 0.0f;
+    eng->fx_delay_time = 0.55f; /* ~280 ms default */
+    eng->fx_delay_fb = 0.38f;
+    eng->fx_rev_decay = 0.62f;
+    eng->fx_rev_damp = 0.35f;
+    eng->fx_wet = 0.70f;
+    eng->freeze_playing = 0;
+    eng->freeze_request = 0;
+    eng->freeze_seconds = 3.0f;
+    eng->freeze_phase = 0.0f;
+    memset(&eng->freeze_sample, 0, sizeof eng->freeze_sample);
+    memset(&eng->preview_sample, 0, sizeof eng->preview_sample);
+    eng->preview_playing = 0;
+    eng->preview_gate = 0;
+    eng->preview_phase = 0.0f;
+    eng->preview_env = 0.0f;
+    eng->preview_env_stage = 0;
     eng->mode_page = EPICYCLE_PAGE_TOMBOLA;
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
@@ -565,6 +586,10 @@ void engine_shutdown(EpicycleEngine *eng)
         free(eng->bank);
         eng->bank = NULL;
     }
+    sample_free(&eng->freeze_sample);
+    eng->freeze_playing = 0;
+    sample_free(&eng->preview_sample);
+    eng->preview_playing = 0;
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++)
         eng->pads[i].sample = NULL;
 }
@@ -1087,6 +1112,16 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
             p->send_del = t3 * 0.55f;
         }
         break;
+    case EPICYCLE_PAGE_FX:
+        /* Global FX editor: K1 delay time, K2 delay FB, K3 reverb decay.
+         * SHIFT overlays handled in main (damp / wet / freeze len). */
+        if (mask & 1u)
+            eng->fx_delay_time = t1;
+        if (mask & 2u)
+            eng->fx_delay_fb = t2;
+        if (mask & 4u)
+            eng->fx_rev_decay = t3;
+        break;
     case EPICYCLE_PAGE_AMP:
         /* K1 A · K2 D · K3 S; SHIFT: K1 R · K2 vel (handled in main for shift). */
         if (mask & 1u)
@@ -1189,17 +1224,16 @@ void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19)
 {
     if (!eng)
         return;
-    /* CC19 → target only. Render smooths toward it so level restores without
-     * clicks; never touches voices / windows / MIDI. */
+    /* Absolute CC19 → gain. Mild x^1.25 curve keeps top-end travel audible
+     * (Ash: halfway must not already feel “full”). Never touches voices. */
     float t = (float)cc19 / 127.0f;
-    eng->main_sq_target = t * t;
-    if (cc19 == 0)
-        eng->main_sq_target = 0.0f;
-    /* Snap to silence immediately when knob hits 0. */
     if (cc19 == 0) {
+        eng->main_sq_target = 0.0f;
         eng->main_sq = 0.0f;
         recompute_master(eng);
+        return;
     }
+    eng->main_sq_target = powf(t, 1.25f);
 }
 
 void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20)
@@ -1308,14 +1342,23 @@ static float g_fx_comb_buf_l[4][1373];
 static float g_fx_comb_buf_r[4][1373];
 static const int FX_COMB_LEN[4] = {1117, 1187, 1279, 1351};
 
-static void fx_process(float in_l, float in_r, float send_rev, float send_del, float *wet_l,
-                       float *wet_r, unsigned sr)
+/* Freeze capture ring: last 5 s stereo @ 44.1k (~1.7 MB). */
+enum { FRZ_MAX_FRAMES = 44100 * 5 };
+static float g_frz_l[FRZ_MAX_FRAMES];
+static float g_frz_r[FRZ_MAX_FRAMES];
+static int g_frz_w;
+static int g_frz_filled;
+
+static void fx_process(EpicycleEngine *eng, float in_l, float in_r, float send_rev,
+                       float send_del, float *wet_l, float *wet_r)
 {
-    (void)sr;
     float dl = 0.0f, dr = 0.0f;
-    /* Tempo-ish fixed delay (~280 ms) with feedback. */
+    float time01 = eng ? clampf(eng->fx_delay_time, 0.0f, 1.0f) : 0.55f;
+    float fb_amt = eng ? clampf(eng->fx_delay_fb, 0.0f, 1.0f) : 0.38f;
+    float rev_dec = eng ? clampf(eng->fx_rev_decay, 0.0f, 1.0f) : 0.62f;
+    float rev_damp = eng ? clampf(eng->fx_rev_damp, 0.0f, 1.0f) : 0.35f;
     {
-        int dlen = FX_DELAY_MAX * 280 / 500;
+        int dlen = 64 + (int)(time01 * (float)(FX_DELAY_MAX - 128));
         if (dlen < 64)
             dlen = 64;
         if (dlen >= FX_DELAY_MAX)
@@ -1325,7 +1368,7 @@ static void fx_process(float in_l, float in_r, float send_rev, float send_del, f
             ri += FX_DELAY_MAX;
         dl = g_fx_delay_l[ri];
         dr = g_fx_delay_r[ri];
-        float fb = 0.38f;
+        float fb = 0.05f + fb_amt * 0.82f;
         g_fx_delay_l[g_fx_delay_w] = in_l * send_del + dl * fb;
         g_fx_delay_r[g_fx_delay_w] = in_r * send_del + dr * fb;
         g_fx_delay_w++;
@@ -1341,9 +1384,10 @@ static void fx_process(float in_l, float in_r, float send_rev, float send_del, f
         int i = g_fx_comb_i[c];
         float y_l = g_fx_comb_buf_l[c][i];
         float y_r = g_fx_comb_buf_r[c][i];
-        float fb = 0.72f - 0.04f * (float)c;
-        g_fx_comb_buf_l[c][i] = rin_l + y_l * fb;
-        g_fx_comb_buf_r[c][i] = rin_r + y_r * fb;
+        float fb = (0.55f + rev_dec * 0.38f) - 0.04f * (float)c;
+        float damp = 1.0f - rev_damp * 0.55f;
+        g_fx_comb_buf_l[c][i] = (rin_l + y_l * fb) * damp;
+        g_fx_comb_buf_r[c][i] = (rin_r + y_r * fb) * damp;
         i++;
         if (i >= len)
             i = 0;
@@ -1353,7 +1397,6 @@ static void fx_process(float in_l, float in_r, float send_rev, float send_del, f
     }
     rl *= 0.25f;
     rr *= 0.25f;
-    /* One allpass for denser tail. */
     {
         float g = 0.5f;
         float yl = -g * rl + g_fx_ap_l;
@@ -1365,6 +1408,107 @@ static void fx_process(float in_l, float in_r, float send_rev, float send_del, f
     }
     *wet_l = dl * 0.85f + rl * 0.95f;
     *wet_r = dr * 0.85f + rr * 0.95f;
+}
+
+static void freeze_ring_write(float l, float r)
+{
+    g_frz_l[g_frz_w] = l;
+    g_frz_r[g_frz_w] = r;
+    g_frz_w++;
+    if (g_frz_w >= FRZ_MAX_FRAMES)
+        g_frz_w = 0;
+    if (g_frz_filled < FRZ_MAX_FRAMES)
+        g_frz_filled++;
+}
+
+static void freeze_capture_now(EpicycleEngine *eng)
+{
+    if (!eng)
+        return;
+    float sec = clampf(eng->freeze_seconds, 2.0f, 5.0f);
+    int want = (int)(sec * (float)eng->sample_rate + 0.5f);
+    if (want < 1)
+        want = 1;
+    if (want > FRZ_MAX_FRAMES)
+        want = FRZ_MAX_FRAMES;
+    if (want > g_frz_filled)
+        want = g_frz_filled > 0 ? g_frz_filled : 1;
+    sample_free(&eng->freeze_sample);
+    eng->freeze_sample.data = calloc((size_t)want * 2u, sizeof(float));
+    if (!eng->freeze_sample.data) {
+        eng->freeze_playing = 0;
+        return;
+    }
+    eng->freeze_sample.frames = (size_t)want;
+    eng->freeze_sample.rate = eng->sample_rate;
+    eng->freeze_sample.channels = 2;
+    snprintf(eng->freeze_sample.name, sizeof eng->freeze_sample.name, "freeze");
+    int ri = g_frz_w - want;
+    if (ri < 0)
+        ri += FRZ_MAX_FRAMES;
+    for (int i = 0; i < want; i++) {
+        eng->freeze_sample.data[i * 2] = g_frz_l[ri];
+        eng->freeze_sample.data[i * 2 + 1] = g_frz_r[ri];
+        ri++;
+        if (ri >= FRZ_MAX_FRAMES)
+            ri = 0;
+    }
+    eng->freeze_phase = 0.0f;
+    eng->freeze_playing = 1;
+}
+
+void engine_set_freeze_seconds(EpicycleEngine *eng, float seconds)
+{
+    if (!eng)
+        return;
+    eng->freeze_seconds = clampf(seconds, 2.0f, 5.0f);
+}
+
+int engine_freeze_active(const EpicycleEngine *eng)
+{
+    return eng && eng->freeze_playing && eng->freeze_sample.data ? 1 : 0;
+}
+
+void engine_freeze_toggle(EpicycleEngine *eng)
+{
+    if (!eng)
+        return;
+    if (eng->freeze_playing) {
+        eng->freeze_playing = 0;
+        eng->freeze_request = 0;
+        return;
+    }
+    /* Capture on audio thread so ring index is consistent. */
+    eng->freeze_request = 1;
+}
+
+void engine_preview_stop(EpicycleEngine *eng)
+{
+    if (!eng)
+        return;
+    if (eng->preview_playing && eng->preview_env_stage < 2) {
+        eng->preview_gate = 0;
+        eng->preview_env_stage = 2; /* release */
+    } else if (!eng->preview_playing) {
+        eng->preview_gate = 0;
+    }
+}
+
+int engine_preview_wav(EpicycleEngine *eng, const char *path, int hold)
+{
+    if (!eng || !path || !path[0])
+        return -1;
+    EpicycleSample tmp;
+    if (sample_load_wav(&tmp, path) != 0)
+        return -1;
+    sample_free(&eng->preview_sample);
+    eng->preview_sample = tmp;
+    eng->preview_phase = 0.0f;
+    eng->preview_env = 0.0f;
+    eng->preview_env_stage = 0;
+    eng->preview_gate = hold ? 1 : 0;
+    eng->preview_playing = 1;
+    return 0;
 }
 
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames)
@@ -1554,17 +1698,75 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             float inv = 1.0f / (float)send_n;
             float sr = clampf(send_rev_acc * inv, 0.0f, 1.0f);
             float sd = clampf(send_del_acc * inv, 0.0f, 1.0f);
-            fx_process(sndL, sndR, sr, sd, &wetL, &wetR, eng->sample_rate);
+            fx_process(eng, sndL, sndR, sr, sd, &wetL, &wetR);
         } else {
             /* Keep delay line ticking so tails decay when voices stop. */
-            fx_process(0.0f, 0.0f, 0.0f, 0.0f, &wetL, &wetR, eng->sample_rate);
+            fx_process(eng, 0.0f, 0.0f, 0.0f, 0.0f, &wetL, &wetR);
         }
+        float wet = clampf(eng->fx_wet, 0.0f, 1.0f);
         float mg = eng->master_gain;
-        mixL = (mixL + wetL * 0.70f) * mg;
-        mixR = (mixR + wetR * 0.70f) * mg;
-        /* Soft clip to S32 */
-        mixL = tanhf(mixL * 0.8f);
-        mixR = tanhf(mixR * 0.8f);
+        mixL = (mixL + wetL * wet) * mg;
+        mixR = (mixR + wetR * wet) * mg;
+
+        /* Freeze loop voice (captured heard triggers). */
+        if (eng->freeze_playing && eng->freeze_sample.data && eng->freeze_sample.frames > 1) {
+            size_t ff = eng->freeze_sample.frames;
+            size_t i0 = (size_t)eng->freeze_phase % ff;
+            mixL += eng->freeze_sample.data[i0 * 2] * 0.85f * mg;
+            mixR += eng->freeze_sample.data[i0 * 2 + 1] * 0.85f * mg;
+            eng->freeze_phase += 1.0f;
+            if (eng->freeze_phase >= (float)ff)
+                eng->freeze_phase -= (float)ff;
+        }
+
+        /* Ring = performance only (no browser audition). */
+        freeze_ring_write(mixL, mixR);
+        if (eng->freeze_request) {
+            eng->freeze_request = 0;
+            freeze_capture_now(eng);
+        }
+
+        /* Browser audition — hear WAV before assign (not frozen). */
+        if (eng->preview_playing && eng->preview_sample.data &&
+            eng->preview_sample.frames > 1) {
+            size_t pf = eng->preview_sample.frames;
+            float atk = 1.0f / (0.004f * (float)eng->sample_rate + 1.0f);
+            float rel = 1.0f / (0.040f * (float)eng->sample_rate + 1.0f);
+            if (eng->preview_env_stage == 0) {
+                eng->preview_env += atk;
+                if (eng->preview_env >= 1.0f) {
+                    eng->preview_env = 1.0f;
+                    eng->preview_env_stage = eng->preview_gate ? 1 : 1;
+                }
+            } else if (eng->preview_env_stage == 1) {
+                if (!eng->preview_gate &&
+                    eng->preview_phase >= (float)pf - 1.0f) {
+                    eng->preview_env_stage = 2;
+                }
+            } else {
+                eng->preview_env -= rel;
+                if (eng->preview_env <= 0.0f) {
+                    eng->preview_env = 0.0f;
+                    eng->preview_playing = 0;
+                }
+            }
+            if (eng->preview_playing) {
+                size_t i0 = (size_t)eng->preview_phase;
+                if (i0 >= pf)
+                    i0 = pf - 1;
+                float g = eng->preview_env * 0.90f * mg;
+                mixL += eng->preview_sample.data[i0 * 2] * g;
+                mixR += eng->preview_sample.data[i0 * 2 + 1] * g;
+                if (eng->preview_phase < (float)pf - 1.0f)
+                    eng->preview_phase += 1.0f;
+                else if (!eng->preview_gate && eng->preview_env_stage < 2)
+                    eng->preview_env_stage = 2;
+            }
+        }
+
+        /* Soft clip to S32 — mild so MAIN travel stays audible. */
+        mixL = tanhf(mixL * 0.72f);
+        mixR = tanhf(mixR * 0.72f);
         out_l[n] = (int32_t)(mixL * 2147483647.0f * 0.5f);
         out_r[n] = (int32_t)(mixR * 2147483647.0f * 0.5f);
     }

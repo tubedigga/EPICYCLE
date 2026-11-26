@@ -1,10 +1,14 @@
 EPICYCLE samples
 ================
-Copy WAV files to Epicycle/samples/ on the card:
+Drop any PCM WAV into Epicycle/samples/ on the card — any filename.
 
-  pad01.wav … pad16.wav
-  (or 1.wav … 16.wav)
+No rename / pad01.wav indexing required. On the SAMPLE page, browse by
+filename and assign any file to any pad (encoder push). SAMPLE+pad
+selects the target pad.
+
+Optional convenience at boot only: if pad01.wav…pad16.wav (or 1.wav…16.wav)
+exist, those are auto-mapped once. Everything else is free-named and
+picked live in the browser.
 
 PCM WAV only (16/24/32-bit or float). Mono or stereo.
-If no files are found, EPICYCLE uses a built-in demo tone bank so you can
-still hear synced 4-beat loops and 3-vs-5 polymeter on pads 1–4.
+If the folder is empty, EPICYCLE uses a built-in demo tone bank.

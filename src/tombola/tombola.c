@@ -3,7 +3,7 @@
  * Soft 2D tombola: morphing N-gon / circle drum, coloured balls, wall-hit
  * triggers. Fader=shape morph ONLY; K1=bipolar spin; MUTE+pad toggles balls.
  * Balls are hard-contained (no orbit outside walls). Empty start — rest at
- * bottom until spin lifts. HitMod slots empty/off. Freeze = phase 2.
+ * bottom until spin lifts. HitMod slots empty/off. Freeze is engine-side.
  * Feel reference: OP-1 tombola (aleatoric bounce→trig) — not a clone.
  */
 #include "epicycle.h"
@@ -38,10 +38,11 @@ static uint8_t g_wall_touch[EPICYCLE_PAD_COUNT];
 static int8_t g_wall_face[EPICYCLE_PAD_COUNT];
 
 /* Distinct pad colours (0x00RRGGBB). */
+/* Cool / muted pad colours — no toy yellow (Ash 0.3.8 palette). */
 static const uint32_t BALL_RGB[EPICYCLE_PAD_COUNT] = {
-    0x00E85A4Fu, 0x00F0A030u, 0x00E8D040u, 0x0068C070u, 0x0040C8A0u, 0x0040A8E0u,
-    0x005070E8u, 0x009050E0u, 0x00D050C0u, 0x00E06090u, 0x00C07050u, 0x00A09060u,
-    0x0070A080u, 0x006090A0u, 0x00B0B0B0u, 0x00E0E0D0u,
+    0x00D45A52u, 0x00C87848u, 0x00A89058u, 0x0048A070u, 0x0038B098u, 0x003898C0u,
+    0x004878D0u, 0x007858C0u, 0x00B050A8u, 0x00C06088u, 0x00A87058u, 0x00888870u,
+    0x00589888u, 0x00508098u, 0x0090A0A8u, 0x00C8D0D4u,
 };
 
 static float clampf(float v, float lo, float hi)
@@ -249,6 +250,9 @@ void tombola_set_ball_count(EpicycleTombola *tb, int count)
         if (want && !tb->balls[i].active) {
             place_ball_rest(&tb->balls[i], i);
             tb->balls[i].active = 1;
+            g_wall_touch[i] = 1; /* resting — no settle phantom */
+            g_wall_face[i] = -1;
+            g_cooldown[i] = TB_HIT_COOLDOWN;
         } else if (!want && tb->balls[i].active) {
             tb->balls[i].active = 0;
             tb->balls[i].vx = 0;
@@ -285,10 +289,11 @@ void tombola_toggle_ball(EpicycleTombola *tb, int pad)
         g_wall_touch[pad] = 0;
         g_cooldown[pad] = 0.0f;
     } else {
-        /* Rest at bottom — spin lifts; no spontaneous bounce. */
+        /* Rest at bottom — mark already touching so settle is not a phantom hit. */
         place_ball_rest(&tb->balls[pad], pad);
-        g_wall_touch[pad] = 0;
-        g_cooldown[pad] = 0.0f;
+        g_wall_touch[pad] = 1;
+        g_wall_face[pad] = -1;
+        g_cooldown[pad] = TB_HIT_COOLDOWN;
     }
     tb->ball_target = tombola_active_count(tb);
 }
@@ -304,6 +309,11 @@ int tombola_ball_active(const EpicycleTombola *tb, int pad)
 
 static void push_hit(EpicycleTombola *tb, int pad, float vel, int face)
 {
+    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return;
+    /* Phantom guard: never fire for inactive / empty drum (Ash 0.3.8). */
+    if (!tb->balls[pad].active)
+        return;
     if (tb->hit_n >= TB_MAX_HITS)
         return;
     if (g_cooldown[pad] > 0.0f)
@@ -707,9 +717,11 @@ void tombola_world_to_screen(const EpicycleTombola *tb, float x, float y, int cx
                              int scale, int *sx, int *sy)
 {
     (void)tb;
-    float depth = 1.0f + y * 0.08f;
+    /* Near-isotropic projection — prior 0.72 Y crush looked squashed (Ash).
+     * Mild perspective only; keep morph silhouette correct in the frame. */
+    float depth = 1.0f + y * 0.05f;
     float px = x * depth;
-    float py = y * 0.72f * depth;
+    float py = y * 0.96f * depth;
     *sx = cx + (int)(px * (float)scale);
     *sy = cy - (int)(py * (float)scale);
 }
@@ -874,6 +886,17 @@ int tombola_selftest(void)
     tombola_set_ball_count(&tb, 0);
     if (tombola_active_count(&tb) != 0)
         return -6;
+    /* Empty drum must never emit hits (Ash phantom trigger). */
+    {
+        int ghost = 0;
+        tombola_set_spin_cc(&tb, 120);
+        for (int i = 0; i < 120; i++) {
+            tombola_step(&tb, 1.0f / 60.0f);
+            ghost += tb.hit_n;
+        }
+        if (ghost != 0)
+            return -22;
+    }
 
     return 0;
 }
