@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.7-trim-fx"
+#define EPICYCLE_VERSION "0.3.8-refine"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -60,8 +60,10 @@ typedef enum EpicycleModDest {
  */
 typedef enum EpicycleModePage {
     EPICYCLE_PAGE_TOMBOLA = 0,
+    EPICYCLE_PAGE_SAMPLE, /* live WAV assign from Epicycle/samples */
     EPICYCLE_PAGE_TRIM,
     EPICYCLE_PAGE_MIX,
+    EPICYCLE_PAGE_FX, /* delay / reverb parameter editor */
     EPICYCLE_PAGE_AMP,
     EPICYCLE_PAGE_TUNE,
     EPICYCLE_PAGE_FILTER,
@@ -70,6 +72,19 @@ typedef enum EpicycleModePage {
     EPICYCLE_PAGE_HITMOD,
     EPICYCLE_PAGE_COUNT
 } EpicycleModePage;
+
+#define EPICYCLE_BROWSER_MAX 96
+#define EPICYCLE_BROWSER_NAME 40
+
+/* Live sample browser — lists WAVs under Epicycle/samples (and optional dirs). */
+typedef struct EpicycleSampleBrowser {
+    char names[EPICYCLE_BROWSER_MAX][EPICYCLE_BROWSER_NAME];
+    char paths[EPICYCLE_BROWSER_MAX][512];
+    int count;
+    int cursor;          /* selected file 0..count-1 */
+    int last_pad;        /* last pad assigned 0..15, or -1 */
+    char status[48];     /* "loaded kick.wav" / "no wavs" / error */
+} EpicycleSampleBrowser;
 
 /* Physics mod sources (phase 1.5; IMPACT wired, others stub-selectable). */
 typedef enum EpicycleHitModSrc {
@@ -233,6 +248,25 @@ typedef struct EpicycleEngine {
     /* Global FX bus boosts from HitMod SEND_A/B (0..1) */
     float fx_bus_rev;
     float fx_bus_del;
+    /* FX editor params (global; Mix K3 still sets per-pad send amounts) */
+    float fx_delay_time; /* 0..1 → ~40..480 ms */
+    float fx_delay_fb;   /* 0..1 feedback */
+    float fx_rev_decay;  /* 0..1 reverb tail */
+    float fx_rev_damp;   /* 0..1 high damp (1 = darker) */
+    float fx_wet;        /* 0..1 master wet level */
+    /* Freeze: last ~2–5 s of heard mix → loop (encoder push on Tombola) */
+    int freeze_playing;     /* 1 = freeze loop audible */
+    int freeze_request;     /* 1 = capture ring → freeze sample (audio thread) */
+    float freeze_seconds;   /* capture length 2..5 */
+    float freeze_phase;     /* playback phase in freeze sample frames */
+    EpicycleSample freeze_sample; /* owned loop buffer */
+    /* Sample-browser audition (hear before assign — Ash 0.3.8) */
+    EpicycleSample preview_sample; /* owned; not tied to a pad */
+    int preview_playing;
+    int preview_gate;       /* 1 = hold-to-preview; 0 = one-shot play-through */
+    float preview_phase;
+    float preview_env;
+    int preview_env_stage;  /* 0=A 1=S 2=R */
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */
@@ -315,6 +349,18 @@ void surface_flash_pad(int pad /* 0..15 */);
 void sample_free(EpicycleSample *s);
 int sample_load_wav(EpicycleSample *out, const char *path);
 int sample_synth_demo(EpicycleSample *out, unsigned rate, float freq_hz, float seconds);
+/* Live browser: scan dirs for .wav, assign onto a pad without rebuilding the card. */
+void sample_browser_init(EpicycleSampleBrowser *b);
+int sample_browser_scan(EpicycleSampleBrowser *b, const char *dir);
+/* Scan Epicycle/samples (+ optional extra dir). Returns file count. */
+int sample_browser_rescan(EpicycleSampleBrowser *b, const EpicyclePaths *paths);
+void sample_browser_move(EpicycleSampleBrowser *b, int delta);
+/* Load cursor WAV into bank[pad] and assign to that pad. 0 = ok. */
+int sample_browser_assign(EpicycleSampleBrowser *b, EpicycleEngine *eng, int pad);
+/* Audition cursor WAV without assigning — play once, or hold (gate=1). */
+int sample_browser_preview(EpicycleSampleBrowser *b, EpicycleEngine *eng, int hold);
+void engine_preview_stop(EpicycleEngine *eng);
+int engine_preview_wav(EpicycleEngine *eng, const char *path, int hold);
 
 /* loop engine */
 void engine_init(EpicycleEngine *eng, unsigned sample_rate);
@@ -350,8 +396,12 @@ void engine_apply_page_knobs(EpicycleEngine *eng, int pad, EpicycleModePage page
 void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage page, uint8_t k1,
                                   uint8_t k2, uint8_t k3, unsigned mask);
 void engine_apply_knobs(EpicycleEngine *eng, int pad, uint8_t k1, uint8_t k2, uint8_t k3);
-void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* squared taper */
-void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* linear; 0 = silence */
+void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19); /* gentle curve; absolute */
+void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* morph only — gain forced 1 */
+/* Freeze last heard audio into a loop (2–5 s). Toggle off stops playback. */
+void engine_freeze_toggle(EpicycleEngine *eng);
+int engine_freeze_active(const EpicycleEngine *eng);
+void engine_set_freeze_seconds(EpicycleEngine *eng, float seconds); /* clamp 2..5 */
 void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on);
 void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad); /* free ↔ 1-beat sync */
 void engine_toggle_loop(EpicycleEngine *eng, int pad);     /* loop latch ↔ one-shot */
@@ -408,6 +458,7 @@ void ui_draw_splash(const char *status_line); /* logo letterboxed on black; stat
 /* Bottom strip prompt only (does not cover logo body). */
 void ui_draw_splash_prompt(const char *prompt_line);
 void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
-                  const EpicycleSurfaceState *surf, const EpicycleTombola *tb);
+                  const EpicycleSurfaceState *surf, const EpicycleTombola *tb,
+                  const EpicycleSampleBrowser *browser);
 
 #endif /* EPICYCLE_H */

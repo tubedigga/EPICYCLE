@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  *
  * UI: Tombola primary (2D projected drum) + Sample-Mode edit pages + Hit Mod
- * multi-slot matrix (impact → vol/pitch/cut/sends). Freeze capture is phase 2.
+ * multi-slot matrix + FX editor + live SAMPLE browser + freeze status.
  */
 #include "epicycle.h"
 
@@ -147,20 +147,22 @@ static void draw_text(uint32_t *px, int x, int y, const char *s, uint32_t fg, in
 }
 
 enum {
-    COL_BG = 0x0014100Cu,
-    COL_FG = 0x00F0E6D8u,
-    COL_MUTED = 0x008A8074u,
-    COL_ACCENT = 0x002A6F8Cu,
-    COL_OK = 0x0048A060u,
-    COL_WAVE = 0x00385868u,
-    COL_WAVE_DIM = 0x00283038u,
-    COL_BRACE = 0x00E8A848u, /* Trim brace / UI accents (not tombola mesh) */
-    COL_BRACE_FILL = 0x00302818u,
-    COL_MESH = 0x00F4F4F0u, /* thin white wireframe for tombola walls */
-    COL_MOD = 0x0060B090u,
-    COL_PLAY = 0x00F0F0E8u,
-    COL_SOFT = 0x00C8B898u,
-    COL_PAGE = 0x00D0C0A0u,
+    /* Cool Sample-firmware palette — no toy yellow, no white spokes (Ash 0.3.8). */
+    COL_BG = 0x000E1418u,
+    COL_FG = 0x00E2E8ECu,
+    COL_MUTED = 0x007A8890u,
+    COL_ACCENT = 0x003A7A8Cu,
+    COL_OK = 0x0048A078u,
+    COL_WAVE = 0x00385058u,
+    COL_WAVE_DIM = 0x00202830u,
+    COL_BRACE = 0x00C8A060u, /* Trim brace only */
+    COL_BRACE_FILL = 0x00242820u,
+    COL_MESH = 0x0088A0A8u, /* cool silver wire — outlines only */
+    COL_MESH_DIM = 0x00485860u,
+    COL_MOD = 0x0058A898u,
+    COL_PLAY = 0x00E8F0F2u,
+    COL_SOFT = 0x00A8B4B8u,
+    COL_PAGE = 0x00B8C8CCu,
 };
 
 int ui_load_splash_logo(const char *path)
@@ -513,22 +515,22 @@ static void draw_line_thin(uint32_t *px, int x0, int y0, int x1, int y1, uint32_
 
 static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
 {
-    int cx = 160, cy = 116, scale = 92;
+    int cx = 160, cy = 114, scale = 88;
     if (!tb)
         return;
 
-    /* Soft ground ellipse (3D hint). */
-    for (int y = -(int)(scale * 0.55f); y <= (int)(scale * 0.6f); y++) {
+    /* Soft ground disc — cool charcoal, not yellow wash. */
+    for (int y = -(int)(scale * 0.52f); y <= (int)(scale * 0.55f); y++) {
         float ty = (float)y / (float)scale;
-        int half = (int)((1.0f - ty * ty * 0.85f) * (float)scale);
+        int half = (int)((1.0f - ty * ty * 0.88f) * (float)scale);
         if (half < 2)
             continue;
-        fill_rect(px, cx - half, cy + y, half * 2, 1, 0x00161612u);
+        fill_rect(px, cx - half, cy + y, half * 2, 1, 0x0012181Cu);
     }
 
     /*
-     * Thin white wireframe mesh — matches collider edges (Ash: drop washed yellow).
-     * N-gon: straight face segments. Circle: dense polyline.
+     * Clean silhouette only — outer edges, no spokes (Ash 0.3.8).
+     * Double-pass: dim underlay + bright edge for firmware-grade clarity.
      */
     {
         int faces = tb->face_count;
@@ -541,8 +543,10 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
                 float oy = sinf(a) * tb->radius;
                 int sx, sy;
                 tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
-                if (i > 0)
+                if (i > 0) {
+                    draw_line_thin(px, prevx, prevy, sx, sy, COL_MESH_DIM);
                     draw_line_thin(px, prevx, prevy, sx, sy, COL_MESH);
+                }
                 prevx = sx;
                 prevy = sy;
             }
@@ -554,15 +558,8 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
                 int sx0, sy0, sx1, sy1;
                 tombola_world_to_screen(tb, x0, y0, cx, cy, scale, &sx0, &sy0);
                 tombola_world_to_screen(tb, x1, y1, cx, cy, scale, &sx1, &sy1);
+                draw_line_thin(px, sx0, sy0, sx1, sy1, COL_MESH_DIM);
                 draw_line_thin(px, sx0, sy0, sx1, sy1, COL_MESH);
-                /* Light radial spoke for mesh depth (every other face). */
-                if ((e & 1) == 0) {
-                    float mx = 0.5f * (x0 + x1) * 0.55f;
-                    float my = 0.5f * (y0 + y1) * 0.55f;
-                    int smx, smy;
-                    tombola_world_to_screen(tb, mx, my, cx, cy, scale, &smx, &smy);
-                    draw_line_thin(px, cx, cy, smx, smy, shade_rgb(COL_MESH, 0.35f));
-                }
             }
         }
     }
@@ -571,27 +568,26 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         int sx, sy;
         uint32_t col = tombola_ball_color(i);
         if (!tb->balls[i].active) {
-            /* MUTE'd out: faint ring slot (not clustered on floor). */
             float ang = (float)i * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
             float ox = cosf(ang) * 0.72f;
             float oy = sinf(ang) * 0.72f;
             tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
-            stroke_disk(px, sx, sy, 5, shade_rgb(col, 0.30f));
+            stroke_disk(px, sx, sy, 5, shade_rgb(col, 0.28f));
             continue;
         }
         tombola_world_to_screen(tb, tb->balls[i].x, tb->balls[i].y, cx, cy, scale, &sx, &sy);
-        /* Hit flash = brighter same pad colour (matches LED). */
         if (tb->balls[i].hit_flash > 0.15f)
-            col = shade_rgb(col, 1.40f);
+            col = shade_rgb(col, 1.35f);
         int r = (i == sel) ? 8 : 6;
         fill_sphere(px, sx, sy, r, col);
         if (i == sel)
-            stroke_disk(px, sx, sy, r + 2, COL_MESH);
+            stroke_disk(px, sx, sy, r + 2, COL_MOD);
     }
 }
 
 void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
-                  const EpicycleSurfaceState *surf, const EpicycleTombola *tb)
+                  const EpicycleSurfaceState *surf, const EpicycleTombola *tb,
+                  const EpicycleSampleBrowser *browser)
 {
     uint32_t *px = display_pixels();
     display_clear(COL_BG);
@@ -624,6 +620,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         draw_text(px, 168, 28, "MUTE", COL_BRACE, 2);
     if (surf && surf->shift_held)
         draw_text(px, 140, 28, "SHIFT", COL_BRACE, 2);
+    if (eng && engine_freeze_active(eng))
+        draw_text(px, 250, 4, "FRZ", COL_MOD, 1);
     if (pad && pad->loop_enable)
         draw_text(px, 290, 4, "LOOP", COL_MOD, 1);
     else
@@ -647,11 +645,53 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         {
             int faces = tb ? tb->face_count : 0;
             if (faces <= 0)
-                snprintf(line, sizeof line, "FADER CIRC  MAIN vol  K1 spin  K2 —");
+                snprintf(line, sizeof line, "FADER CIRC  MAIN  K1 spin  ENC=freeze");
             else
-                snprintf(line, sizeof line, "FADER %dF  MAIN vol  K1 spin  K2 —", faces);
+                snprintf(line, sizeof line, "FADER %dF  MAIN  K1 spin  ENC=freeze", faces);
             draw_text(px, 8, 226, line, COL_MUTED, 1);
         }
+    } else if (page == EPICYCLE_PAGE_SAMPLE) {
+        /* Live assign: any WAV by filename — no pad01.wav rename required. */
+        draw_text(px, 8, 48, "SAMPLE", COL_FG, 2);
+        draw_text(px, 120, 52, "any wav -> pad", COL_MUTED, 1);
+        if (pad && pad->sample && pad->sample->name[0]) {
+            snprintf(line, sizeof line, "now: %.36s", pad->sample->name);
+            draw_text(px, 8, 68, line, COL_MOD, 1);
+        } else {
+            draw_text(px, 8, 68, "now: (empty)", COL_MUTED, 1);
+        }
+        int count = browser ? browser->count : 0;
+        int cur = browser ? browser->cursor : 0;
+        if (count <= 0) {
+            draw_text(px, 8, 100, "drop WAVs in", COL_FG, 2);
+            draw_text(px, 8, 120, "Epicycle/samples/", COL_PAGE, 2);
+            draw_text(px, 8, 150, "any name — then ENC rescan", COL_MUTED, 1);
+        } else {
+            int visible = 7;
+            int top = cur - visible / 2;
+            if (top < 0)
+                top = 0;
+            if (top > count - visible)
+                top = count - visible;
+            if (top < 0)
+                top = 0;
+            int row_y = 86;
+            for (int i = 0; i < visible; i++) {
+                int idx = top + i;
+                if (idx >= count)
+                    break;
+                uint32_t fg = (idx == cur) ? COL_FG : COL_MUTED;
+                if (idx == cur)
+                    fill_rect(px, 4, row_y - 1, 312, 14, 0x00182024u);
+                snprintf(line, sizeof line, "%s", browser->names[idx]);
+                draw_text(px, 12, row_y, line, fg, 1);
+                row_y += 14;
+            }
+        }
+        if (browser && browser->status[0])
+            draw_text(px, 8, 200, browser->status, COL_OK, 1);
+        draw_text(px, 8, 214, "pad=preview (hold ok)  ENC=assign to PAD", COL_MUTED, 1);
+        draw_text(px, 8, 226, "SAMPLE+pad=target  SHIFT+ENC=rescan", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_HITMOD) {
         draw_text(px, 8, 48, "HIT MOD", COL_FG, 2);
         draw_text(px, 120, 52, "src->dest matrix", COL_MUTED, 1);
@@ -789,6 +829,25 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             draw_text(px, 8, 160, line, COL_MUTED, 1);
         }
         draw_text(px, 8, 218, "K1 vol  K2 pan  K3 FX send  SHIFT+K3 kit", COL_MUTED, 1);
+    } else if (page == EPICYCLE_PAGE_FX) {
+        draw_text(px, 8, 52, "FX", COL_FG, 4);
+        int shift = surf && surf->shift_held;
+        if (shift) {
+            snprintf(v1, sizeof v1, "%d", eng ? (int)(eng->fx_rev_damp * 100.0f) : 0);
+            snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->fx_wet * 100.0f) : 0);
+            snprintf(v3, sizeof v3, "%.1fs", eng ? (double)eng->freeze_seconds : 3.0);
+            draw_param_row(px, 100, "DAMP", v1, "WET", v2, "FRZ", v3);
+            draw_text(px, 8, 160, "SHIFT: reverb damp / master wet / freeze len", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 damp  K2 wet  K3 freeze 2-5s", COL_MUTED, 1);
+        } else {
+            int dms = eng ? (40 + (int)(eng->fx_delay_time * 440.0f)) : 280;
+            snprintf(v1, sizeof v1, "%dms", dms);
+            snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->fx_delay_fb * 100.0f) : 0);
+            snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->fx_rev_decay * 100.0f) : 0);
+            draw_param_row(px, 100, "DELAY", v1, "FB", v2, "REV", v3);
+            draw_text(px, 8, 160, "edit delay/reverb — Mix K3 is pad send", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 time  K2 feedback  K3 rev decay", COL_MUTED, 1);
+        }
     } else if (page == EPICYCLE_PAGE_AMP) {
         draw_text(px, 8, 52, "AMP ADSR", COL_FG, 3);
         int shift = surf && surf->shift_held;

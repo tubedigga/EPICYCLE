@@ -2,7 +2,7 @@
 # Cross-build: aarch64-linux-gnu-gcc (Debian/Ubuntu) or set CROSS=
 
 APP        := epicycle
-VERSION    := 0.3.7-trim-fx
+VERSION    := 0.3.8-refine
 BUILD      := build
 DIST       := dist
 
@@ -28,6 +28,7 @@ SRCS := \
 	src/engine/engine.c \
 	src/tombola/tombola.c \
 	src/sample/wav.c \
+	src/sample/browser.c \
 	src/ui/ui.c
 
 PNG_SRC := src/image/png.c
