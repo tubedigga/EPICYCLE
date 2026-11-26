@@ -397,7 +397,6 @@ static void put_px_soft(uint32_t *px, int x, int y, uint32_t c, float a)
     *dst = blend_rgb(*dst, c, a);
 }
 
-/* Bresenham line with soft 2px AA thickness (cleaner walls on 320×240). */
 static uint32_t shade_rgb(uint32_t c, float lit)
 {
     int r = (int)(((c >> 16) & 0xff) * lit);
@@ -418,53 +417,56 @@ static uint32_t shade_rgb(uint32_t c, float lit)
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
-/* Shaded sphere with soft edge — proper sqrt z, NW light, specular. */
+/* Firm shaded sphere — NW key light, cool fill, tight specular, soft AA rim. */
 static void fill_sphere(uint32_t *px, int cx, int cy, int r, uint32_t base)
 {
     if (r < 1)
         r = 1;
     float rf = (float)r;
     float inv_r = 1.0f / rf;
-    int r_outer = r + 1;
+    int r_outer = r + 2;
     for (int y = -r_outer; y <= r_outer; y++) {
         for (int x = -r_outer; x <= r_outer; x++) {
             float fx = (float)x + 0.5f;
             float fy = (float)y + 0.5f;
             float d = sqrtf(fx * fx + fy * fy);
-            if (d > rf + 1.0f)
+            if (d > rf + 1.25f)
                 continue;
             float edge_a = 1.0f;
-            if (d > rf - 0.6f)
-                edge_a = clampf_ui((rf + 0.4f - d) / 1.0f); /* soft rim */
+            if (d > rf - 0.85f)
+                edge_a = clampf_ui((rf + 0.85f - d) / 1.7f);
             if (edge_a <= 0.0f)
                 continue;
             float nx = fx * inv_r;
             float ny = fy * inv_r;
             float nz2 = 1.0f - nx * nx - ny * ny;
             float nz = nz2 > 0.0f ? sqrtf(nz2) : 0.0f;
-            /* Light from upper-left. */
-            float lit = 0.22f + 0.78f * (0.50f * (-nx) + 0.32f * (-ny) + 0.80f * nz);
-            if (lit < 0.10f)
-                lit = 0.10f;
-            /* Specular hotspot. */
-            float hx = -nx * 0.4f + 0.3f;
-            float hy = -ny * 0.4f + 0.45f;
-            float hz = nz - 0.75f;
+            /* Key (NW) + cool rim fill — Sample-firmware ball, not flat pixel. */
+            float ndot = 0.55f * (-nx) + 0.38f * (-ny) + 0.74f * nz;
+            float lit = 0.16f + 0.72f * clampf_ui(ndot) + 0.14f * clampf_ui(nz);
+            /* Specular lobe. */
+            float hx = -nx * 0.35f + 0.28f;
+            float hy = -ny * 0.35f + 0.42f;
+            float hz = nz + 0.55f;
             float hn = sqrtf(hx * hx + hy * hy + hz * hz);
             if (hn > 1e-4f) {
                 hx /= hn;
                 hy /= hn;
                 hz /= hn;
             }
-            float spec = hx * 0.35f + hy * 0.4f + hz * 0.85f;
+            float spec = hx * 0.32f + hy * 0.38f + hz * 0.86f;
             if (spec > 0.0f) {
                 float s2 = spec * spec;
-                lit += s2 * s2 * 0.55f;
+                lit += s2 * s2 * s2 * 0.72f;
             }
-            if (lit > 1.45f)
-                lit = 1.45f;
+            /* Slight contact shadow under ball. */
+            lit *= 0.92f + 0.08f * clampf_ui(0.55f - ny);
+            if (lit < 0.08f)
+                lit = 0.08f;
+            if (lit > 1.55f)
+                lit = 1.55f;
             uint32_t col = shade_rgb(base, lit);
-            if (edge_a >= 0.95f)
+            if (edge_a >= 0.92f)
                 put_px(px, cx + x, cy + y, col);
             else
                 put_px_soft(px, cx + x, cy + y, col, edge_a);
@@ -478,65 +480,105 @@ static void stroke_disk(uint32_t *px, int cx, int cy, int r, uint32_t c)
     if (r < 2)
         return;
     float rf = (float)r;
-    for (int y = -r - 1; y <= r + 1; y++) {
-        for (int x = -r - 1; x <= r + 1; x++) {
+    float half = 1.35f;
+    for (int y = -r - 2; y <= r + 2; y++) {
+        for (int x = -r - 2; x <= r + 2; x++) {
             float d = sqrtf((float)(x * x + y * y));
-            float a = 1.0f - fabsf(d - rf);
+            float a = 1.0f - fabsf(d - rf) / half;
             if (a <= 0.0f)
                 continue;
             if (a > 1.0f)
                 a = 1.0f;
-            put_px_soft(px, cx + x, cy + y, c, a * 0.85f);
+            put_px_soft(px, cx + x, cy + y, c, a * 0.90f);
         }
     }
 }
 
-/* Thin single-pixel polyline (no washed soft halo). */
-static void draw_line_thin(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
+/* Thick anti-aliased stroke (distance-to-segment) — intentional firmware line. */
+static void draw_line_aa(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c, float half_w)
 {
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        put_px(px, x0, y0, c);
-        if (x0 == x1 && y0 == y1)
-            break;
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
+    float fx0 = (float)x0, fy0 = (float)y0, fx1 = (float)x1, fy1 = (float)y1;
+    float dx = fx1 - fx0, dy = fy1 - fy0;
+    float len2 = dx * dx + dy * dy;
+    float len = sqrtf(len2);
+    if (len < 0.5f) {
+        put_px_soft(px, x0, y0, c, 1.0f);
+        return;
+    }
+    float inv_len = 1.0f / len;
+    float px_n = -dy * inv_len, py_n = dx * inv_len;
+    int pad = (int)(half_w + 2.0f);
+    int minx = (x0 < x1 ? x0 : x1) - pad;
+    int maxx = (x0 > x1 ? x0 : x1) + pad;
+    int miny = (y0 < y1 ? y0 : y1) - pad;
+    int maxy = (y0 > y1 ? y0 : y1) + pad;
+    if (minx < 0)
+        minx = 0;
+    if (miny < 0)
+        miny = 0;
+    if (maxx >= EPICYCLE_FB_W)
+        maxx = EPICYCLE_FB_W - 1;
+    if (maxy >= EPICYCLE_FB_H)
+        maxy = EPICYCLE_FB_H - 1;
+    for (int y = miny; y <= maxy; y++) {
+        for (int x = minx; x <= maxx; x++) {
+            float qx = (float)x + 0.5f - fx0;
+            float qy = (float)y + 0.5f - fy0;
+            float t = (qx * dx + qy * dy) * (len2 > 1e-6f ? 1.0f / len2 : 0.0f);
+            if (t < 0.0f)
+                t = 0.0f;
+            if (t > 1.0f)
+                t = 1.0f;
+            float cx = fx0 + dx * t;
+            float cy = fy0 + dy * t;
+            float ddx = (float)x + 0.5f - cx;
+            float ddy = (float)y + 0.5f - cy;
+            float dist = sqrtf(ddx * ddx + ddy * ddy);
+            /* Slight round caps via endpoint distance already covered by clamp t. */
+            float a = 1.0f - (dist - (half_w - 0.55f));
+            if (a <= 0.0f)
+                continue;
+            if (a > 1.0f)
+                a = 1.0f;
+            /* Mild bias along normal for cleaner silhouette. */
+            float along = fabsf(qx * px_n + qy * py_n);
+            (void)along;
+            put_px_soft(px, x, y, c, a);
         }
     }
 }
 
 static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
 {
-    int cx = 160, cy = 114, scale = 88;
+    /* Shrink so full drum sits under “TOMBOLA” title with margin (Ash 0.3.11).
+     * Title ~y28–42; param row ~y188 — keep silhouette inside ~48..178. */
+    int cx = 160, cy = 118, scale = 66;
     if (!tb)
         return;
 
-    /* Soft ground disc — cool charcoal, not yellow wash. */
-    for (int y = -(int)(scale * 0.52f); y <= (int)(scale * 0.55f); y++) {
+    /* Soft elliptical ground — cool charcoal depth, not yellow wash. */
+    for (int y = -(int)(scale * 0.58f); y <= (int)(scale * 0.62f); y++) {
         float ty = (float)y / (float)scale;
-        int half = (int)((1.0f - ty * ty * 0.88f) * (float)scale);
+        float fall = 1.0f - ty * ty * 0.92f;
+        if (fall < 0.05f)
+            continue;
+        int half = (int)(fall * (float)scale * 0.98f);
         if (half < 2)
             continue;
-        fill_rect(px, cx - half, cy + y, half * 2, 1, 0x0012181Cu);
+        float shade = 0.55f + 0.45f * fall;
+        uint32_t gcol = shade_rgb(0x0010181Eu, shade);
+        fill_rect(px, cx - half, cy + y, half * 2, 1, gcol);
     }
 
     /*
-     * Clean silhouette only — outer edges, no spokes (Ash 0.3.8).
-     * Double-pass: dim underlay + bright edge for firmware-grade clarity.
+     * Clean silhouette only — outer edges, no spokes (Ash prefs).
+     * Thick AA stroke + dim underlay = professional Sample-firmware wire.
      */
     {
         int faces = tb->face_count;
         if (faces <= 0) {
             int prevx = 0, prevy = 0;
-            const int segs = 96;
+            const int segs = 128;
             for (int i = 0; i <= segs; i++) {
                 float a = (float)i / (float)segs * (float)(2.0 * M_PI) + tb->spin_rad;
                 float ox = cosf(a) * tb->radius;
@@ -544,8 +586,8 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
                 int sx, sy;
                 tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
                 if (i > 0) {
-                    draw_line_thin(px, prevx, prevy, sx, sy, COL_MESH_DIM);
-                    draw_line_thin(px, prevx, prevy, sx, sy, COL_MESH);
+                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH_DIM, 2.15f);
+                    draw_line_aa(px, prevx, prevy, sx, sy, COL_MESH, 1.35f);
                 }
                 prevx = sx;
                 prevy = sy;
@@ -558,8 +600,8 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
                 int sx0, sy0, sx1, sy1;
                 tombola_world_to_screen(tb, x0, y0, cx, cy, scale, &sx0, &sy0);
                 tombola_world_to_screen(tb, x1, y1, cx, cy, scale, &sx1, &sy1);
-                draw_line_thin(px, sx0, sy0, sx1, sy1, COL_MESH_DIM);
-                draw_line_thin(px, sx0, sy0, sx1, sy1, COL_MESH);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH_DIM, 2.25f);
+                draw_line_aa(px, sx0, sy0, sx1, sy1, COL_MESH, 1.40f);
             }
         }
     }
@@ -569,16 +611,16 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         uint32_t col = tombola_ball_color(i);
         if (!tb->balls[i].active) {
             float ang = (float)i * (float)(2.0 * M_PI / EPICYCLE_PAD_COUNT);
-            float ox = cosf(ang) * 0.72f;
-            float oy = sinf(ang) * 0.72f;
+            float ox = cosf(ang) * 0.70f;
+            float oy = sinf(ang) * 0.70f;
             tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
-            stroke_disk(px, sx, sy, 5, shade_rgb(col, 0.28f));
+            stroke_disk(px, sx, sy, 4, shade_rgb(col, 0.32f));
             continue;
         }
         tombola_world_to_screen(tb, tb->balls[i].x, tb->balls[i].y, cx, cy, scale, &sx, &sy);
         if (tb->balls[i].hit_flash > 0.15f)
-            col = shade_rgb(col, 1.35f);
-        int r = (i == sel) ? 8 : 6;
+            col = shade_rgb(col, 1.38f);
+        int r = (i == sel) ? 7 : 5;
         fill_sphere(px, sx, sy, r, col);
         if (i == sel)
             stroke_disk(px, sx, sy, r + 2, COL_MOD);

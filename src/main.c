@@ -4,6 +4,7 @@
  * SAMPLE+pad select; MUTE+pad toggle ball; SEQ → Tombola; PAD FX → Hit Mod;
  * B1/B2 cycle Tombola / Trim / Mix / Delay / Reverb / …; B3 quit.
  * 0.3.10: SAMPLE browse/preview crash harden (cap, UAF retire, soft fail).
+ * 0.3.11: MAIN absolute latch + hard mute; LFO POS-only default; shrink + AA gfx.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -1146,11 +1147,8 @@ int main(int argc, char **argv)
     g_quit_guard_ticks = 45; /* ~0.7s after splash before B3 quit armed */
 
     surface_poll();
-    /* MAIN absolute: usable dump = hardware level; near-zero dump stays safe. */
-    if (surface_state()->main_engaged)
-        engine_set_master_gain_cc(&eng, surface_state()->main_vol);
-    else
-        engine_set_master_gain_cc(&eng, surface_state()->main_vol); /* 100 safe default */
+    /* MAIN absolute from dump: physical pot = software level (floor = mute). */
+    engine_set_master_gain_cc(&eng, surface_state()->main_vol);
     last_main = surface_state()->main_vol;
     last_fader = surface_state()->fader;
     last_shift = surface_state()->shift_held;

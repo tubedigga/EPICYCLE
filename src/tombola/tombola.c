@@ -157,6 +157,9 @@ void tombola_eval_hitmod(EpicycleTombola *tb, float impact, float *pitch_mul, fl
         const EpicycleHitModRoute *r = &tb->hitmods[i];
         if (!r->enabled || r->dest == EPICYCLE_HITMOD_NONE)
             continue;
+        /* Amount off = no pitch/filt/level (Ash: matrix amount 0 must be silent). */
+        if (r->amount <= 1e-4f)
+            continue;
         /* Resolve source value (IMPACT wired; ANGLE/HARDNESS stubbed from shape). */
         float src_v = imp;
         if (r->src == EPICYCLE_HITMOD_SRC_ANGLE)

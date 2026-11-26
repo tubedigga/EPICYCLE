@@ -428,34 +428,26 @@ static int confirm_drop(uint8_t *pending, int *pending_n, uint8_t v, int need)
 
 static void apply_main_vol_cc(uint8_t v)
 {
-    /* CC19 → gain only. Absolute hardware map once engaged (Ash 0.3.8):
-     * dump of near-zero stays ignored (no wrongful mute); usable dump is
-     * adopted as the live level so pot-at-halfway is not “already full”.
-     * First move ≥3 from dump engages absolute tracking — turning up raises. */
+    /* CC19 → gain only. Absolute from first dump (Ash 0.3.11):
+     * physical pot position = software level from boot — including floor.
+     * Near-zero dump used to force “safe full” and left MAIN down sounding
+     * loud; that is gone. Floor (≤2) is true mute; large MIDI plunges still
+     * need a matching confirm so a single glitch cannot hard-kill the mix. */
     if (!g_state.main_seen) {
         g_state.main_seen = 1;
         g_state.main_dump = v;
+        g_state.main_vol = v;
+        g_state.main_stable = v;
+        g_state.main_engaged = 1;
         g_main_pending_n = 0;
-        if (v >= 16) {
-            /* Absolute from dump: physical position = software level. */
-            g_state.main_vol = v;
-            g_state.main_stable = v;
-            g_state.main_engaged = 1;
-        } else {
-            /* Near-zero dump: keep audible until user moves pot. */
-            g_state.main_vol = 100;
-            g_state.main_stable = 100;
-            g_state.main_engaged = 0;
-        }
         return;
     }
     if (!g_state.main_engaged) {
+        /* Legacy path: any real move engages absolute tracking. */
         int d = (int)v - (int)g_state.main_dump;
         if (d < 0)
             d = -d;
-        if (d < 3)
-            return;
-        if (v < 8)
+        if (d < 2)
             return;
         g_state.main_engaged = 1;
         g_state.main_vol = v;
@@ -463,9 +455,16 @@ static void apply_main_vol_cc(uint8_t v)
         g_main_pending_n = 0;
         return;
     }
-    /* Absolute track. Confirm large drops + zero (glitch mute). Ups apply. */
+    /* Absolute track. Floor applies immediately (true mute). Large mid-range
+     * plunges still need a matching confirm so a single glitch cannot kill. */
+    if (v <= 2) {
+        g_main_pending_n = 0;
+        g_state.main_vol = v;
+        g_state.main_stable = v;
+        return;
+    }
     int drop = (int)g_state.main_stable - (int)v;
-    if (drop > 16 || v == 0) {
+    if (drop > 16) {
         if (!confirm_drop(&g_main_pending, &g_main_pending_n, v, 2))
             return;
     }
@@ -1089,7 +1088,7 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 5) Volume CC absolute from usable dump (Ash 0.3.8 MAIN pickup). */
+    /* 5) Volume CC absolute from dump (Ash 0.3.11 MAIN latch). */
     midi_selftest_reset();
     {
         const uint8_t seq[] = {0xb0, 19, 40, 0xb0, 19, 80, 0xb0, 16, 10};
@@ -1100,21 +1099,21 @@ int surface_midi_selftest(void)
             fails++;
         if (g_state.k1 != 10)
             fails++;
-        /* Dump=40 (≥16) engages absolute; move to 80 tracks */
+        /* Dump=40 engages absolute; move to 80 tracks */
         if (!g_state.main_engaged || g_state.main_vol != 80)
             fails++;
     }
 
-    /* 5b) Dump at 0 must NOT engage silence (Ash: never silent wrongly). */
+    /* 5b) Dump at 0 engages mute — physical floor = software silence. */
     midi_selftest_reset();
     {
         const uint8_t z[] = {0xb0, 19, 0};
         midi_feed_buf(z, sizeof z);
-        if (g_state.main_engaged)
+        if (!g_state.main_engaged)
             fails++;
-        if (g_state.main_vol != 100)
-            fails++; /* safe audible until user moves */
-        /* Move from dump 0 → mid engages absolute */
+        if (g_state.main_vol != 0)
+            fails++; /* knob down → mute, not “safe full” */
+        /* Turn up → absolute track */
         const uint8_t up[] = {0xb0, 19, 64};
         midi_feed_buf(up, sizeof up);
         if (!g_state.main_engaged || g_state.main_vol != 64)
@@ -1134,7 +1133,7 @@ int surface_midi_selftest(void)
             fails++;
     }
 
-    /* 5c) Lone main-vol plunge rejected; confirmed drop accepted. */
+    /* 5c) Lone mid plunge rejected; confirmed drop accepted. Floor is faster. */
     midi_selftest_reset();
     {
         /* Engage first: dump 100, then move to 90. */
@@ -1146,6 +1145,11 @@ int surface_midi_selftest(void)
         midi_feed_buf(drop2, sizeof drop2);
         if (g_state.main_vol != 10)
             fails++; /* second matching drop confirms */
+        /* Floor ≤2: single confirm reaches true mute. */
+        const uint8_t floor1[] = {0xb0, 19, 0};
+        midi_feed_buf(floor1, sizeof floor1);
+        if (g_state.main_vol != 0)
+            fails++;
     }
 
     /* 5d) Fader dump 0 + noise must not engage silence. */
