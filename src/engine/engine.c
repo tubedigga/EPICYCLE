@@ -97,7 +97,8 @@ static void pad_defaults(EpicyclePad *p)
     p->mod_level = 0.8f;
     p->mod_filter_cutoff = 1.0f;
 
-    /* Default mod matrix: LFO0 → brace start (off until enabled); LFO1 → pitch stub. */
+    /* Default mod matrix: LFO0 → POS/brace scrub only. No pitch route until
+     * user explicitly wires one (Ash 0.3.11: rogue pitch when amount/dest off). */
     for (int i = 0; i < EPICYCLE_LFO_PER_PAD; i++) {
         p->lfos[i].shape = EPICYCLE_LFO_SINE;
         p->lfos[i].rate_hz = 0.25f + 0.1f * (float)i;
@@ -114,9 +115,6 @@ static void pad_defaults(EpicyclePad *p)
     p->mods[0].lfo_index = 0;
     p->mods[0].dest = EPICYCLE_MOD_BRACE_START;
     p->mods[0].amount = 1.0f;
-    p->mods[1].lfo_index = 1;
-    p->mods[1].dest = EPICYCLE_MOD_PITCH;
-    p->mods[1].amount = 0.0f;
 }
 
 const char *epicycle_page_name(EpicycleModePage page)
@@ -386,6 +384,8 @@ static int pad_wants_brace_scrub(const EpicyclePad *pad)
         if (pad->mods[m].dest != EPICYCLE_MOD_BRACE_START &&
             pad->mods[m].dest != EPICYCLE_MOD_BRACE_LEN)
             continue;
+        if (fabsf(pad->mods[m].amount) < 1e-4f)
+            continue;
         int li = pad->mods[m].lfo_index;
         if (li < 0 || li >= EPICYCLE_LFO_PER_PAD)
             continue;
@@ -460,6 +460,9 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
             continue;
         if (r->dest == EPICYCLE_MOD_NONE)
             continue;
+        /* Amount 0 / unset = no modulation of any dest (esp. no rogue pitch). */
+        if (fabsf(r->amount) < 1e-4f)
+            continue;
         EpicycleLfo *l = &pad->lfos[r->lfo_index];
         if (!l->enabled || l->depth <= 0.0f)
             continue;
@@ -476,6 +479,7 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
             (void)w;
             break;
         case EPICYCLE_MOD_PITCH:
+            /* Pitch only when dest is explicitly PITCH and amount > 0. */
             d_pitch += w * 2.0f; /* ±2 semitones at full */
             break;
         case EPICYCLE_MOD_LEVEL:
@@ -495,6 +499,7 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
     pad->mod_window_start_prev = pad->mod_window_start;
     pad->mod_window_start = start;
     pad->mod_window_length = len;
+    /* Pitch stays unity unless a PITCH route with amount>0 contributed. */
     pad->mod_pitch_ratio = pitch_ratio(pad->octave, pad->semitone, pad->fine + d_pitch * 100.0f);
     pad->mod_level = clampf(pad->level + d_level, 0.0f, 1.0f);
     pad->mod_filter_cutoff = clampf(pad->filter_cutoff + d_filt, 0.0f, 1.0f);
@@ -1048,9 +1053,18 @@ void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on)
         p->lfos[0].enabled = 1;
         if (p->lfos[0].depth < 0.05f)
             p->lfos[0].depth = 0.35f;
+        /* Default dest = POS/brace scrub — never pitch (Ash 0.3.11). */
         p->mods[0].lfo_index = 0;
         p->mods[0].dest = EPICYCLE_MOD_BRACE_START;
         p->mods[0].amount = 1.0f;
+        /* Clear any accidental pitch stub on other slots when enabling. */
+        for (int i = 1; i < EPICYCLE_MOD_SLOTS; i++) {
+            if (p->mods[i].dest == EPICYCLE_MOD_PITCH && fabsf(p->mods[i].amount) < 1e-4f) {
+                p->mods[i].dest = EPICYCLE_MOD_NONE;
+                p->mods[i].lfo_index = -1;
+                p->mods[i].amount = 0.0f;
+            }
+        }
         p->allow_scrub = 1;
     } else {
         p->lfos[0].enabled = 0;
@@ -1257,14 +1271,15 @@ void engine_set_master_gain_cc(EpicycleEngine *eng, uint8_t cc19)
     if (!eng)
         return;
     /* Absolute CC19 → gain. Mild x^1.25 curve keeps top-end travel audible
-     * (Ash: halfway must not already feel “full”). Never touches voices. */
-    float t = (float)cc19 / 127.0f;
-    if (cc19 == 0) {
+     * (Ash: halfway must not already feel “full”). Floor ≤2 = hard mute —
+     * no FX/voice bleed (Ash 0.3.11). Never touches voices. */
+    if (cc19 <= 2) {
         eng->main_sq_target = 0.0f;
         eng->main_sq = 0.0f;
         recompute_master(eng);
         return;
     }
+    float t = (float)cc19 / 127.0f;
     eng->main_sq_target = powf(t, 1.25f);
 }
 
@@ -1840,9 +1855,24 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
         {
             float tgt = eng->main_sq_target;
             eng->main_sq += (tgt - eng->main_sq) * main_a;
-            if (tgt == 0.0f && eng->main_sq < 1e-6f)
+            if (tgt == 0.0f && eng->main_sq < 1e-5f)
                 eng->main_sq = 0.0f;
             eng->master_gain = eng->main_sq * eng->fader_gain;
+        }
+        float mg = eng->master_gain;
+        /* Hard mute floor: exact digital silence — no FX/voice/preview bleed. */
+        if (mg <= 0.0f) {
+            /* Still tick FX so tails die, but discard wet. */
+            float discard_l = 0.0f, discard_r = 0.0f;
+            fx_process(eng, 0.0f, 0.0f, 0.0f, 0.0f, &discard_l, &discard_r);
+            freeze_ring_write(0.0f, 0.0f);
+            if (eng->freeze_request) {
+                eng->freeze_request = 0;
+                freeze_capture_now(eng);
+            }
+            out_l[n] = 0;
+            out_r[n] = 0;
+            continue;
         }
         float wetL = 0.0f, wetR = 0.0f;
         if (send_n > 0) {
@@ -1855,7 +1885,6 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             fx_process(eng, 0.0f, 0.0f, 0.0f, 0.0f, &wetL, &wetR);
         }
         /* Wet levels applied inside fx_process (delay/reverb/master). */
-        float mg = eng->master_gain;
         mixL = (mixL + wetL) * mg;
         mixR = (mixR + wetR) * mg;
 
