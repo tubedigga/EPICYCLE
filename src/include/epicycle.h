@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.8-refine"
+#define EPICYCLE_VERSION "0.3.9-polish"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -63,7 +63,8 @@ typedef enum EpicycleModePage {
     EPICYCLE_PAGE_SAMPLE, /* live WAV assign from Epicycle/samples */
     EPICYCLE_PAGE_TRIM,
     EPICYCLE_PAGE_MIX,
-    EPICYCLE_PAGE_FX, /* delay / reverb parameter editor */
+    EPICYCLE_PAGE_DELAY,  /* delay editor (own knobs + SHIFT row) */
+    EPICYCLE_PAGE_REVERB, /* reverb editor (own knobs + SHIFT row) */
     EPICYCLE_PAGE_AMP,
     EPICYCLE_PAGE_TUNE,
     EPICYCLE_PAGE_FILTER,
@@ -171,6 +172,7 @@ typedef struct EpicyclePad {
     EpicycleModRoute mods[EPICYCLE_MOD_SLOTS];
     /* Runtime modulated (engine fills each block; UI may read) */
     float mod_window_start;
+    float mod_window_start_prev; /* prior-block start — scrub lerp / phase follow */
     float mod_window_length;
     float mod_pitch_ratio;
     float mod_level;
@@ -249,11 +251,15 @@ typedef struct EpicycleEngine {
     float fx_bus_rev;
     float fx_bus_del;
     /* FX editor params (global; Mix K3 still sets per-pad send amounts) */
-    float fx_delay_time; /* 0..1 → ~40..480 ms */
+    float fx_delay_time; /* 0..1 → ~40..750 ms */
     float fx_delay_fb;   /* 0..1 feedback */
+    float fx_delay_tone; /* 0..1 feedback LP (1 = bright) */
+    float fx_delay_wet;  /* 0..1 delay return */
     float fx_rev_decay;  /* 0..1 reverb tail */
     float fx_rev_damp;   /* 0..1 high damp (1 = darker) */
-    float fx_wet;        /* 0..1 master wet level */
+    float fx_rev_size;   /* 0..1 room / diffusion */
+    float fx_rev_wet;    /* 0..1 reverb return */
+    float fx_wet;        /* 0..1 master wet (legacy / both buses) */
     /* Freeze: last ~2–5 s of heard mix → loop (encoder push on Tombola) */
     int freeze_playing;     /* 1 = freeze loop audible */
     int freeze_request;     /* 1 = capture ring → freeze sample (audio thread) */
@@ -293,7 +299,8 @@ typedef struct EpicycleSurfaceState {
     int sample_held;                     /* SAMPLE mode button (ch1 note 6) */
     int mute_held;                       /* MUTE (ch1 note 43) — +pad toggles ball */
     int loop_btn;                        /* LOOP (ch1 note 74) edge — toggle latch */
-    int hitmod_btn;                      /* FULL LEVEL (ch1 note 7) edge — Hit Mod page */
+    int hitmod_btn;                      /* PAD FX (ch1 note 1) edge — Hit Mod page */
+    int seq_btn;                         /* SEQ (ch1 note 7) edge — Tombola home */
     int shift_held;                      /* SHIFT (ch1 note 49) */
     int open;                            /* 1 if MIDI port bound */
 } EpicycleSurfaceState;
@@ -349,6 +356,8 @@ void surface_flash_pad(int pad /* 0..15 */);
 void sample_free(EpicycleSample *s);
 int sample_load_wav(EpicycleSample *out, const char *path);
 int sample_synth_demo(EpicycleSample *out, unsigned rate, float freq_hz, float seconds);
+/* Peak-normalize sample in place to ~0.95. Returns 0 ok, -1 empty/quiet. */
+int sample_normalize(EpicycleSample *s);
 /* Live browser: scan dirs for .wav, assign onto a pad without rebuilding the card. */
 void sample_browser_init(EpicycleSampleBrowser *b);
 int sample_browser_scan(EpicycleSampleBrowser *b, const char *dir);
@@ -402,6 +411,8 @@ void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20);   /* morph onl
 void engine_freeze_toggle(EpicycleEngine *eng);
 int engine_freeze_active(const EpicycleEngine *eng);
 void engine_set_freeze_seconds(EpicycleEngine *eng, float seconds); /* clamp 2..5 */
+/* Normalize selected pad's sample in RAM (quiet WAVs → usable level). */
+int engine_normalize_pad(EpicycleEngine *eng, int pad);
 void engine_lfo_set_enabled(EpicycleEngine *eng, int pad, int on);
 void engine_lfo_toggle_sync(EpicycleEngine *eng, int pad); /* free ↔ 1-beat sync */
 void engine_toggle_loop(EpicycleEngine *eng, int pad);     /* loop latch ↔ one-shot */

@@ -147,22 +147,22 @@ static void draw_text(uint32_t *px, int x, int y, const char *s, uint32_t fg, in
 }
 
 enum {
-    /* Cool Sample-firmware palette — no toy yellow, no white spokes (Ash 0.3.8). */
-    COL_BG = 0x000E1418u,
-    COL_FG = 0x00E2E8ECu,
-    COL_MUTED = 0x007A8890u,
-    COL_ACCENT = 0x003A7A8Cu,
-    COL_OK = 0x0048A078u,
-    COL_WAVE = 0x00385058u,
-    COL_WAVE_DIM = 0x00202830u,
-    COL_BRACE = 0x00C8A060u, /* Trim brace only */
-    COL_BRACE_FILL = 0x00242820u,
-    COL_MESH = 0x0088A0A8u, /* cool silver wire — outlines only */
-    COL_MESH_DIM = 0x00485860u,
-    COL_MOD = 0x0058A898u,
-    COL_PLAY = 0x00E8F0F2u,
-    COL_SOFT = 0x00A8B4B8u,
-    COL_PAGE = 0x00B8C8CCu,
+    /* Vibrant pro palette — no washed yellow (Ash 0.3.9). */
+    COL_BG = 0x000A1016u,
+    COL_FG = 0x00F0F4F8u,
+    COL_MUTED = 0x00687888u,
+    COL_ACCENT = 0x0028B0C8u,
+    COL_OK = 0x0028C878u,
+    COL_WAVE = 0x00283848u,
+    COL_WAVE_DIM = 0x00182028u,
+    COL_BRACE = 0x0020D0E0u, /* cyan brace — not yellow */
+    COL_BRACE_FILL = 0x00142830u,
+    COL_MESH = 0x00B8D0D8u, /* bright cool silver wire */
+    COL_MESH_DIM = 0x00486068u,
+    COL_MOD = 0x00E05070u, /* coral accent */
+    COL_PLAY = 0x00F8FCFFu,
+    COL_SOFT = 0x0098A8B0u,
+    COL_PAGE = 0x00C8D8E0u,
 };
 
 int ui_load_splash_logo(const char *path)
@@ -690,8 +690,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         }
         if (browser && browser->status[0])
             draw_text(px, 8, 200, browser->status, COL_OK, 1);
-        draw_text(px, 8, 214, "pad=preview (hold ok)  ENC=assign to PAD", COL_MUTED, 1);
-        draw_text(px, 8, 226, "SAMPLE+pad=target  SHIFT+ENC=rescan", COL_MUTED, 1);
+        draw_text(px, 8, 214, "pad=preview  ENC=assign  SHIFT+ENC=norm", COL_MUTED, 1);
+        draw_text(px, 8, 226, "SAMPLE+pad=target  SAMPLE+ENC=rescan", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_HITMOD) {
         draw_text(px, 8, 48, "HIT MOD", COL_FG, 2);
         draw_text(px, 120, 52, "src->dest matrix", COL_MUTED, 1);
@@ -794,8 +794,8 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                     snprintf(line, sizeof line, "w=%.4f", (double)len);
                     draw_text(px, 248, 82, line, COL_MUTED, 1);
                 }
-                draw_text(px, 8, 212, "K1/K2 width  K3 POS slide  LFO scrub", COL_MUTED, 1);
-                draw_text(px, 8, 226, "narrow then reopen OK  ENC fine  SHIFT", COL_MUTED, 1);
+                draw_text(px, 8, 212, "K1/K2 absolute Start/End  K3 POS", COL_MUTED, 1);
+                draw_text(px, 8, 226, "frame-quantized  ENC fine  SEQ=home", COL_MUTED, 1);
             } else {
                 snprintf(line, sizeof line, "DIV%d",
                          pad ? engine_division_quantize_slices(pad->division_beats) : 4);
@@ -829,24 +829,42 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
             draw_text(px, 8, 160, line, COL_MUTED, 1);
         }
         draw_text(px, 8, 218, "K1 vol  K2 pan  K3 FX send  SHIFT+K3 kit", COL_MUTED, 1);
-    } else if (page == EPICYCLE_PAGE_FX) {
-        draw_text(px, 8, 52, "FX", COL_FG, 4);
+    } else if (page == EPICYCLE_PAGE_DELAY) {
+        draw_text(px, 8, 52, "DELAY", COL_FG, 4);
         int shift = surf && surf->shift_held;
         if (shift) {
-            snprintf(v1, sizeof v1, "%d", eng ? (int)(eng->fx_rev_damp * 100.0f) : 0);
+            snprintf(v1, sizeof v1, "%d", eng ? (int)(eng->fx_delay_tone * 100.0f) : 0);
             snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->fx_wet * 100.0f) : 0);
             snprintf(v3, sizeof v3, "%.1fs", eng ? (double)eng->freeze_seconds : 3.0);
-            draw_param_row(px, 100, "DAMP", v1, "WET", v2, "FRZ", v3);
-            draw_text(px, 8, 160, "SHIFT: reverb damp / master wet / freeze len", COL_MUTED, 1);
-            draw_text(px, 8, 218, "K1 damp  K2 wet  K3 freeze 2-5s", COL_MUTED, 1);
+            draw_param_row(px, 100, "TONE", v1, "MWET", v2, "FRZ", v3);
+            draw_text(px, 8, 160, "SHIFT: feedback tone / master wet / freeze", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 tone  K2 master wet  K3 freeze 2-5s", COL_MUTED, 1);
         } else {
-            int dms = eng ? (40 + (int)(eng->fx_delay_time * 440.0f)) : 280;
+            int dms = eng ? (40 + (int)(eng->fx_delay_time * 710.0f)) : 340;
             snprintf(v1, sizeof v1, "%dms", dms);
             snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->fx_delay_fb * 100.0f) : 0);
-            snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->fx_rev_decay * 100.0f) : 0);
-            draw_param_row(px, 100, "DELAY", v1, "FB", v2, "REV", v3);
-            draw_text(px, 8, 160, "edit delay/reverb — Mix K3 is pad send", COL_MUTED, 1);
-            draw_text(px, 8, 218, "K1 time  K2 feedback  K3 rev decay", COL_MUTED, 1);
+            snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->fx_delay_wet * 100.0f) : 0);
+            draw_param_row(px, 100, "TIME", v1, "FB", v2, "WET", v3);
+            draw_text(px, 8, 160, "stereo delay — Mix K3 is pad send", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 time  K2 feedback  K3 delay wet", COL_MUTED, 1);
+        }
+    } else if (page == EPICYCLE_PAGE_REVERB) {
+        draw_text(px, 8, 52, "REVERB", COL_FG, 3);
+        int shift = surf && surf->shift_held;
+        if (shift) {
+            snprintf(v1, sizeof v1, "%d", eng ? (int)(eng->fx_rev_wet * 100.0f) : 0);
+            snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->fx_wet * 100.0f) : 0);
+            snprintf(v3, sizeof v3, "%.1fs", eng ? (double)eng->freeze_seconds : 3.0);
+            draw_param_row(px, 100, "RWET", v1, "MWET", v2, "FRZ", v3);
+            draw_text(px, 8, 160, "SHIFT: reverb wet / master wet / freeze", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 rev wet  K2 master  K3 freeze 2-5s", COL_MUTED, 1);
+        } else {
+            snprintf(v1, sizeof v1, "%d", eng ? (int)(eng->fx_rev_decay * 100.0f) : 0);
+            snprintf(v2, sizeof v2, "%d", eng ? (int)(eng->fx_rev_damp * 100.0f) : 0);
+            snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->fx_rev_size * 100.0f) : 0);
+            draw_param_row(px, 100, "DECAY", v1, "DAMP", v2, "SIZE", v3);
+            draw_text(px, 8, 160, "room reverb — Mix K3 is pad send", COL_MUTED, 1);
+            draw_text(px, 8, 218, "K1 decay  K2 damp  K3 size", COL_MUTED, 1);
         }
     } else if (page == EPICYCLE_PAGE_AMP) {
         draw_text(px, 8, 52, "AMP ADSR", COL_FG, 3);

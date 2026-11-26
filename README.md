@@ -55,7 +55,7 @@ make test-host    # demo bank + non-silent preview WAV check
 2. **Tombola** home: balls rest at bottom; spin lifts; wall hits fire samples. **Fader** = morph; **MAIN** = vol; **K1** = spin (CW=CW); **K2** unused.
 3. **SAMPLE + pad** = select (LED solid); **MUTE + pad** = remove/add ball; LED flash = wall hit only.
 4. Soft keys: **B1** prev, **B2** next, **B3 QUIT**. Pages: Tombola / Trim / Mix / Amp / Tune / Filt / FEnv / LFO / HitMod.
-5. **FULL LEVEL** = Hit Mod (empty until you wire SRC/DEST/AMT). **LOOP** off = one-shot bounce.
+5. **SEQ** = jump to Tombola from any page. **PAD FX** = Hit Mod. **LOOP** off = one-shot bounce.
 6. Prefer short grains in `Epicycle/samples/`; ~8 active balls = messy generative texture.
 
 Session log: `Epicycle/logs/last-session.log` on the card.

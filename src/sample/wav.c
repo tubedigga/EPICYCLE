@@ -192,3 +192,24 @@ int sample_synth_demo(EpicycleSample *out, unsigned rate, float freq_hz, float s
     snprintf(out->name, sizeof out->name, "demo-%.0fHz", (double)freq_hz);
     return 0;
 }
+
+int sample_normalize(EpicycleSample *s)
+{
+    if (!s || !s->data || s->frames < 2)
+        return -1;
+    float peak = 0.0f;
+    size_t n = s->frames * 2u;
+    for (size_t i = 0; i < n; i++) {
+        float a = fabsf(s->data[i]);
+        if (a > peak)
+            peak = a;
+    }
+    if (peak < 1e-5f)
+        return -1; /* silence — nothing to normalize */
+    if (peak >= 0.94f && peak <= 1.0f)
+        return 0; /* already hot enough */
+    float g = 0.95f / peak;
+    for (size_t i = 0; i < n; i++)
+        s->data[i] *= g;
+    return 0;
+}

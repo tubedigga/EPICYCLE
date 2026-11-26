@@ -89,6 +89,7 @@ static void pad_defaults(EpicyclePad *p)
     p->send_rev = 0.18f;  /* light default wet — dry-only was a complaint */
     p->send_del = 0.10f;
     p->mod_window_start = 0.0f;
+    p->mod_window_start_prev = 0.0f;
     p->mod_window_length = 1.0f;
     p->mod_pitch_ratio = 1.0f;
     p->mod_level = 0.8f;
@@ -127,8 +128,10 @@ const char *epicycle_page_name(EpicycleModePage page)
         return "TRIM";
     case EPICYCLE_PAGE_MIX:
         return "MIX";
-    case EPICYCLE_PAGE_FX:
-        return "FX";
+    case EPICYCLE_PAGE_DELAY:
+        return "DELAY";
+    case EPICYCLE_PAGE_REVERB:
+        return "REVERB";
     case EPICYCLE_PAGE_AMP:
         return "AMP";
     case EPICYCLE_PAGE_TUNE:
@@ -399,6 +402,7 @@ void engine_sync_mod_window(EpicycleEngine *eng, int pad)
     resolve_window(eng, p, &start, &len);
     /* Only freeze to base window when brace scrub LFO is off. */
     if (!pad_wants_brace_scrub(p)) {
+        p->mod_window_start_prev = start;
         p->mod_window_start = start;
         p->mod_window_length = len;
     }
@@ -485,6 +489,8 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
 
     float len = clampf(base_len + d_len, trim_min_len(pad), 1.0f);
     float start = clampf(base_start + d_start, 0.0f, 1.0f - len);
+    /* Keep prior start for intra-block lerp + continuous phase follow (no zipper). */
+    pad->mod_window_start_prev = pad->mod_window_start;
     pad->mod_window_start = start;
     pad->mod_window_length = len;
     pad->mod_pitch_ratio = pitch_ratio(pad->octave, pad->semitone, pad->fine + d_pitch * 100.0f);
@@ -553,11 +559,15 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->kit_level = 1.0f;
     eng->fx_bus_rev = 0.0f;
     eng->fx_bus_del = 0.0f;
-    eng->fx_delay_time = 0.55f; /* ~280 ms default */
-    eng->fx_delay_fb = 0.38f;
-    eng->fx_rev_decay = 0.62f;
-    eng->fx_rev_damp = 0.35f;
-    eng->fx_wet = 0.70f;
+    eng->fx_delay_time = 0.42f; /* ~340 ms default */
+    eng->fx_delay_fb = 0.42f;
+    eng->fx_delay_tone = 0.55f;
+    eng->fx_delay_wet = 0.85f;
+    eng->fx_rev_decay = 0.68f;
+    eng->fx_rev_damp = 0.40f;
+    eng->fx_rev_size = 0.55f;
+    eng->fx_rev_wet = 0.90f;
+    eng->fx_wet = 0.75f;
     eng->freeze_playing = 0;
     eng->freeze_request = 0;
     eng->freeze_seconds = 3.0f;
@@ -1112,15 +1122,23 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
             p->send_del = t3 * 0.55f;
         }
         break;
-    case EPICYCLE_PAGE_FX:
-        /* Global FX editor: K1 delay time, K2 delay FB, K3 reverb decay.
-         * SHIFT overlays handled in main (damp / wet / freeze len). */
+    case EPICYCLE_PAGE_DELAY:
+        /* K1 time · K2 feedback · K3 delay wet. SHIFT in main: tone / sync / freeze. */
         if (mask & 1u)
             eng->fx_delay_time = t1;
         if (mask & 2u)
             eng->fx_delay_fb = t2;
         if (mask & 4u)
-            eng->fx_rev_decay = t3;
+            eng->fx_delay_wet = t3;
+        break;
+    case EPICYCLE_PAGE_REVERB:
+        /* K1 decay · K2 damp · K3 size. SHIFT in main: wet / pre / freeze. */
+        if (mask & 1u)
+            eng->fx_rev_decay = t1;
+        if (mask & 2u)
+            eng->fx_rev_damp = t2;
+        if (mask & 4u)
+            eng->fx_rev_size = t3;
         break;
     case EPICYCLE_PAGE_AMP:
         /* K1 A · K2 D · K3 S; SHIFT: K1 R · K2 vel (handled in main for shift). */
@@ -1331,16 +1349,25 @@ static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigne
     *R = voice_filter_tick(*R, &v->filt_z1_r, &v->filt_z2_r, f, q, type);
 }
 
-/* Lightweight stereo delay + 4-comb reverb (static buffers; MIT, no libs). */
-enum { FX_DELAY_MAX = 22050 }; /* ~500 ms @ 44.1k */
+/*
+ * Stereo delay (LP in feedback + L/R offset) + Schroeder-ish reverb
+ * (8 tuned combs + 4 allpasses). Static buffers; MIT; no libs.
+ */
+enum { FX_DELAY_MAX = 44100 }; /* ~1 s @ 44.1k */
 static float g_fx_delay_l[FX_DELAY_MAX];
 static float g_fx_delay_r[FX_DELAY_MAX];
 static int g_fx_delay_w;
-static float g_fx_ap_l, g_fx_ap_r;
-static int g_fx_comb_i[4];
-static float g_fx_comb_buf_l[4][1373];
-static float g_fx_comb_buf_r[4][1373];
-static const int FX_COMB_LEN[4] = {1117, 1187, 1279, 1351};
+static float g_fx_del_lp_l, g_fx_del_lp_r;
+static int g_fx_comb_i[8];
+static float g_fx_comb_buf_l[8][1601];
+static float g_fx_comb_buf_r[8][1601];
+static float g_fx_comb_lp_l[8], g_fx_comb_lp_r[8];
+/* Prime-ish lengths for denser, less metallic tails. */
+static const int FX_COMB_LEN[8] = {1117, 1187, 1279, 1351, 1423, 1493, 1559, 1597};
+static const int FX_AP_LEN[4] = {225, 341, 441, 556};
+static float g_fx_ap_buf_l[4][560];
+static float g_fx_ap_buf_r[4][560];
+static int g_fx_ap_i[4];
 
 /* Freeze capture ring: last 5 s stereo @ 44.1k (~1.7 MB). */
 enum { FRZ_MAX_FRAMES = 44100 * 5 };
@@ -1353,61 +1380,99 @@ static void fx_process(EpicycleEngine *eng, float in_l, float in_r, float send_r
                        float send_del, float *wet_l, float *wet_r)
 {
     float dl = 0.0f, dr = 0.0f;
-    float time01 = eng ? clampf(eng->fx_delay_time, 0.0f, 1.0f) : 0.55f;
-    float fb_amt = eng ? clampf(eng->fx_delay_fb, 0.0f, 1.0f) : 0.38f;
-    float rev_dec = eng ? clampf(eng->fx_rev_decay, 0.0f, 1.0f) : 0.62f;
-    float rev_damp = eng ? clampf(eng->fx_rev_damp, 0.0f, 1.0f) : 0.35f;
+    float time01 = eng ? clampf(eng->fx_delay_time, 0.0f, 1.0f) : 0.42f;
+    float fb_amt = eng ? clampf(eng->fx_delay_fb, 0.0f, 1.0f) : 0.42f;
+    float tone = eng ? clampf(eng->fx_delay_tone, 0.0f, 1.0f) : 0.55f;
+    float del_wet = eng ? clampf(eng->fx_delay_wet, 0.0f, 1.0f) : 0.85f;
+    float rev_dec = eng ? clampf(eng->fx_rev_decay, 0.0f, 1.0f) : 0.68f;
+    float rev_damp = eng ? clampf(eng->fx_rev_damp, 0.0f, 1.0f) : 0.40f;
+    float rev_size = eng ? clampf(eng->fx_rev_size, 0.0f, 1.0f) : 0.55f;
+    float rev_wet = eng ? clampf(eng->fx_rev_wet, 0.0f, 1.0f) : 0.90f;
+    float master_wet = eng ? clampf(eng->fx_wet, 0.0f, 1.0f) : 0.75f;
+
+    /* --- Delay: stereo offset + one-pole LP in feedback loop --- */
     {
-        int dlen = 64 + (int)(time01 * (float)(FX_DELAY_MAX - 128));
-        if (dlen < 64)
-            dlen = 64;
-        if (dlen >= FX_DELAY_MAX)
-            dlen = FX_DELAY_MAX - 1;
-        int ri = g_fx_delay_w - dlen;
-        if (ri < 0)
-            ri += FX_DELAY_MAX;
-        dl = g_fx_delay_l[ri];
-        dr = g_fx_delay_r[ri];
-        float fb = 0.05f + fb_amt * 0.82f;
-        g_fx_delay_l[g_fx_delay_w] = in_l * send_del + dl * fb;
-        g_fx_delay_r[g_fx_delay_w] = in_r * send_del + dr * fb;
+        int dlen = 96 + (int)(time01 * (float)(FX_DELAY_MAX - 200));
+        if (dlen < 96)
+            dlen = 96;
+        if (dlen >= FX_DELAY_MAX - 64)
+            dlen = FX_DELAY_MAX - 65;
+        int offset = 12 + (int)(time01 * 48.0f); /* mild L/R spread */
+        int ri_l = g_fx_delay_w - dlen;
+        int ri_r = g_fx_delay_w - dlen - offset;
+        if (ri_l < 0)
+            ri_l += FX_DELAY_MAX;
+        if (ri_r < 0)
+            ri_r += FX_DELAY_MAX;
+        dl = g_fx_delay_l[ri_l];
+        dr = g_fx_delay_r[ri_r];
+        float fb = 0.08f + fb_amt * 0.78f; /* stable under 0.9 */
+        if (fb > 0.92f)
+            fb = 0.92f;
+        float lp_a = 0.15f + tone * 0.80f; /* 1 = bright, 0 = dark */
+        g_fx_del_lp_l += (dl - g_fx_del_lp_l) * lp_a;
+        g_fx_del_lp_r += (dr - g_fx_del_lp_r) * lp_a;
+        g_fx_delay_l[g_fx_delay_w] = in_l * send_del + g_fx_del_lp_l * fb;
+        g_fx_delay_r[g_fx_delay_w] = in_r * send_del + g_fx_del_lp_r * fb;
         g_fx_delay_w++;
         if (g_fx_delay_w >= FX_DELAY_MAX)
             g_fx_delay_w = 0;
     }
 
+    /* --- Reverb: 8 damped combs → 4 allpasses --- */
     float rl = 0.0f, rr = 0.0f;
-    float rin_l = in_l * send_rev + dl * 0.25f;
-    float rin_r = in_r * send_rev + dr * 0.25f;
-    for (int c = 0; c < 4; c++) {
-        int len = FX_COMB_LEN[c];
+    float rin_l = in_l * send_rev + dl * 0.18f;
+    float rin_r = in_r * send_rev + dr * 0.18f;
+    float damp_a = 0.20f + (1.0f - rev_damp) * 0.75f; /* higher = brighter */
+    float size_scale = 0.55f + rev_size * 0.45f;
+    for (int c = 0; c < 8; c++) {
+        int len = (int)((float)FX_COMB_LEN[c] * size_scale);
+        if (len < 64)
+            len = 64;
+        if (len > 1600)
+            len = 1600;
         int i = g_fx_comb_i[c];
+        if (i >= len)
+            i = 0;
         float y_l = g_fx_comb_buf_l[c][i];
         float y_r = g_fx_comb_buf_r[c][i];
-        float fb = (0.55f + rev_dec * 0.38f) - 0.04f * (float)c;
-        float damp = 1.0f - rev_damp * 0.55f;
-        g_fx_comb_buf_l[c][i] = (rin_l + y_l * fb) * damp;
-        g_fx_comb_buf_r[c][i] = (rin_r + y_r * fb) * damp;
+        float fb = (0.62f + rev_dec * 0.32f) - 0.025f * (float)c;
+        if (fb > 0.96f)
+            fb = 0.96f;
+        g_fx_comb_lp_l[c] += (y_l - g_fx_comb_lp_l[c]) * damp_a;
+        g_fx_comb_lp_r[c] += (y_r - g_fx_comb_lp_r[c]) * damp_a;
+        g_fx_comb_buf_l[c][i] = rin_l + g_fx_comb_lp_l[c] * fb;
+        g_fx_comb_buf_r[c][i] = rin_r + g_fx_comb_lp_r[c] * fb;
         i++;
         if (i >= len)
             i = 0;
         g_fx_comb_i[c] = i;
-        rl += y_l;
-        rr += y_r;
+        /* Alternate polarity for denser stereo field */
+        float sgn = (c & 1) ? -1.0f : 1.0f;
+        rl += y_l * sgn;
+        rr += y_r * sgn;
     }
-    rl *= 0.25f;
-    rr *= 0.25f;
-    {
-        float g = 0.5f;
-        float yl = -g * rl + g_fx_ap_l;
-        g_fx_ap_l = rl + g * yl;
-        float yr = -g * rr + g_fx_ap_r;
-        g_fx_ap_r = rr + g * yr;
+    rl *= 0.125f;
+    rr *= 0.125f;
+    for (int a = 0; a < 4; a++) {
+        int len = FX_AP_LEN[a];
+        int i = g_fx_ap_i[a];
+        float buf_l = g_fx_ap_buf_l[a][i];
+        float buf_r = g_fx_ap_buf_r[a][i];
+        float g = 0.5f + rev_size * 0.15f;
+        float yl = -g * rl + buf_l;
+        float yr = -g * rr + buf_r;
+        g_fx_ap_buf_l[a][i] = rl + g * yl;
+        g_fx_ap_buf_r[a][i] = rr + g * yr;
+        i++;
+        if (i >= len)
+            i = 0;
+        g_fx_ap_i[a] = i;
         rl = yl;
         rr = yr;
     }
-    *wet_l = dl * 0.85f + rl * 0.95f;
-    *wet_r = dr * 0.85f + rr * 0.95f;
+    *wet_l = (dl * del_wet + rl * rev_wet) * master_wet;
+    *wet_r = (dr * del_wet + rr * rev_wet) * master_wet;
 }
 
 static void freeze_ring_write(float l, float r)
@@ -1462,6 +1527,16 @@ void engine_set_freeze_seconds(EpicycleEngine *eng, float seconds)
     if (!eng)
         return;
     eng->freeze_seconds = clampf(seconds, 2.0f, 5.0f);
+}
+
+int engine_normalize_pad(EpicycleEngine *eng, int pad)
+{
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+        return -1;
+    EpicyclePad *p = &eng->pads[pad];
+    if (!p->sample || !p->sample->data || p->sample->frames < 2)
+        return -1;
+    return sample_normalize(p->sample);
 }
 
 int engine_freeze_active(const EpicycleEngine *eng)
@@ -1546,8 +1621,24 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 continue;
             }
 
-            double win0 = (double)pad->mod_window_start * (double)s->frames;
-            double win1 = win0 + (double)pad->mod_window_length * (double)s->frames;
+            /* Intra-block scrub lerp: continuous window move, no zipper/buzz.
+             * Samples are RAM-resident — bottleneck was block-rate jumps + hard clamps. */
+            float scrub_t = (frames > 1) ? ((float)n / (float)(frames - 1)) : 1.0f;
+            float start01 = pad->mod_window_start_prev +
+                            (pad->mod_window_start - pad->mod_window_start_prev) * scrub_t;
+            float len01 = pad->mod_window_length;
+            double win0 = (double)start01 * (double)s->frames;
+            double win1 = win0 + (double)len01 * (double)s->frames;
+            /* Phase follows the moving brace (true POS scrub). */
+            {
+                float prev01 = pad->mod_window_start_prev +
+                               (pad->mod_window_start - pad->mod_window_start_prev) *
+                                   ((frames > 1 && n > 0) ? ((float)(n - 1) / (float)(frames - 1))
+                                                          : scrub_t);
+                double prev_win0 = (double)prev01 * (double)s->frames;
+                if (n > 0 || pad_wants_brace_scrub(pad))
+                    v->phase += (win0 - prev_win0);
+            }
             if (win1 <= win0 + 2.0) {
                 /* Tiny grain: hold last in-brace phase instead of hard mute. */
                 if (v->phase < win0)
@@ -1566,6 +1657,10 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 xfade_frames = 2.0;
             if (xfade_frames > (win1 - win0) * 0.45)
                 xfade_frames = (win1 - win0) * 0.45;
+            /* Scrubbing grains get a short wrap crossfade instead of clicky clamps. */
+            int scrubbing = pad_wants_brace_scrub(pad) && pad_may_scrub(eng, v->pad_index);
+            if (scrubbing && xfade_frames < 32.0)
+                xfade_frames = 32.0 < (win1 - win0) * 0.4 ? 32.0 : (win1 - win0) * 0.4;
 
             float L = 0, R = 0;
             float pitch = pad->mod_pitch_ratio * (v->impact_pitch > 0.01f ? v->impact_pitch : 1.0f);
@@ -1573,10 +1668,11 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             if (v->direction < 0)
                 step = -step;
 
-            /* LOOP+bounce loops sample under ADSR; LOOP off = one-shot bounce. */
-            int do_loop = pad->loop_enable && !v->force_oneshot;
+            /* LOOP+bounce loops sample under ADSR; LOOP off = one-shot bounce.
+             * Active LFO scrub wraps smoothly (continuous play from new offset). */
+            int do_loop = (pad->loop_enable && !v->force_oneshot) || scrubbing;
             float edge_mul = 1.0f;
-            if (do_loop && pad->ping_pong) {
+            if (do_loop && pad->ping_pong && !scrubbing) {
                 read_sample(s, v->phase, &L, &R);
                 v->phase += step;
                 if (v->phase >= win1) {
@@ -1610,6 +1706,10 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                     float L0, R0, L1, R1;
                     read_sample(s, v->phase, &L0, &R0);
                     double restart = win0 + (v->phase - (win1 - xfade_frames));
+                    if (restart < win0)
+                        restart = win0;
+                    if (restart >= win1)
+                        restart = win0;
                     read_sample(s, restart, &L1, &R1);
                     float a = (float)fade;
                     L = L0 * (1.0f - a) + L1 * a;
@@ -1703,10 +1803,10 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             /* Keep delay line ticking so tails decay when voices stop. */
             fx_process(eng, 0.0f, 0.0f, 0.0f, 0.0f, &wetL, &wetR);
         }
-        float wet = clampf(eng->fx_wet, 0.0f, 1.0f);
+        /* Wet levels applied inside fx_process (delay/reverb/master). */
         float mg = eng->master_gain;
-        mixL = (mixL + wetL * wet) * mg;
-        mixR = (mixR + wetR * wet) * mg;
+        mixL = (mixL + wetL) * mg;
+        mixR = (mixR + wetR) * mg;
 
         /* Freeze loop voice (captured heard triggers). */
         if (eng->freeze_playing && eng->freeze_sample.data && eng->freeze_sample.frames > 1) {
