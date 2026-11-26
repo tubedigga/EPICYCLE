@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.6-knob-physics"
+#define EPICYCLE_VERSION "0.3.7-trim-fx"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
@@ -79,14 +79,14 @@ typedef enum EpicycleHitModSrc {
     EPICYCLE_HITMOD_SRC_COUNT
 } EpicycleHitModSrc;
 
-/* Physics impact destinations (not MIDI velocity). Sends are stubbed. */
+/* Physics impact destinations (not MIDI velocity). Sends feed FX buses. */
 typedef enum EpicycleHitModDest {
     EPICYCLE_HITMOD_NONE = 0,
     EPICYCLE_HITMOD_LEVEL,   /* volume */
     EPICYCLE_HITMOD_PITCH,
     EPICYCLE_HITMOD_FILTER,  /* cutoff */
-    EPICYCLE_HITMOD_SEND_A,  /* stub reverb send */
-    EPICYCLE_HITMOD_SEND_B,  /* stub delay send */
+    EPICYCLE_HITMOD_SEND_A,  /* reverb send bump */
+    EPICYCLE_HITMOD_SEND_B,  /* delay send bump */
     EPICYCLE_HITMOD_DEST_COUNT
 } EpicycleHitModDest;
 
@@ -150,6 +150,8 @@ typedef struct EpicyclePad {
     float filt_attack;
     float filt_decay;
     float filt_depth; /* 0..1 cutoff env depth */
+    float send_rev;   /* 0..1 Mix send → reverb bus */
+    float send_del;   /* 0..1 Mix send → delay bus */
     EpicycleLfo lfos[EPICYCLE_LFO_PER_PAD];
     EpicycleModRoute mods[EPICYCLE_MOD_SLOTS];
     /* Runtime modulated (engine fills each block; UI may read) */
@@ -175,6 +177,7 @@ typedef struct EpicycleVoice {
     float filt_z1_l, filt_z2_l;
     float filt_z1_r, filt_z2_r;
     float filt_env; /* 0..1 filt-env level after note-on */
+    int filt_env_stage; /* 0=attack 1=decay */
     /* Physics hit-mod (tombola wall impact); 1 / 0 = none */
     float impact_pitch; /* pitch ratio multiplier */
     float impact_filt;  /* added to filter cutoff 0..1 */
@@ -205,7 +208,7 @@ typedef struct EpicycleTombola {
     /* Global physics → param matrix (multi-slot UI) */
     EpicycleHitModRoute hitmods[EPICYCLE_HITMOD_SLOTS];
     int hitmod_edit; /* which slot Hit Mod page edits 0..SLOTS-1 */
-    /* Stub send accumulators (no FX yet — UI + eval wire them) */
+    /* HitMod send bumps (decayed each eval; feed engine FX buses) */
     float send_a;
     float send_b;
 } EpicycleTombola;
@@ -224,9 +227,12 @@ typedef struct EpicycleEngine {
     int scrub_active; /* how many pads currently LFO-scanning brace */
     float main_sq;        /* smoothed CC19 squared taper 0..1 (render) */
     float main_sq_target; /* raw target from CC19 — gain only, no voice touch */
-    float fader_gain;     /* CC20 linear 0..1; 0 = true silence */
+    float fader_gain;     /* kept at 1 — MAIN is sole master (fader≠gain) */
     float master_gain;    /* main_sq * fader_gain (cached for render) */
-    float kit_level;      /* Mix SHIFT-K2 analogue: global pad trim 0..1 */
+    float kit_level;      /* Mix SHIFT-K3: global pad trim 0..1 */
+    /* Global FX bus boosts from HitMod SEND_A/B (0..1) */
+    float fx_bus_rev;
+    float fx_bus_del;
 } EpicycleEngine;
 
 /* Live surface snapshot for the UI (pads / knobs / quit). */

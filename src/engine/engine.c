@@ -74,17 +74,19 @@ static void pad_defaults(EpicyclePad *p)
     p->loop_enable = 0; /* Tombola default: one-shot; LOOP button enables latch */
     p->ping_pong = 0;   /* Forward; SHIFT on Trim selects Ping-pong */
     p->allow_scrub = 1;
-    p->amp_attack = 0.0f;
-    p->amp_decay = 0.18f;
-    p->amp_sustain = 0.55f;
-    p->amp_release = 0.22f;
+    p->amp_attack = 0.02f;  /* slight soft attack — less clicky/cheap */
+    p->amp_decay = 0.22f;
+    p->amp_sustain = 0.70f;
+    p->amp_release = 0.28f;
     p->vel_sens = 1.0f;
     p->filter_cutoff = 1.0f; /* open */
     p->filter_reso = 0.0f;
     p->filter_type = 0; /* OFF = fully hearable until user picks a type */
-    p->filt_attack = 0.0f;
-    p->filt_decay = 0.35f;
-    p->filt_depth = 0.0f;
+    p->filt_attack = 0.05f;
+    p->filt_decay = 0.40f;
+    p->filt_depth = 0.0f; /* FEnv audible once depth > 0 (auto-LPF) */
+    p->send_rev = 0.18f;  /* light default wet — dry-only was a complaint */
+    p->send_del = 0.10f;
     p->mod_window_start = 0.0f;
     p->mod_window_length = 1.0f;
     p->mod_pitch_ratio = 1.0f;
@@ -541,9 +543,11 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->selected_pad = 0;
     eng->main_sq = 1.0f; /* until surface CC19 arrives */
     eng->main_sq_target = 1.0f;
-    eng->fader_gain = 1.0f; /* CC20 default full until first fader event */
+    eng->fader_gain = 1.0f; /* always full — MAIN VOL sole master (Ash Trim mute) */
     eng->master_gain = 1.0f;
     eng->kit_level = 1.0f;
+    eng->fx_bus_rev = 0.0f;
+    eng->fx_bus_del = 0.0f;
     eng->mode_page = EPICYCLE_PAGE_TOMBOLA;
     eng->bank_count = EPICYCLE_PAD_COUNT;
     eng->bank = calloc((size_t)eng->bank_count, sizeof(EpicycleSample));
@@ -613,15 +617,63 @@ void engine_set_division(EpicycleEngine *eng, int pad, int slices)
     engine_division_snap_brace(eng, pad);
 }
 
+/* Keep live voices inside a moved brace — Start/End must not mute (Ash). */
+static void rebase_voices_to_window(EpicycleEngine *eng, int pad, float old_start, float old_len,
+                                    float new_start, float new_len)
+{
+    EpicyclePad *p = &eng->pads[pad];
+    if (!p->sample || !p->sample->data || p->sample->frames < 2)
+        return;
+    double frames = (double)p->sample->frames;
+    double o0 = (double)old_start * frames;
+    double o1 = o0 + (double)old_len * frames;
+    double n0 = (double)new_start * frames;
+    double n1 = n0 + (double)new_len * frames;
+    double ospan = o1 - o0;
+    double nspan = n1 - n0;
+    if (nspan < 2.0)
+        nspan = 2.0;
+    if (n1 <= n0 + 1.0)
+        n1 = n0 + 2.0;
+
+    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+        EpicycleVoice *v = &eng->voices[i];
+        if (!v->active || v->pad_index != pad)
+            continue;
+        if (ospan > 2.0) {
+            double rel = (v->phase - o0) / ospan;
+            if (rel < 0.0)
+                rel = 0.0;
+            if (rel > 1.0)
+                rel = 1.0;
+            v->phase = n0 + rel * nspan;
+        } else {
+            if (v->phase < n0)
+                v->phase = n0;
+            if (v->phase >= n1)
+                v->phase = n1 - 1.0;
+        }
+        if (v->phase < n0)
+            v->phase = n0;
+        if (v->phase >= n1)
+            v->phase = n1 - 1.0;
+        /* Stay in current amp stage — never force Release just for a trim move. */
+        v->in_crossfade = 0;
+    }
+}
+
 void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
 {
-    if (pad < 0 || pad >= EPICYCLE_PAD_COUNT)
+    if (!eng || pad < 0 || pad >= EPICYCLE_PAD_COUNT)
         return;
     EpicyclePad *p = &eng->pads[pad];
+    float old_start = p->window_start;
+    float old_len = p->window_length;
     if (!p->freeform) {
         /* Division: length locked to 1/N; start snapped to grid. */
         p->window_start = clampf(start, 0.0f, 1.0f);
         engine_division_snap_brace(eng, pad);
+        rebase_voices_to_window(eng, pad, old_start, old_len, p->window_start, p->window_length);
         return;
     }
     {
@@ -630,6 +682,7 @@ void engine_set_window(EpicycleEngine *eng, int pad, float start, float length)
         p->window_start = clampf(start, 0.0f, 1.0f - p->window_length);
     }
     engine_sync_mod_window(eng, pad);
+    rebase_voices_to_window(eng, pad, old_start, old_len, p->window_start, p->window_length);
 }
 
 void engine_set_pitch(EpicycleEngine *eng, int pad, int octave, int semi, float fine)
@@ -717,12 +770,12 @@ void engine_trim_set_position(EpicycleEngine *eng, int pad, float pos01)
 
 enum { ENV_A = 0, ENV_D = 1, ENV_S = 2, ENV_R = 3 };
 
-/* Map 0..1 knob → seconds (A/D/R). Cubed curve keeps low settings snappy. */
+/* Map 0..1 knob → seconds (A/D/R). Squared curve: snappy lows, musical highs. */
 static float adsr_time_s(float kn, float min_s, float max_s)
 {
     float t = clampf(kn, 0.0f, 1.0f);
-    float t3 = t * t * t;
-    return min_s + (max_s - min_s) * t3;
+    float t2 = t * t;
+    return min_s + (max_s - min_s) * t2;
 }
 
 static void voice_start_attack(EpicycleVoice *v, const EpicyclePad *p, float velocity)
@@ -739,6 +792,7 @@ static void voice_start_attack(EpicycleVoice *v, const EpicyclePad *p, float vel
     v->filt_z1_l = v->filt_z2_l = 0.0f;
     v->filt_z1_r = v->filt_z2_r = 0.0f;
     v->filt_env = 0.0f;
+    v->filt_env_stage = 0; /* attack */
     v->impact_pitch = 1.0f;
     v->impact_filt = 0.0f;
     v->impact_level = 1.0f;
@@ -843,13 +897,14 @@ void engine_note_off(EpicycleEngine *eng, int pad)
     }
 }
 
-/* Advance ADSR one sample; returns 0 if voice finished Release. */
+/* Advance ADSR one sample; returns 0 if voice finished Release.
+ * Expo approach curves — less cheap/linear than prior ramp (Ash). */
 static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr)
 {
-    float atk = adsr_time_s(pad->amp_attack, 0.0005f, 1.5f);
-    float dec = adsr_time_s(pad->amp_decay, 0.003f, 2.5f);
+    float atk = adsr_time_s(pad->amp_attack, 0.001f, 2.0f);
+    float dec = adsr_time_s(pad->amp_decay, 0.008f, 3.0f);
     float sus = clampf(pad->amp_sustain, 0.0f, 1.0f);
-    float rel = adsr_time_s(pad->amp_release, 0.003f, 3.0f);
+    float rel = adsr_time_s(pad->amp_release, 0.010f, 4.0f);
     float inv_sr = 1.0f / (float)(sr ? sr : 44100);
 
     /* Impact one-shots (gate already low): A→D then straight to Release (no S hold). */
@@ -860,9 +915,10 @@ static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr
 
     switch (v->env_stage) {
     case ENV_A: {
-        float step = inv_sr / atk;
-        v->env += step;
-        if (v->env >= 1.0f) {
+        /* 1 - e^(-t/tau): soft start, still reaches ~1 quickly. */
+        float coeff = 1.0f - expf(-inv_sr / (atk * 0.28f + 1e-5f));
+        v->env += (1.0f - v->env) * coeff;
+        if (v->env >= 0.995f) {
             v->env = 1.0f;
             v->env_stage = ENV_D;
         }
@@ -870,12 +926,9 @@ static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr
     }
     case ENV_D: {
         float target = skip_sustain ? 0.0f : sus;
-        float span = 1.0f - target;
-        if (span < 0.001f)
-            span = 0.001f;
-        float step = span * inv_sr / dec;
-        v->env -= step;
-        if (v->env <= target + 0.001f) {
+        float coeff = 1.0f - expf(-inv_sr / (dec * 0.35f + 1e-5f));
+        v->env += (target - v->env) * coeff;
+        if (fabsf(v->env - target) <= 0.004f) {
             v->env = target;
             if (skip_sustain || !v->gate) {
                 v->env_stage = ENV_R;
@@ -892,9 +945,9 @@ static int voice_adsr_tick(EpicycleVoice *v, const EpicyclePad *pad, unsigned sr
         break;
     case ENV_R:
     default: {
-        /* Exponential-ish release (feels more natural than linear). */
-        float step = (v->env + 0.02f) * inv_sr / (rel * 0.55f);
-        v->env -= step;
+        /* Exponential release toward silence. */
+        float coeff = 1.0f - expf(-inv_sr / (rel * 0.32f + 1e-5f));
+        v->env += (0.0f - v->env) * coeff;
         if (v->env <= 0.001f) {
             v->env = 0.0f;
             v->active = 0;
@@ -1022,7 +1075,7 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
         break;
     }
     case EPICYCLE_PAGE_MIX:
-        /* Pad vol + pan by default; kit only via SHIFT+K2 (handled in main). */
+        /* Pad vol + pan; K3 = FX send (rev+delay); kit via SHIFT+K3 in main. */
         if (mask & 1u) {
             p->level = t1;
             p->mod_level = t1;
@@ -1030,8 +1083,8 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
         if (mask & 2u)
             p->pan = t2;
         if (mask & 4u) {
-            /* Reserved send stub (delay/reverb later); store as unused fine slot. */
-            (void)t3;
+            p->send_rev = t3;
+            p->send_del = t3 * 0.55f;
         }
         break;
     case EPICYCLE_PAGE_AMP:
@@ -1153,8 +1206,10 @@ void engine_set_fader_gain_cc(EpicycleEngine *eng, uint8_t cc20)
 {
     if (!eng)
         return;
-    /* Control slider (CC20): linear; bottom detent = exact 0. */
-    eng->fader_gain = (float)cc20 / 127.0f;
+    /* Fader is morph on Tombola — never master volume (Ash Trim-page mute).
+     * Keep API; force full so page changes cannot attenuate. */
+    (void)cc20;
+    eng->fader_gain = 1.0f;
     recompute_master(eng);
 }
 
@@ -1194,27 +1249,33 @@ static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigne
                                float *R)
 {
     int type = pad->filter_type;
+    float depth = pad->filt_depth;
+    /* Depth > 0 with type OFF → auto LPF so FEnv is audible (Ash: felt stubbed). */
+    if ((type <= 0 || type > 4) && depth > 0.02f)
+        type = 1;
     if (type <= 0 || type > 4)
         return; /* OFF — bypass, fully hearable */
 
     float cut = clampf(pad->mod_filter_cutoff + v->impact_filt, 0.0f, 1.0f);
-    /* Filt env: simple rise then fall, depth scales cutoff down from open. */
-    float depth = pad->filt_depth;
     if (depth > 0.001f) {
-        float atk = 0.001f + pad->filt_attack * 0.25f;
-        float dec = 0.01f + pad->filt_decay * 0.75f;
-        float rate = (v->filt_env < 1.0f) ? (1.0f / (atk * (float)sr + 1.0f))
-                                          : -(1.0f / (dec * (float)sr + 1.0f));
-        if (v->filt_env < 1.0f || rate < 0.0f) {
-            v->filt_env += rate;
-            if (v->filt_env > 1.0f)
+        float atk = 0.002f + pad->filt_attack * pad->filt_attack * 0.80f;
+        float dec = 0.015f + pad->filt_decay * pad->filt_decay * 1.60f;
+        float inv_sr = 1.0f / (float)(sr ? sr : 44100);
+        if (v->filt_env_stage == 0) {
+            float coeff = 1.0f - expf(-inv_sr / (atk * 0.30f + 1e-5f));
+            v->filt_env += (1.0f - v->filt_env) * coeff;
+            if (v->filt_env >= 0.995f) {
                 v->filt_env = 1.0f;
+                v->filt_env_stage = 1;
+            }
+        } else {
+            float coeff = 1.0f - expf(-inv_sr / (dec * 0.35f + 1e-5f));
+            v->filt_env += (0.0f - v->filt_env) * coeff;
             if (v->filt_env < 0.0f)
                 v->filt_env = 0.0f;
         }
-        float env = (v->filt_env < 1.0f) ? v->filt_env : v->filt_env; /* peak then decay */
-        /* While still attacking, env rises 0→1; after peak we decay — use env as amount. */
-        cut = clampf(cut - depth * (1.0f - env), 0.0f, 1.0f);
+        /* Classic: start closed by depth, open with env peak, decay closed. */
+        cut = clampf(cut - depth + depth * v->filt_env, 0.0f, 1.0f);
     }
 
     /* Exponential-ish cutoff: ~80 Hz .. 0.45 * Nyquist */
@@ -1226,8 +1287,7 @@ static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigne
     if (f < 0.001f)
         f = 0.001f;
     /* Chamberlin "q" is damping: lower = more resonance. Map knob so
-     * CC 0 = min reso (high damp), CC 127 = max reso (low damp).
-     * (Ash 0.2.10: previous map felt reversed — 0=full, 127=min.) */
+     * CC 0 = min reso (high damp), CC 127 = max reso (low damp). */
     float damp = 0.90f - clampf(pad->filter_reso, 0.0f, 1.0f) * 0.85f;
     float q = damp;
     if (f * q > 0.95f)
@@ -1235,6 +1295,76 @@ static void voice_apply_filter(EpicycleVoice *v, const EpicyclePad *pad, unsigne
 
     *L = voice_filter_tick(*L, &v->filt_z1_l, &v->filt_z2_l, f, q, type);
     *R = voice_filter_tick(*R, &v->filt_z1_r, &v->filt_z2_r, f, q, type);
+}
+
+/* Lightweight stereo delay + 4-comb reverb (static buffers; MIT, no libs). */
+enum { FX_DELAY_MAX = 22050 }; /* ~500 ms @ 44.1k */
+static float g_fx_delay_l[FX_DELAY_MAX];
+static float g_fx_delay_r[FX_DELAY_MAX];
+static int g_fx_delay_w;
+static float g_fx_ap_l, g_fx_ap_r;
+static int g_fx_comb_i[4];
+static float g_fx_comb_buf_l[4][1373];
+static float g_fx_comb_buf_r[4][1373];
+static const int FX_COMB_LEN[4] = {1117, 1187, 1279, 1351};
+
+static void fx_process(float in_l, float in_r, float send_rev, float send_del, float *wet_l,
+                       float *wet_r, unsigned sr)
+{
+    (void)sr;
+    float dl = 0.0f, dr = 0.0f;
+    /* Tempo-ish fixed delay (~280 ms) with feedback. */
+    {
+        int dlen = FX_DELAY_MAX * 280 / 500;
+        if (dlen < 64)
+            dlen = 64;
+        if (dlen >= FX_DELAY_MAX)
+            dlen = FX_DELAY_MAX - 1;
+        int ri = g_fx_delay_w - dlen;
+        if (ri < 0)
+            ri += FX_DELAY_MAX;
+        dl = g_fx_delay_l[ri];
+        dr = g_fx_delay_r[ri];
+        float fb = 0.38f;
+        g_fx_delay_l[g_fx_delay_w] = in_l * send_del + dl * fb;
+        g_fx_delay_r[g_fx_delay_w] = in_r * send_del + dr * fb;
+        g_fx_delay_w++;
+        if (g_fx_delay_w >= FX_DELAY_MAX)
+            g_fx_delay_w = 0;
+    }
+
+    float rl = 0.0f, rr = 0.0f;
+    float rin_l = in_l * send_rev + dl * 0.25f;
+    float rin_r = in_r * send_rev + dr * 0.25f;
+    for (int c = 0; c < 4; c++) {
+        int len = FX_COMB_LEN[c];
+        int i = g_fx_comb_i[c];
+        float y_l = g_fx_comb_buf_l[c][i];
+        float y_r = g_fx_comb_buf_r[c][i];
+        float fb = 0.72f - 0.04f * (float)c;
+        g_fx_comb_buf_l[c][i] = rin_l + y_l * fb;
+        g_fx_comb_buf_r[c][i] = rin_r + y_r * fb;
+        i++;
+        if (i >= len)
+            i = 0;
+        g_fx_comb_i[c] = i;
+        rl += y_l;
+        rr += y_r;
+    }
+    rl *= 0.25f;
+    rr *= 0.25f;
+    /* One allpass for denser tail. */
+    {
+        float g = 0.5f;
+        float yl = -g * rl + g_fx_ap_l;
+        g_fx_ap_l = rl + g * yl;
+        float yr = -g * rr + g_fx_ap_r;
+        g_fx_ap_r = rr + g * yr;
+        rl = yl;
+        rr = yr;
+    }
+    *wet_l = dl * 0.85f + rl * 0.95f;
+    *wet_r = dr * 0.85f + rr * 0.95f;
 }
 
 void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t frames)
@@ -1252,9 +1382,14 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
 
     /* One-pole coeff toward main_sq_target (~5 ms) — computed once per block. */
     float main_a = 1.0f - expf(-1.0f / (0.005f * (float)eng->sample_rate + 1.0f));
+    float bus_rev = clampf(eng->fx_bus_rev, 0.0f, 1.0f);
+    float bus_del = clampf(eng->fx_bus_del, 0.0f, 1.0f);
 
     for (size_t n = 0; n < frames; n++) {
         float mixL = 0, mixR = 0;
+        float sndL = 0, sndR = 0;
+        float send_rev_acc = 0.0f, send_del_acc = 0.0f;
+        int send_n = 0;
 
         for (int vi = 0; vi < EPICYCLE_VOICE_COUNT; vi++) {
             EpicycleVoice *v = &eng->voices[vi];
@@ -1270,8 +1405,15 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             double win0 = (double)pad->mod_window_start * (double)s->frames;
             double win1 = win0 + (double)pad->mod_window_length * (double)s->frames;
             if (win1 <= win0 + 2.0) {
-                v->active = 0;
-                continue;
+                /* Tiny grain: hold last in-brace phase instead of hard mute. */
+                if (v->phase < win0)
+                    v->phase = win0;
+                if (v->phase >= win1 && win1 > win0 + 1.0)
+                    v->phase = win1 - 1.0;
+                if (win1 <= win0 + 1.0) {
+                    v->active = 0;
+                    continue;
+                }
             }
 
             double xfade_frames =
@@ -1344,18 +1486,27 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                         v->phase = win0 + fmod(v->phase - win0 + (win1 - win0) * 8.0, win1 - win0);
                 }
             } else {
-                /* One-shot: play through brace, then ADSR Release fades out. */
-                if (v->phase >= win1 || v->phase < win0) {
+                /* One-shot: play through brace, then ADSR Release fades out.
+                 * Phase outside after Trim rebase is clamped — only end-of-brace
+                 * (natural playthrough) enters Release, not Start/End scrub. */
+                if (v->phase >= win1) {
                     if (v->env_stage != ENV_R) {
                         v->gate = 0;
                         v->env_stage = ENV_R;
                     }
-                    if (v->phase >= win1)
-                        v->phase = win1 - 1.0;
-                    if (v->phase < win0)
-                        v->phase = win0;
+                    v->phase = win1 - 1.0;
+                } else if (v->phase < win0) {
+                    /* Brace moved under playhead — stay audible at new start. */
+                    v->phase = win0;
                 } else {
                     v->phase += pitch;
+                    if (v->phase >= win1) {
+                        if (v->env_stage != ENV_R) {
+                            v->gate = 0;
+                            v->env_stage = ENV_R;
+                        }
+                        v->phase = win1 - 1.0;
+                    }
                 }
                 read_sample(s, v->phase, &L, &R);
             }
@@ -1375,8 +1526,19 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             float pan = clampf(pad->pan, 0.0f, 1.0f);
             float gl = cosf(pan * (float)(0.5 * M_PI));
             float gr = sinf(pan * (float)(0.5 * M_PI));
-            mixL += L * g * gl;
-            mixR += R * g * gr;
+            float vl = L * g * gl;
+            float vr = R * g * gr;
+            mixL += vl;
+            mixR += vr;
+            float sr_amt = clampf(pad->send_rev + bus_rev, 0.0f, 1.5f);
+            float sd_amt = clampf(pad->send_del + bus_del, 0.0f, 1.5f);
+            if (sr_amt > 0.001f || sd_amt > 0.001f) {
+                sndL += vl;
+                sndR += vr;
+                send_rev_acc += sr_amt;
+                send_del_acc += sd_amt;
+                send_n++;
+            }
         }
 
         /* Smooth main volume toward target — gain only, no voice restart. */
@@ -1387,15 +1549,29 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 eng->main_sq = 0.0f;
             eng->master_gain = eng->main_sq * eng->fader_gain;
         }
+        float wetL = 0.0f, wetR = 0.0f;
+        if (send_n > 0) {
+            float inv = 1.0f / (float)send_n;
+            float sr = clampf(send_rev_acc * inv, 0.0f, 1.0f);
+            float sd = clampf(send_del_acc * inv, 0.0f, 1.0f);
+            fx_process(sndL, sndR, sr, sd, &wetL, &wetR, eng->sample_rate);
+        } else {
+            /* Keep delay line ticking so tails decay when voices stop. */
+            fx_process(0.0f, 0.0f, 0.0f, 0.0f, &wetL, &wetR, eng->sample_rate);
+        }
         float mg = eng->master_gain;
-        mixL *= mg;
-        mixR *= mg;
+        mixL = (mixL + wetL * 0.70f) * mg;
+        mixR = (mixR + wetR * 0.70f) * mg;
         /* Soft clip to S32 */
         mixL = tanhf(mixL * 0.8f);
         mixR = tanhf(mixR * 0.8f);
         out_l[n] = (int32_t)(mixL * 2147483647.0f * 0.5f);
         out_r[n] = (int32_t)(mixR * 2147483647.0f * 0.5f);
     }
+
+    /* Decay HitMod bus bumps slowly (main copies fresh each tick). */
+    eng->fx_bus_rev *= 0.995f;
+    eng->fx_bus_del *= 0.995f;
 
     eng->transport_frames += frames;
 }

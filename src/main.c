@@ -3,7 +3,7 @@
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
  * SAMPLE+pad select; MUTE+pad toggle ball; FULL LEVEL → Hit Mod matrix;
  * B1/B2 cycle Tombola / Trim / Mix / … / HitMod; B3 quit.
- * 0.3.6: knob labels match; CC19 latch; leave+impact hits; baller bounce; Trim.
+ * 0.3.7: Trim mute fix; face hits; white mesh; FX sends; better ADSR/FEnv.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -192,10 +192,10 @@ static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
     if (!dcc)
         return;
     /* Cap MIDI jumps so a noisy pot cannot leap the brace. */
-    if (dcc > 2)
-        dcc = 2;
-    if (dcc < -2)
-        dcc = -2;
+    if (dcc > 1)
+        dcc = 1;
+    if (dcc < -1)
+        dcc = -1;
     EpicyclePad *p = &eng->pads[pad];
     float frame = trim_frame_frac(eng, pad);
     float start = p->window_start;
@@ -209,22 +209,21 @@ static void trim_nudge_edge(EpicycleEngine *eng, int pad, int end_edge, int dcc)
         if (width <= frame * 16.0f) {
             step = frame * (float)dcc;
         } else {
-            float per = width * 0.10f; /* was 0.22 — less jumpy */
-            if (per < frame * 8.0f)
-                per = frame * 8.0f;
+            float per = width * 0.08f; /* gentler than 0.10; still reaches grain */
+            if (per < frame * 4.0f)
+                per = frame * 4.0f;
             step = per * (float)dcc;
         }
     } else {
-        /* Opening: grow by ~1.2% of sample or 10% of headroom per tick — still
-         * unlocks after a narrow (Ash End unlock) without large jumps. */
+        /* Opening: unlocks after a narrow grain without large jumps. */
         float headroom = end_edge ? (1.0f - start - width) : start;
         if (headroom < 0.0f)
             headroom = 0.0f;
-        float per = headroom * 0.10f;
-        if (per < 0.012f)
-            per = 0.012f;
-        if (per < frame * 32.0f)
-            per = frame * 32.0f;
+        float per = headroom * 0.08f;
+        if (per < 0.008f)
+            per = 0.008f;
+        if (per < frame * 16.0f)
+            per = frame * 16.0f;
         if (per > headroom && headroom > frame)
             per = headroom;
         step = per * (float)dcc;
@@ -317,7 +316,7 @@ static void pickup_targets_from_pad(EpicycleEngine *eng, EpicycleModePage page, 
         t0 = (uint8_t)clampf_u8((int)(p->level * 127.0f + 0.5f));
         t1 = (uint8_t)clampf_u8((int)(p->pan * 127.0f + 0.5f));
         t2 = shift ? (uint8_t)clampf_u8((int)((eng->kit_level - 0.05f) / 0.95f * 127.0f + 0.5f))
-                   : g_pick_prev[2];
+                   : (uint8_t)clampf_u8((int)(p->send_rev * 127.0f + 0.5f));
         break;
     case EPICYCLE_PAGE_AMP:
         if (shift) {
@@ -787,7 +786,7 @@ int main(int argc, char **argv)
                 engine_set_window(&eng, pad, 0.25f, 0.22f); /* Ash 0.25–0.47 case */
                 if (eng.pads[pad].window_length < 0.20f)
                     rc = -20;
-                for (int n = 0; n < 80; n++)
+                for (int n = 0; n < 160; n++)
                     trim_nudge_edge(&eng, pad, 1, -1);
                 float frame = trim_frame_frac(&eng, pad);
                 if (eng.pads[pad].window_length > frame * 4.0f)
@@ -804,10 +803,29 @@ int main(int argc, char **argv)
                 /* Ash 0.23–0.25 lock: after narrow, End must reopen. */
                 engine_set_window(&eng, pad, 0.23f, 0.02f);
                 float w0 = eng.pads[pad].window_length;
-                for (int n = 0; n < 24; n++)
+                for (int n = 0; n < 48; n++)
                     trim_nudge_edge(&eng, pad, 1, +1);
                 if (eng.pads[pad].window_length < w0 + 0.05f)
                     rc = -24; /* End reopen failed */
+                /* Start/End scrub must not silence a live voice (Ash Trim mute). */
+                {
+                    engine_set_window(&eng, pad, 0.10f, 0.40f);
+                    engine_note_on(&eng, pad, 1.0f);
+                    float ph0 = -1.0f;
+                    for (int i = 0; i < EPICYCLE_VOICE_COUNT; i++) {
+                        if (eng.voices[i].active && eng.voices[i].pad_index == pad)
+                            ph0 = (float)eng.voices[i].phase;
+                    }
+                    for (int n = 0; n < 30; n++)
+                        trim_nudge_edge(&eng, pad, 0, +1); /* move Start */
+                    if (!engine_pad_voice_active(&eng, pad))
+                        rc = -25;
+                    for (int n = 0; n < 30; n++)
+                        trim_nudge_edge(&eng, pad, 1, -1); /* close End */
+                    if (!engine_pad_voice_active(&eng, pad))
+                        rc = -26;
+                    (void)ph0;
+                }
                 engine_shutdown(&eng);
             }
             puts(rc == 0 ? "midi-selftest: ok" : "midi-selftest: FAIL");
@@ -1139,13 +1157,10 @@ int main(int argc, char **argv)
             last_page = eng.mode_page;
             surface_set_hitmod_led(eng.mode_page == EPICYCLE_PAGE_HITMOD);
             pickup_arm(surf, &eng);
-            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                engine_set_fader_gain_cc(&eng, 127);
-                if (surf->fader_engaged)
-                    tombola_set_morph(tb, (float)surf->fader / 127.0f);
-            } else if (surf->fader_engaged) {
-                engine_set_fader_gain_cc(&eng, surf->fader);
-            }
+            /* Fader never becomes gain on page enter (Ash Trim mute). */
+            engine_set_fader_gain_cc(&eng, 127);
+            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA && surf->fader_engaged)
+                tombola_set_morph(tb, (float)surf->fader / 127.0f);
         }
         if (surf->shift_held != last_shift) {
             last_shift = surf->shift_held;
@@ -1157,27 +1172,21 @@ int main(int argc, char **argv)
             engine_set_master_gain_cc(&eng, surf->main_vol);
             last_main = surf->main_vol;
         }
-        /* Tombola: fader = morph ONLY (MAIN = volume). Debounce ±1 to avoid
-         * face flicker / shrink-expand from CC noise. Other pages: fader = gain. */
+        /* Fader = morph on Tombola ONLY. MAIN = sole master volume on every page. */
+        engine_set_fader_gain_cc(&eng, 127);
         if (surf->fader_engaged && surf->fader != last_fader) {
             int fd = (int)surf->fader - (int)last_fader;
             if (fd < 0)
                 fd = -fd;
-            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-                if (fd >= 2) {
-                    last_fader = surf->fader;
-                    tombola_set_morph(tb, (float)surf->fader / 127.0f);
-                }
-                engine_set_fader_gain_cc(&eng, 127);
-            } else {
+            if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA && fd >= 2) {
                 last_fader = surf->fader;
-                engine_set_fader_gain_cc(&eng, surf->fader);
+                tombola_set_morph(tb, (float)surf->fader / 127.0f);
+            } else if (eng.mode_page != EPICYCLE_PAGE_TOMBOLA) {
+                last_fader = surf->fader; /* track pot; do not apply as gain */
             }
         }
 
         if (eng.mode_page == EPICYCLE_PAGE_TOMBOLA) {
-            /* Keep fader gain full while on Tombola (morph only — never volume). */
-            engine_set_fader_gain_cc(&eng, 127);
             /* K1 spin only. K2 unused on Tombola (Ash: no double morph). */
             static uint8_t tk1 = 255;
             static uint8_t tk1_dump = 255;
@@ -1291,6 +1300,8 @@ int main(int argc, char **argv)
 
         /* Always step tombola (hits fire even while editing other pages). */
         tombola_step(tb, 1.0f / 60.0f);
+        eng.fx_bus_rev = tb->send_a;
+        eng.fx_bus_del = tb->send_b;
         {
             int pads[EPICYCLE_PAD_COUNT];
             float vels[EPICYCLE_PAD_COUNT];

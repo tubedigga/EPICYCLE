@@ -154,8 +154,9 @@ enum {
     COL_OK = 0x0048A060u,
     COL_WAVE = 0x00385868u,
     COL_WAVE_DIM = 0x00283038u,
-    COL_BRACE = 0x00E8A848u,
+    COL_BRACE = 0x00E8A848u, /* Trim brace / UI accents (not tombola mesh) */
     COL_BRACE_FILL = 0x00302818u,
+    COL_MESH = 0x00F4F4F0u, /* thin white wireframe for tombola walls */
     COL_MOD = 0x0060B090u,
     COL_PLAY = 0x00F0F0E8u,
     COL_SOFT = 0x00C8B898u,
@@ -395,33 +396,6 @@ static void put_px_soft(uint32_t *px, int x, int y, uint32_t c, float a)
 }
 
 /* Bresenham line with soft 2px AA thickness (cleaner walls on 320×240). */
-static void draw_line(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
-{
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        put_px(px, x0, y0, c);
-        put_px_soft(px, x0 + 1, y0, c, 0.65f);
-        put_px_soft(px, x0, y0 + 1, c, 0.65f);
-        put_px_soft(px, x0 - 1, y0, c, 0.45f);
-        put_px_soft(px, x0, y0 - 1, c, 0.45f);
-        put_px_soft(px, x0 + 1, y0 + 1, c, 0.28f);
-        put_px_soft(px, x0 - 1, y0 - 1, c, 0.22f);
-        if (x0 == x1 && y0 == y1)
-            break;
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
 static uint32_t shade_rgb(uint32_t c, float lit)
 {
     int r = (int)(((c >> 16) & 0xff) * lit);
@@ -515,48 +489,26 @@ static void stroke_disk(uint32_t *px, int cx, int cy, int r, uint32_t c)
     }
 }
 
-/*
- * Outline matches physics walls closely (Ash: balls must look contained).
- * Mild corner round only near circle morph — avoid drawing a bigger cage
- * than the collider (that made balls look like they escaped).
- */
-static void tombola_smooth_edge(const EpicycleTombola *tb, float t01, float *ox, float *oy)
+/* Thin single-pixel polyline (no washed soft halo). */
+static void draw_line_thin(uint32_t *px, int x0, int y0, int x1, int y1, uint32_t c)
 {
-    float R = tb->radius;
-    int faces = tb->face_count;
-    float ang = t01 * (float)(2.0 * M_PI) + tb->spin_rad;
-    if (faces <= 0) {
-        *ox = cosf(ang) * R;
-        *oy = sinf(ang) * R;
-        return;
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_px(px, x0, y0, c);
+        if (x0 == x1 && y0 == y1)
+            break;
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
     }
-    float morph = tb->morph;
-    float blend = 0.0f;
-    if (morph < 0.04f)
-        blend = 1.0f;
-    else if (morph < 0.12f)
-        blend = 1.0f - (morph - 0.04f) / 0.08f;
-    float a_face = ang;
-    float sector = (float)(2.0 * M_PI / faces);
-    float local = fmodf(a_face + (float)M_PI / (float)faces, sector);
-    if (local < 0.0f)
-        local += sector;
-    float edge_t = local / sector;
-    int e = (int)floorf((a_face + (float)M_PI / (float)faces) / sector);
-    if (e < 0)
-        e += faces * 8;
-    e %= faces;
-    float x0, y0, x1, y1;
-    tombola_edge_point(tb, e, 0.0f, &x0, &y0);
-    tombola_edge_point(tb, e, 1.0f, &x1, &y1);
-    float px = x0 + (x1 - x0) * edge_t;
-    float py = y0 + (y1 - y0) * edge_t;
-    float cx = cosf(ang) * R;
-    float cy = sinf(ang) * R;
-    /* Keep round subtle so outline ≈ collision hull. */
-    float round = 0.04f + 0.96f * blend;
-    *ox = px * (1.0f - round) + cx * round;
-    *oy = py * (1.0f - round) + cy * round;
 }
 
 static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
@@ -574,20 +526,44 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         fill_rect(px, cx - half, cy + y, half * 2, 1, 0x00161612u);
     }
 
-    /* Dense AA outline — matches collider; 128 segs for cleaner arcs. */
+    /*
+     * Thin white wireframe mesh — matches collider edges (Ash: drop washed yellow).
+     * N-gon: straight face segments. Circle: dense polyline.
+     */
     {
-        int prevx = 0, prevy = 0;
-        const int segs = 128;
-        uint32_t edge_col = (tb->face_count <= 0) ? COL_ACCENT : COL_BRACE;
-        for (int i = 0; i <= segs; i++) {
-            float ox, oy;
-            tombola_smooth_edge(tb, (float)i / (float)segs, &ox, &oy);
-            int sx, sy;
-            tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
-            if (i > 0)
-                draw_line(px, prevx, prevy, sx, sy, edge_col);
-            prevx = sx;
-            prevy = sy;
+        int faces = tb->face_count;
+        if (faces <= 0) {
+            int prevx = 0, prevy = 0;
+            const int segs = 96;
+            for (int i = 0; i <= segs; i++) {
+                float a = (float)i / (float)segs * (float)(2.0 * M_PI) + tb->spin_rad;
+                float ox = cosf(a) * tb->radius;
+                float oy = sinf(a) * tb->radius;
+                int sx, sy;
+                tombola_world_to_screen(tb, ox, oy, cx, cy, scale, &sx, &sy);
+                if (i > 0)
+                    draw_line_thin(px, prevx, prevy, sx, sy, COL_MESH);
+                prevx = sx;
+                prevy = sy;
+            }
+        } else {
+            for (int e = 0; e < faces; e++) {
+                float x0, y0, x1, y1;
+                tombola_edge_point(tb, e, 0.0f, &x0, &y0);
+                tombola_edge_point(tb, e, 1.0f, &x1, &y1);
+                int sx0, sy0, sx1, sy1;
+                tombola_world_to_screen(tb, x0, y0, cx, cy, scale, &sx0, &sy0);
+                tombola_world_to_screen(tb, x1, y1, cx, cy, scale, &sx1, &sy1);
+                draw_line_thin(px, sx0, sy0, sx1, sy1, COL_MESH);
+                /* Light radial spoke for mesh depth (every other face). */
+                if ((e & 1) == 0) {
+                    float mx = 0.5f * (x0 + x1) * 0.55f;
+                    float my = 0.5f * (y0 + y1) * 0.55f;
+                    int smx, smy;
+                    tombola_world_to_screen(tb, mx, my, cx, cy, scale, &smx, &smy);
+                    draw_line_thin(px, cx, cy, smx, smy, shade_rgb(COL_MESH, 0.35f));
+                }
+            }
         }
     }
 
@@ -610,7 +586,7 @@ static void draw_tombola(uint32_t *px, const EpicycleTombola *tb, int sel)
         int r = (i == sel) ? 8 : 6;
         fill_sphere(px, sx, sy, r, col);
         if (i == sel)
-            stroke_disk(px, sx, sy, r + 2, COL_BRACE);
+            stroke_disk(px, sx, sy, r + 2, COL_MESH);
     }
 }
 
@@ -805,15 +781,14 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         if (surf && surf->shift_held)
             snprintf(v3, sizeof v3, "%d", eng ? (int)(eng->kit_level * 100.0f) : 0);
         else
-            snprintf(v3, sizeof v3, "--");
-        draw_param_row(px, 100, "VOL", v1, "PAN", v2, surf && surf->shift_held ? "KIT" : "SEND",
+            snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->send_rev * 100.0f) : 0);
+        draw_param_row(px, 100, "VOL", v1, "PAN", v2, surf && surf->shift_held ? "KIT" : "FX",
                        v3);
         if (surf) {
-            snprintf(line, sizeof line, "main %d  fader %s%d", (int)surf->main_vol,
-                     surf->fader_engaged ? "" : "~", (int)surf->fader);
+            snprintf(line, sizeof line, "main %d  fader morph-only", (int)surf->main_vol);
             draw_text(px, 8, 160, line, COL_MUTED, 1);
         }
-        draw_text(px, 8, 218, "K1 pad vol  K2 pan  SHIFT+K3 kit", COL_MUTED, 1);
+        draw_text(px, 8, 218, "K1 vol  K2 pan  K3 FX send  SHIFT+K3 kit", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_AMP) {
         draw_text(px, 8, 52, "AMP ADSR", COL_FG, 3);
         int shift = surf && surf->shift_held;
@@ -855,7 +830,7 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
         snprintf(v2, sizeof v2, "%d", pad ? (int)(pad->filt_decay * 127.0f) : 0);
         snprintf(v3, sizeof v3, "%d", pad ? (int)(pad->filt_depth * 127.0f) : 0);
         draw_param_row(px, 100, "ATK", v1, "DEC", v2, "DEP", v3);
-        draw_text(px, 8, 160, "env modulates cutoff depth", COL_MUTED, 1);
+        draw_text(px, 8, 160, "depth>0 auto-LPF  opens then closes", COL_MUTED, 1);
         draw_text(px, 8, 218, "K1 attack  K2 decay  K3 depth", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_LFO) {
         draw_text(px, 8, 56, "LFO", COL_FG, 4);
