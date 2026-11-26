@@ -2,11 +2,13 @@
  *
  * Minimal PCM WAV loader (16/24/32-bit integer or float). Converts to
  * interleaved stereo float. No compressed formats. Host + device.
+ * Hardened: size caps, corrupt-header rejects, no OOM from huge chunks.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +34,12 @@ static uint32_t rd32(const uint8_t *p)
 
 int sample_load_wav(EpicycleSample *out, const char *path)
 {
+    if (!out || !path || !path[0])
+        return -1;
+    /* Drop any previous buffer so callers can reload in place safely. */
+    sample_free(out);
     memset(out, 0, sizeof *out);
+
     FILE *fp = fopen(path, "rb");
     if (!fp)
         return -1;
@@ -47,6 +54,7 @@ int sample_load_wav(EpicycleSample *out, const char *path)
     uint32_t rate = 0;
     uint8_t *pcm = NULL;
     uint32_t pcm_bytes = 0;
+    int too_big = 0;
 
     for (;;) {
         uint8_t chdr[8];
@@ -54,6 +62,11 @@ int sample_load_wav(EpicycleSample *out, const char *path)
             break;
         uint32_t csz = rd32(chdr + 4);
         if (memcmp(chdr, "fmt ", 4) == 0) {
+            /* fmt body is tiny; reject absurd sizes (corrupt / bomb). */
+            if (csz < 16 || csz > 256) {
+                fclose(fp);
+                return -1;
+            }
             uint8_t *f = malloc(csz);
             if (!f || fread(f, 1, csz, fp) != csz) {
                 free(f);
@@ -68,8 +81,37 @@ int sample_load_wav(EpicycleSample *out, const char *path)
             if (csz & 1)
                 fseek(fp, 1, SEEK_CUR);
         } else if (memcmp(chdr, "data", 4) == 0) {
+            if (csz == 0 || rate == 0 || ch == 0 || ch > 2 || (fmt != 1 && fmt != 3) ||
+                bps == 0 || (bps % 8) != 0) {
+                fclose(fp);
+                return -1;
+            }
+            int bytes_per = (int)bps / 8;
+            size_t frame_bytes = (size_t)bytes_per * (size_t)ch;
+            if (frame_bytes == 0) {
+                fclose(fp);
+                return -1;
+            }
+            size_t max_pcm = (size_t)EPICYCLE_WAV_MAX_FRAMES * frame_bytes;
+            if ((size_t)csz > max_pcm) {
+                too_big = 1;
+                fclose(fp);
+                return EPICYCLE_WAV_ERR_TOO_BIG;
+            }
+            /* Guard float conversion alloc: frames*2*sizeof(float). */
+            size_t frames_est = (size_t)csz / frame_bytes;
+            if (frames_est > EPICYCLE_WAV_MAX_FRAMES ||
+                frames_est > (SIZE_MAX / (2u * sizeof(float)))) {
+                too_big = 1;
+                fclose(fp);
+                return EPICYCLE_WAV_ERR_TOO_BIG;
+            }
             pcm = malloc(csz);
-            if (!pcm || fread(pcm, 1, csz, fp) != csz) {
+            if (!pcm) {
+                fclose(fp);
+                return -1;
+            }
+            if (fread(pcm, 1, csz, fp) != csz) {
                 free(pcm);
                 fclose(fp);
                 return -1;
@@ -79,11 +121,17 @@ int sample_load_wav(EpicycleSample *out, const char *path)
                 fseek(fp, 1, SEEK_CUR);
             break;
         } else {
-            if (fseek(fp, csz + (csz & 1), SEEK_CUR) != 0)
+            /* Skip unknown chunks; bail on absurd sizes to avoid long seeks. */
+            if (csz > (64u * 1024u * 1024u)) {
+                fclose(fp);
+                return -1;
+            }
+            if (fseek(fp, (long)csz + (long)(csz & 1), SEEK_CUR) != 0)
                 break;
         }
     }
     fclose(fp);
+    (void)too_big;
 
     if (!pcm || !rate || !ch || ch > 2 || (fmt != 1 && fmt != 3)) {
         free(pcm);
@@ -99,6 +147,10 @@ int sample_load_wav(EpicycleSample *out, const char *path)
     if (frames == 0) {
         free(pcm);
         return -1;
+    }
+    if (frames > EPICYCLE_WAV_MAX_FRAMES) {
+        free(pcm);
+        return EPICYCLE_WAV_ERR_TOO_BIG;
     }
 
     float *data = calloc(frames * 2, sizeof(float));
@@ -151,12 +203,17 @@ int sample_load_wav(EpicycleSample *out, const char *path)
 
 int sample_synth_demo(EpicycleSample *out, unsigned rate, float freq_hz, float seconds)
 {
+    if (!out)
+        return -1;
+    sample_free(out);
     memset(out, 0, sizeof *out);
     if (rate == 0 || seconds <= 0.0f)
         return -1;
     size_t frames = (size_t)(rate * seconds);
     if (frames < 64)
         frames = 64;
+    if (frames > EPICYCLE_WAV_MAX_FRAMES)
+        frames = EPICYCLE_WAV_MAX_FRAMES;
     float *data = calloc(frames * 2, sizeof(float));
     if (!data)
         return -1;

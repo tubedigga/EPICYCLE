@@ -3,7 +3,7 @@
  * EPICYCLE tombola — primary 2D projected drum; wall hits trigger pads.
  * SAMPLE+pad select; MUTE+pad toggle ball; SEQ → Tombola; PAD FX → Hit Mod;
  * B1/B2 cycle Tombola / Trim / Mix / Delay / Reverb / …; B3 quit.
- * 0.3.9: clean LFO scrub, precise Trim, Delay/Reverb pages, normalize, palette.
+ * 0.3.10: SAMPLE browse/preview crash harden (cap, UAF retire, soft fail).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "epicycle.h"
@@ -31,10 +31,11 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "EPICYCLE %s — tombola for MPC Sample\n"
             "usage: %s [--help] [--version] [--demo] [--midi-selftest] "
-            "[--tombola-selftest] [--wav PATH]...\n"
+            "[--tombola-selftest] [--sample-preview-selftest] [--wav PATH]...\n"
             "  --demo             synth demo tones onto pads (host / no card samples)\n"
             "  --midi-selftest    host MIDI parser regression checks\n"
             "  --tombola-selftest physics containment + hit + mute ball checks\n"
+            "  --sample-preview-selftest  SAMPLE browse/preview fuzz (host)\n"
             "  --wav PATH         load WAV into next bank slot (up to 16)\n"
             "  MPC_APP_DIR  set by the SD launcher to the payload folder\n"
             "  On device: FADER morph, MAIN vol, K1 spin; SAMPLE page=browse/preview/assign;\n"
@@ -911,6 +912,13 @@ int main(int argc, char **argv)
                 engine_shutdown(&eng);
             }
             puts(rc == 0 ? "midi-selftest: ok" : "midi-selftest: FAIL");
+            return rc == 0 ? 0 : 1;
+        }
+        if (strcmp(argv[i], "--sample-preview-selftest") == 0) {
+            int rc = sample_preview_selftest();
+            puts(rc == 0 ? "sample-preview-selftest: ok" : "sample-preview-selftest: FAIL");
+            if (rc != 0)
+                fprintf(stderr, "sample-preview-selftest rc=%d\n", rc);
             return rc == 0 ? 0 : 1;
         }
         if (strcmp(argv[i], "--tombola-selftest") == 0) {

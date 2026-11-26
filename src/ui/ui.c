@@ -688,8 +688,14 @@ void ui_draw_loop(const EpicycleHwStatus *hw, const EpicycleEngine *eng,
                 row_y += 14;
             }
         }
-        if (browser && browser->status[0])
-            draw_text(px, 8, 200, browser->status, COL_OK, 1);
+        if (browser && browser->status[0]) {
+            /* Soft-fail messages stay visible; successes stay green. */
+            uint32_t sc = COL_OK;
+            if (strstr(browser->status, "fail") || strstr(browser->status, "bad") ||
+                strstr(browser->status, "too big") || strstr(browser->status, "nothing"))
+                sc = COL_MUTED;
+            draw_text(px, 8, 200, browser->status, sc, 1);
+        }
         draw_text(px, 8, 214, "pad=preview  ENC=assign  SHIFT+ENC=norm", COL_MUTED, 1);
         draw_text(px, 8, 226, "SAMPLE+pad=target  SAMPLE+ENC=rescan", COL_MUTED, 1);
     } else if (page == EPICYCLE_PAGE_HITMOD) {
