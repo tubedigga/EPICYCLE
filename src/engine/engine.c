@@ -88,25 +88,29 @@ static void pad_defaults(EpicyclePad *p)
     p->filt_attack = 0.05f;
     p->filt_decay = 0.40f;
     p->filt_depth = 0.0f; /* FEnv audible once depth > 0 (auto-LPF) */
-    p->send_rev = 0.18f;  /* light default wet — dry-only was a complaint */
-    p->send_del = 0.10f;
+    p->send_rev = 0.42f; /* audible default — Ash 0.3.16 reverb presence */
+    p->send_del = 0.12f;
     p->mod_window_start = 0.0f;
     p->mod_window_start_prev = 0.0f;
     p->mod_window_length = 1.0f;
     p->mod_pos_offset = 0.0f;
-    p->mod_pos_smooth = 0.0f;
+    p->mod_pos_a = 0.0f;
+    p->mod_pos_b = 0.0f;
+    p->mod_pos_xf = 0.0f;
+    p->mod_pos_xfading = 0;
+    p->mod_pos_active = 0;
     p->mod_pitch_ratio = 1.0f;
     p->mod_level = 0.8f;
     p->mod_filter_cutoff = 1.0f;
     p->mod_edit_slot = 0;
 
-    /* Empty mod matrix — LFO depth alone does nothing until user routes a slot
-     * (Ash 0.3.14: no default POS scrub ON). */
+    /* Empty mod matrix — route DEPTH alone drives dest; LFO is shape/rate source
+     * (Ash 0.3.16: no AMT vs DEPTH confusion; no default POS). */
     for (int i = 0; i < EPICYCLE_LFO_PER_PAD; i++) {
         p->lfos[i].shape = EPICYCLE_LFO_SINE;
         p->lfos[i].rate_hz = 0.25f + 0.1f * (float)i;
         p->lfos[i].sync_beats = 0.0f;
-        p->lfos[i].depth = 0.0f;
+        p->lfos[i].depth = 1.0f; /* source always full; matrix DEPTH scales */
         p->lfos[i].phase = 0.0f;
         p->lfos[i].enabled = 0;
     }
@@ -408,7 +412,7 @@ static int pad_wants_brace_scrub(const EpicyclePad *pad)
         int li = pad->mods[m].lfo_index;
         if (li < 0 || li >= EPICYCLE_LFO_PER_PAD)
             continue;
-        if (pad->lfos[li].enabled && pad->lfos[li].depth > 0.0f)
+        if (pad->lfos[li].enabled)
             return 1;
     }
     return 0;
@@ -426,7 +430,11 @@ void engine_sync_mod_window(EpicycleEngine *eng, int pad)
     p->mod_window_length = len;
     if (!pad_wants_brace_scrub(p)) {
         p->mod_pos_offset = 0.0f;
-        p->mod_pos_smooth = 0.0f;
+        p->mod_pos_a = 0.0f;
+        p->mod_pos_b = 0.0f;
+        p->mod_pos_xf = 0.0f;
+        p->mod_pos_xfading = 0;
+        p->mod_pos_active = 0;
     }
     p->mod_pitch_ratio = pitch_ratio(p->octave, p->semitone, p->fine);
     p->mod_level = p->level;
@@ -485,13 +493,13 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
         if (fabsf(r->amount) < 1e-4f)
             continue;
         EpicycleLfo *l = &pad->lfos[r->lfo_index];
-        if (!l->enabled || l->depth <= 0.0f)
+        if (!l->enabled)
             continue;
-        float w = lfo_wave(l->shape, l->phase) * l->depth * r->amount;
+        /* One depth: matrix amount. LFO wave is always full-scale source. */
+        float w = lfo_wave(l->shape, l->phase) * r->amount;
         switch (r->dest) {
         case EPICYCLE_MOD_BRACE_START:
-            /* POS = smooth read-offset into the sample (not brace carve / grain).
-             * Only when matrix routes it — depth alone never reaches here. */
+            /* POS target for dual-reader (Ash 0.3.16) — never continuous slew. */
             if (scrub_ok)
                 d_pos += w;
             break;
@@ -511,13 +519,35 @@ static void apply_modulation(EpicycleEngine *eng, int pad_index, size_t frames)
             break;
         }
     }
-    /* Trim brace stays user-set; POS is a separate read offset. */
+    /* Trim brace stays user-set; POS uses dual-reader crossfade offsets. */
     pad->mod_window_start_prev = pad->mod_window_start;
     pad->mod_window_start = base_start;
     pad->mod_window_length = base_len;
     pad->mod_pos_offset = clampf(d_pos, -1.0f, 1.0f);
-    /* Soften block-rate LFO steps — avoids grainy zipper on engage. */
-    pad->mod_pos_smooth += (pad->mod_pos_offset - pad->mod_pos_smooth) * 0.28f;
+    pad->mod_pos_active = (scrub_ok && fabsf(pad->mod_pos_offset) > 1e-4f) ||
+                          pad->mod_pos_xfading ||
+                          (fabsf(pad->mod_pos_a) > 1e-4f || fabsf(pad->mod_pos_b) > 1e-4f);
+    /* Retarget dual-reader: constant offsets + equal-power XF (no Doppler). */
+    {
+        float tgt = pad->mod_pos_offset;
+        if (!pad->mod_pos_active && !pad->mod_pos_xfading) {
+            pad->mod_pos_a = 0.0f;
+            pad->mod_pos_b = 0.0f;
+            pad->mod_pos_xf = 0.0f;
+        } else if (pad->mod_pos_xfading) {
+            /* Keep chasing B while fading so LFO stays responsive. */
+            pad->mod_pos_b = tgt;
+        } else {
+            float cur = pad->mod_pos_a;
+            if (fabsf(tgt - cur) > 0.008f) {
+                pad->mod_pos_b = tgt;
+                pad->mod_pos_xf = 0.0f;
+                pad->mod_pos_xfading = 1;
+            } else {
+                pad->mod_pos_a = tgt;
+            }
+        }
+    }
     pad->mod_pitch_ratio = pitch_ratio(pad->octave, pad->semitone, pad->fine + d_pitch * 100.0f);
     pad->mod_level = clampf(pad->level + d_level, 0.0f, 1.0f);
     pad->mod_filter_cutoff = clampf(pad->filter_cutoff + d_filt, 0.0f, 1.0f);
@@ -610,11 +640,11 @@ void engine_init(EpicycleEngine *eng, unsigned sample_rate)
     eng->fx_delay_fb = 0.42f;
     eng->fx_delay_tone = 0.55f;
     eng->fx_delay_wet = 0.85f;
-    eng->fx_rev_decay = 0.68f;
-    eng->fx_rev_damp = 0.40f;
-    eng->fx_rev_size = 0.55f;
-    eng->fx_rev_wet = 0.90f;
-    eng->fx_wet = 0.75f;
+    eng->fx_rev_decay = 0.82f; /* longer tail — Ash 0.3.16 audible reverb */
+    eng->fx_rev_damp = 0.28f;  /* brighter / more present */
+    eng->fx_rev_size = 0.72f;
+    eng->fx_rev_wet = 1.0f;
+    eng->fx_wet = 0.92f; /* master wet presence (Ash 0.3.16) */
     eng->freeze_playing = 0;
     eng->freeze_request = 0;
     eng->freeze_seconds = 3.0f;
@@ -1239,35 +1269,13 @@ void engine_apply_page_knobs_mask(EpicycleEngine *eng, int pad, EpicycleModePage
         if (mask & 4u)
             p->filt_depth = t3;
         break;
-    case EPICYCLE_PAGE_LFO: {
-        if (mask & 1u) {
-            int shape = (int)(t1 * (float)(EPICYCLE_LFO_SHAPE_COUNT - 1) + 0.5f);
-            if (shape < 0)
-                shape = 0;
-            if (shape >= EPICYCLE_LFO_SHAPE_COUNT)
-                shape = EPICYCLE_LFO_SHAPE_COUNT - 1;
-            p->lfos[0].shape = (EpicycleLfoShape)shape;
-        }
-        if (mask & 2u) {
-            if (p->lfos[0].sync_beats > 0.0f) {
-                static const float beats[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
-                int idx = (int)(t2 * 5.0f + 0.5f);
-                if (idx < 0)
-                    idx = 0;
-                if (idx > 5)
-                    idx = 5;
-                p->lfos[0].sync_beats = beats[idx];
-            } else {
-                p->lfos[0].rate_hz = 0.05f + 7.95f * t2;
-            }
-        }
-        if (mask & 4u) {
-            /* Depth = source level only; matrix routes decide dest. */
-            p->lfos[0].depth = t3;
-            engine_lfo_set_enabled(eng, pad, t3 > 0.02f);
-        }
+    case EPICYCLE_PAGE_LFO:
+        /* Handled in main (matrix DEST/DEPTH/RATE). Keep no-op here. */
+        (void)t1;
+        (void)t2;
+        (void)t3;
+        (void)mask;
         break;
-    }
     default:
         break;
     }
@@ -1474,12 +1482,13 @@ static void fx_process(EpicycleEngine *eng, float in_l, float in_r, float send_r
             g_fx_delay_w = 0;
     }
 
-    /* --- Reverb: 8 damped combs → 4 allpasses --- */
+    /* --- Reverb: denser 8 combs → 4 allpasses + early tap (Ash 0.3.16) --- */
     float rl = 0.0f, rr = 0.0f;
-    float rin_l = in_l * send_rev + dl * 0.18f;
-    float rin_r = in_r * send_rev + dr * 0.18f;
-    float damp_a = 0.20f + (1.0f - rev_damp) * 0.75f; /* higher = brighter */
-    float size_scale = 0.55f + rev_size * 0.45f;
+    float send_boost = 1.35f; /* make Mix REV send obvious */
+    float rin_l = in_l * send_rev * send_boost + dl * 0.22f;
+    float rin_r = in_r * send_rev * send_boost + dr * 0.22f;
+    float damp_a = 0.28f + (1.0f - rev_damp) * 0.68f; /* higher = brighter */
+    float size_scale = 0.62f + rev_size * 0.55f;
     for (int c = 0; c < 8; c++) {
         int len = (int)((float)FX_COMB_LEN[c] * size_scale);
         if (len < 64)
@@ -1491,9 +1500,9 @@ static void fx_process(EpicycleEngine *eng, float in_l, float in_r, float send_r
             i = 0;
         float y_l = g_fx_comb_buf_l[c][i];
         float y_r = g_fx_comb_buf_r[c][i];
-        float fb = (0.62f + rev_dec * 0.32f) - 0.025f * (float)c;
-        if (fb > 0.96f)
-            fb = 0.96f;
+        float fb = (0.72f + rev_dec * 0.26f) - 0.018f * (float)c;
+        if (fb > 0.97f)
+            fb = 0.97f;
         g_fx_comb_lp_l[c] += (y_l - g_fx_comb_lp_l[c]) * damp_a;
         g_fx_comb_lp_r[c] += (y_r - g_fx_comb_lp_r[c]) * damp_a;
         g_fx_comb_buf_l[c][i] = rin_l + g_fx_comb_lp_l[c] * fb;
@@ -1502,19 +1511,20 @@ static void fx_process(EpicycleEngine *eng, float in_l, float in_r, float send_r
         if (i >= len)
             i = 0;
         g_fx_comb_i[c] = i;
-        /* Alternate polarity for denser stereo field */
         float sgn = (c & 1) ? -1.0f : 1.0f;
-        rl += y_l * sgn;
-        rr += y_r * sgn;
+        float wcomb = 0.10f + 0.04f * (float)(c & 3);
+        rl += y_l * sgn * wcomb;
+        rr += y_r * sgn * wcomb;
     }
-    rl *= 0.125f;
-    rr *= 0.125f;
+    /* Early reflection tap from delay line for density / presence. */
+    rl += dl * 0.18f * send_rev;
+    rr += dr * 0.18f * send_rev;
     for (int a = 0; a < 4; a++) {
         int len = FX_AP_LEN[a];
         int i = g_fx_ap_i[a];
         float buf_l = g_fx_ap_buf_l[a][i];
         float buf_r = g_fx_ap_buf_r[a][i];
-        float g = 0.5f + rev_size * 0.15f;
+        float g = 0.55f + rev_size * 0.20f;
         float yl = -g * rl + buf_l;
         float yr = -g * rr + buf_r;
         g_fx_ap_buf_l[a][i] = rl + g * yl;
@@ -1526,8 +1536,9 @@ static void fx_process(EpicycleEngine *eng, float in_l, float in_r, float send_r
         rl = yl;
         rr = yr;
     }
-    *wet_l = (dl * del_wet + rl * rev_wet) * master_wet;
-    *wet_r = (dr * del_wet + rr * rev_wet) * master_wet;
+    float rev_gain = 1.55f; /* return louder so REV send is obvious */
+    *wet_l = (dl * del_wet + rl * rev_wet * rev_gain) * master_wet;
+    *wet_r = (dr * del_wet + rr * rev_wet * rev_gain) * master_wet;
 }
 
 static void freeze_ring_write(float l, float r)
@@ -1702,6 +1713,24 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
         float send_rev_acc = 0.0f, send_del_acc = 0.0f;
         int send_n = 0;
 
+        /* Advance POS dual-reader crossfades once per sample (pad-shared). */
+        for (int pi = 0; pi < EPICYCLE_PAD_COUNT; pi++) {
+            EpicyclePad *pp = &eng->pads[pi];
+            if (!pp->mod_pos_xfading)
+                continue;
+            float xms = EPICYCLE_POS_XFADE_MS;
+            if (xms < 4.0f)
+                xms = 4.0f;
+            float inc = 1.0f / (xms * 0.001f * (float)eng->sample_rate + 1.0f);
+            pp->mod_pos_xf += inc;
+            if (pp->mod_pos_xf >= 1.0f) {
+                pp->mod_pos_xf = 1.0f;
+                pp->mod_pos_a = pp->mod_pos_b;
+                pp->mod_pos_xf = 0.0f;
+                pp->mod_pos_xfading = 0;
+            }
+        }
+
         for (int vi = 0; vi < EPICYCLE_VOICE_COUNT; vi++) {
             EpicycleVoice *v = &eng->voices[vi];
             if (!v->active)
@@ -1717,11 +1746,21 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
             float pitch = pad->mod_pitch_ratio * (v->impact_pitch > 0.01f ? v->impact_pitch : 1.0f);
             float edge_mul = 1.0f;
 
-            /* Intra-block brace lerp for manual Trim; POS uses separate offset. */
+            /* Intra-block brace lerp for manual Trim. */
             float scrub_t = (frames > 1) ? ((float)n / (float)(frames - 1)) : 1.0f;
             float start01 = pad->mod_window_start_prev +
                             (pad->mod_window_start - pad->mod_window_start_prev) * scrub_t;
             float len01 = pad->mod_window_length;
+            /*
+             * POS dual-reader (Ash 0.3.16): short braces + continuous offset slew
+             * caused buzz/Doppler. Under POS, loop the full sample at constant
+             * pitch and crossfade between two *constant* read offsets.
+             */
+            int pos_live = pad->mod_pos_active;
+            if (pos_live) {
+                start01 = 0.0f;
+                len01 = 1.0f;
+            }
             double win0 = (double)start01 * (double)s->frames;
             double win1 = win0 + (double)len01 * (double)s->frames;
             if (win1 <= win0 + 2.0) {
@@ -1735,20 +1774,49 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 }
             }
 
-            /* Matrix POS: smooth read offset (±45% sample). Phase rate unchanged. */
-            double pos_off =
-                (double)pad->mod_pos_smooth * (double)s->frames * 0.45;
             double sf = (double)s->frames;
-            /* Apply POS offset at read time only — never to phase increment. */
+            float xf = pad->mod_pos_xfading ? pad->mod_pos_xf : 0.0f;
+            float pos_a = pad->mod_pos_a;
+            float pos_b = pad->mod_pos_b;
+            /* Max ±30% sample — enough scrub, less wrap stress. */
+            const double pos_span = 0.30;
+            #define EP_WRAP(rp)                                                                   \
+                do {                                                                              \
+                    if (sf > 1.0) {                                                               \
+                        (rp) = fmod((rp), sf);                                                    \
+                        if ((rp) < 0.0)                                                           \
+                            (rp) += sf;                                                           \
+                    }                                                                             \
+                } while (0)
             #define EP_READ(ph, ol, or_)                                                          \
                 do {                                                                              \
-                    double _rp = (ph) + pos_off;                                                  \
-                    if (sf > 1.0) {                                                               \
-                        _rp = fmod(_rp, sf);                                                      \
-                        if (_rp < 0.0)                                                            \
-                            _rp += sf;                                                            \
+                    if (!pos_live) {                                                              \
+                        read_sample(s, (ph), (ol), (or_));                                        \
+                    } else {                                                                      \
+                        double _oa = (double)pos_a * sf * pos_span;                               \
+                        double _ob = (double)pos_b * sf * pos_span;                               \
+                        if (xf <= 0.001f) {                                                       \
+                            double _rp = (ph) + _oa;                                              \
+                            EP_WRAP(_rp);                                                         \
+                            read_sample(s, _rp, (ol), (or_));                                     \
+                        } else if (xf >= 0.999f) {                                                \
+                            double _rp = (ph) + _ob;                                              \
+                            EP_WRAP(_rp);                                                         \
+                            read_sample(s, _rp, (ol), (or_));                                     \
+                        } else {                                                                  \
+                            double _rpa = (ph) + _oa;                                             \
+                            double _rpb = (ph) + _ob;                                             \
+                            EP_WRAP(_rpa);                                                        \
+                            EP_WRAP(_rpb);                                                        \
+                            float _la, _ra, _lb, _rb;                                             \
+                            read_sample(s, _rpa, &_la, &_ra);                                     \
+                            read_sample(s, _rpb, &_lb, &_rb);                                     \
+                            float _ga = cosf(xf * (float)(0.5 * M_PI));                           \
+                            float _gb = sinf(xf * (float)(0.5 * M_PI));                           \
+                            *(ol) = _la * _ga + _lb * _gb;                                        \
+                            *(or_) = _ra * _ga + _rb * _gb;                                       \
+                        }                                                                         \
                     }                                                                             \
-                    read_sample(s, _rp, (ol), (or_));                                             \
                 } while (0)
 
             double xfade_frames =
@@ -1847,6 +1915,7 @@ void engine_render(EpicycleEngine *eng, int32_t *out_l, int32_t *out_r, size_t f
                 EP_READ(v->phase, &L, &R);
             }
             #undef EP_READ
+            #undef EP_WRAP
 
             if (!voice_adsr_tick(v, pad, eng->sample_rate))
                 continue;
@@ -2030,10 +2099,11 @@ void engine_host_demo_setup(EpicycleEngine *eng)
 }
 
 /*
- * Host selftest (Ash 0.3.14):
- *  - depth + empty matrix → no POS offset / no pitch
- *  - matrix POS route → offset moves, pitch unity, phase advance ≈ frames
- *  - no grainy spike: max |Δsample| under POS not wildly above dry
+ * Host selftest (Ash 0.3.16):
+ *  - no route → no POS / no pitch
+ *  - matrix POS → dual-reader target moves, pitch unity, phase advance ≈ frames
+ *  - stricter grainy/Doppler guards (consecutive Δ + pitch lock)
+ *  - 8 mod slots present
  */
 int engine_lfo_selftest(void)
 {
@@ -2044,6 +2114,10 @@ int engine_lfo_selftest(void)
     if (!eng.bank) {
         engine_shutdown(&eng);
         return -1;
+    }
+    if (EPICYCLE_MOD_SLOTS != 8) {
+        engine_shutdown(&eng);
+        return -4; /* slots restored to 8 */
     }
     for (int i = 0; i < EPICYCLE_PAD_COUNT; i++) {
         if (eng.pads[i].sample != NULL ||
@@ -2070,7 +2144,7 @@ int engine_lfo_selftest(void)
     p->loop_enable = 1;
     engine_sync_mod_window(&eng, 0);
 
-    /* Depth full, matrix empty → nothing. */
+    /* LFO on, matrix empty → nothing (DEPTH is route amount only). */
     p->lfos[0].enabled = 1;
     p->lfos[0].depth = 1.0f;
     p->lfos[0].rate_hz = 2.0f;
@@ -2089,7 +2163,7 @@ int engine_lfo_selftest(void)
     }
     if (fabsf(max_off - min_off) > 1e-4f || fabsf(max_off) > 1e-4f) {
         engine_shutdown(&eng);
-        return -10; /* depth alone moved POS */
+        return -10; /* no route must not move POS */
     }
     if (fabsf(min_pr - 1.0f) > 1e-4f || fabsf(max_pr - 1.0f) > 1e-4f) {
         engine_shutdown(&eng);
@@ -2104,13 +2178,16 @@ int engine_lfo_selftest(void)
         return -12; /* default POS scrub ON is forbidden */
     }
 
-    /* Wire matrix POS explicitly. */
+    /* Wire matrix POS explicitly (single DEPTH = amount). */
     p->mods[0].lfo_index = 0;
     p->mods[0].dest = EPICYCLE_MOD_BRACE_START;
     p->mods[0].amount = 1.0f;
     p->lfos[0].rate_hz = 2.5f;
     p->lfos[0].phase = 0.0f;
-    p->mod_pos_smooth = 0.0f;
+    p->mod_pos_a = 0.0f;
+    p->mod_pos_b = 0.0f;
+    p->mod_pos_xf = 0.0f;
+    p->mod_pos_xfading = 0;
 
     min_off = 99.f;
     max_off = -99.f;
@@ -2126,6 +2203,7 @@ int engine_lfo_selftest(void)
     int n_dp = 0;
     double expected = (double)EPICYCLE_AUDIO_FRAMES;
     float dry_peak_d = 0.f, wet_peak_d = 0.f;
+    int saw_xf = 0;
     for (int i = 0; i < 400; i++) {
         double ph0 = -1.0;
         for (int v = 0; v < EPICYCLE_VOICE_COUNT; v++) {
@@ -2133,10 +2211,15 @@ int engine_lfo_selftest(void)
                 ph0 = eng.voices[v].phase;
         }
         engine_render(&eng, L, R, EPICYCLE_AUDIO_FRAMES);
-        if (p->mod_pos_smooth < min_off)
-            min_off = p->mod_pos_smooth;
-        if (p->mod_pos_smooth > max_off)
-            max_off = p->mod_pos_smooth;
+        /* Dual-reader active offset (A, or B when settled mid-fade). */
+        float aoff = p->mod_pos_xfading ? (p->mod_pos_a + (p->mod_pos_b - p->mod_pos_a) * p->mod_pos_xf)
+                                        : p->mod_pos_a;
+        if (aoff < min_off)
+            min_off = aoff;
+        if (aoff > max_off)
+            max_off = aoff;
+        if (p->mod_pos_xfading)
+            saw_xf = 1;
         if (p->mod_pitch_ratio < min_pr)
             min_pr = p->mod_pitch_ratio;
         if (p->mod_pitch_ratio > max_pr)
@@ -2155,7 +2238,6 @@ int engine_lfo_selftest(void)
                 n_dp++;
             }
         }
-        /* Grainy spike heuristic: peak consecutive sample delta. */
         for (size_t s = 1; s < EPICYCLE_AUDIO_FRAMES; s++) {
             float d = fabsf((float)L[s] - (float)L[s - 1]) / 2147483648.0f;
             if (d > wet_peak_d)
@@ -2165,9 +2247,14 @@ int engine_lfo_selftest(void)
 
     if ((max_off - min_off) < 0.08f) {
         engine_shutdown(&eng);
-        return -20; /* matrix POS offset did not move */
+        return -20; /* matrix POS dual-reader did not move */
     }
-    if (fabsf(min_pr - 1.0f) > 5e-4f || fabsf(max_pr - 1.0f) > 5e-4f) {
+    if (!saw_xf) {
+        engine_shutdown(&eng);
+        return -26; /* expected dual-reader crossfades under moving LFO */
+    }
+    /* Pitch must stay unity under POS (no Doppler). */
+    if (fabsf(min_pr - 1.0f) > 2e-4f || fabsf(max_pr - 1.0f) > 2e-4f) {
         engine_shutdown(&eng);
         return -21;
     }
@@ -2176,11 +2263,11 @@ int engine_lfo_selftest(void)
         return -22;
     }
     double mean_dp = sum_dphase / (double)n_dp;
-    if (fabs(mean_dp - expected) > expected * 0.20) {
+    if (fabs(mean_dp - expected) > expected * 0.15) {
         engine_shutdown(&eng);
         return -23; /* phase rate not constant under POS */
     }
-    if (max_dphase > expected * 1.40) {
+    if (max_dphase > expected * 1.25) {
         engine_shutdown(&eng);
         return -24; /* high-rate phase sweep */
     }
@@ -2188,7 +2275,11 @@ int engine_lfo_selftest(void)
     /* Dry baseline spike (POS off) for grainy compare. */
     p->mods[0].amount = 0.0f;
     p->mod_pos_offset = 0.0f;
-    p->mod_pos_smooth = 0.0f;
+    p->mod_pos_a = 0.0f;
+    p->mod_pos_b = 0.0f;
+    p->mod_pos_xf = 0.0f;
+    p->mod_pos_xfading = 0;
+    p->mod_pos_active = 0;
     engine_note_on(&eng, 0, 0.9f);
     for (int v = 0; v < EPICYCLE_VOICE_COUNT; v++) {
         if (eng.voices[v].active && eng.voices[v].pad_index == 0)
@@ -2202,8 +2293,8 @@ int engine_lfo_selftest(void)
                 dry_peak_d = d;
         }
     }
-    /* POS must not explode consecutive deltas (grainy trash). */
-    if (dry_peak_d > 1e-6f && wet_peak_d > dry_peak_d * 8.0f && wet_peak_d > 0.35f) {
+    /* Stricter: POS must not explode consecutive deltas (buzz/grain). */
+    if (dry_peak_d > 1e-6f && wet_peak_d > dry_peak_d * 3.5f && wet_peak_d > 0.22f) {
         engine_shutdown(&eng);
         return -25; /* grainy spike under POS */
     }

@@ -5,17 +5,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EPICYCLE_VERSION "0.3.15-matrix-ui"
+#define EPICYCLE_VERSION "0.3.16-pos-clean"
 #define EPICYCLE_FB_W 320
 #define EPICYCLE_FB_H 240
 #define EPICYCLE_AUDIO_FRAMES 128
 #define EPICYCLE_PAD_COUNT 16
 #define EPICYCLE_VOICE_COUNT 16
 #define EPICYCLE_LFO_PER_PAD 2
-#define EPICYCLE_MOD_SLOTS 4
+#define EPICYCLE_MOD_SLOTS 8 /* restored (Ash 0.3.16) */
+#define EPICYCLE_MOD_VISIBLE 4 /* LFO matrix scroll window */
 #define EPICYCLE_HITMOD_SLOTS 8 /* matrix rows; UI shows ~6, encoder scrolls */
 #define EPICYCLE_HITMOD_VISIBLE 6
 #define EPICYCLE_SCRUB_BUDGET 8 /* aggressive LFO window-scan limit */
+#define EPICYCLE_POS_XFADE_MS 12.0f /* dual-reader crossfade — no Doppler slew */
 #define EPICYCLE_MAX_DIVISION 32
 #define EPICYCLE_XFADE_MAX 2048
 /* Refuse WAVs that would blow device RAM (≈20 s @ 48 kHz stereo float). */
@@ -178,8 +180,12 @@ typedef struct EpicyclePad {
     float mod_window_start;
     float mod_window_start_prev; /* prior-block start — Trim lerp */
     float mod_window_length;
-    float mod_pos_offset;       /* -1..1 LFO→POS read offset (matrix only) */
-    float mod_pos_smooth;       /* one-pole smoothed offset for audio */
+    float mod_pos_offset;       /* -1..1 LFO→POS target (matrix only) */
+    float mod_pos_a;            /* dual-reader A offset (constant during life) */
+    float mod_pos_b;            /* dual-reader B offset */
+    float mod_pos_xf;           /* 0=A .. 1=B equal-power crossfade */
+    int mod_pos_xfading;        /* 1 while crossfading A→B */
+    int mod_pos_active;         /* matrix POS route live this block */
     float mod_pitch_ratio;
     float mod_level;
     float mod_filter_cutoff; /* after LFO / filt-env */
